@@ -1218,89 +1218,83 @@ std::string RenderPrometheusMetrics(const MetricsState& metrics) {
     emit_i64("srt_relay_input_links_total", "gauge", "Total number of input links in the active SRT group.", input_links_total);
     emit_i64("srt_relay_input_links_healthy", "gauge", "Number of healthy input links in the active SRT group.", input_links_healthy);
     emit_i64("srt_relay_input_links_running", "gauge", "Number of currently running/active input links in the active SRT group.", input_links_running);
-    out << "# HELP srt_relay_input_link_connected Per-input-link connection state in the active SRT group (1/0).\n";
-    out << "# TYPE srt_relay_input_link_connected gauge\n";
-    for (size_t i = 0; i < input_links_snapshot_capped; ++i) {
-        const auto identity_key = metrics.input_member_identity_keys[i].load(std::memory_order_relaxed);
-        if (identity_key == 0) {
-            continue;
-        }
-        const auto socket_id = static_cast<SRTSOCKET>(metrics.input_member_ids[i].load(std::memory_order_relaxed));
-        const auto connected = metrics.input_member_connected[i].load(std::memory_order_relaxed);
-        out << "srt_relay_input_link_connected{link_index=\"" << (i + 1)
-            << "\",socket_id=\"" << socket_id << "\"} "
-            << connected << "\n";
-    }
 
-    out << "# HELP srt_relay_input_link_rx_bytes_total Monotonic per-link transport RX bytes for each stable input link slot.\n";
-    out << "# TYPE srt_relay_input_link_rx_bytes_total counter\n";
-    for (size_t i = 0; i < input_links_snapshot_capped; ++i) {
-        const auto identity_key = metrics.input_member_identity_keys[i].load(std::memory_order_relaxed);
-        if (identity_key == 0) {
-            continue;
+    auto emit_input_link_metric_u64 = [&](const char* name,
+                                          const char* type,
+                                          const char* help,
+                                          const std::array<std::atomic<uint64_t>, MetricsState::kMaxTrackedMembers>& values) {
+        out << "# HELP " << name << " " << help << "\n";
+        out << "# TYPE " << name << " " << type << "\n";
+        for (size_t i = 0; i < input_links_snapshot_capped; ++i) {
+            const auto identity_key = metrics.input_member_identity_keys[i].load(std::memory_order_relaxed);
+            if (identity_key == 0) {
+                continue;
+            }
+            const auto socket_id = static_cast<SRTSOCKET>(metrics.input_member_ids[i].load(std::memory_order_relaxed));
+            out << name << "{link_index=\"" << (i + 1)
+                << "\",socket_id=\"" << socket_id << "\"} "
+                << values[i].load(std::memory_order_relaxed) << "\n";
         }
-        const auto socket_id = static_cast<SRTSOCKET>(metrics.input_member_ids[i].load(std::memory_order_relaxed));
-        const auto rx_total = metrics.input_link_rx_bytes_total[i].load(std::memory_order_relaxed);
-        out << "srt_relay_input_link_rx_bytes_total{link_index=\"" << (i + 1)
-            << "\",socket_id=\"" << socket_id << "\"} "
-            << rx_total << "\n";
-    }
+    };
+    auto emit_input_link_metric_i64 = [&](const char* name,
+                                          const char* type,
+                                          const char* help,
+                                          const std::array<std::atomic<int64_t>, MetricsState::kMaxTrackedMembers>& values) {
+        out << "# HELP " << name << " " << help << "\n";
+        out << "# TYPE " << name << " " << type << "\n";
+        for (size_t i = 0; i < input_links_snapshot_capped; ++i) {
+            const auto identity_key = metrics.input_member_identity_keys[i].load(std::memory_order_relaxed);
+            if (identity_key == 0) {
+                continue;
+            }
+            const auto socket_id = static_cast<SRTSOCKET>(metrics.input_member_ids[i].load(std::memory_order_relaxed));
+            out << name << "{link_index=\"" << (i + 1)
+                << "\",socket_id=\"" << socket_id << "\"} "
+                << values[i].load(std::memory_order_relaxed) << "\n";
+        }
+    };
+    auto emit_input_link_metric_i32 = [&](const char* name,
+                                          const char* type,
+                                          const char* help,
+                                          const std::array<std::atomic<int>, MetricsState::kMaxTrackedMembers>& values) {
+        out << "# HELP " << name << " " << help << "\n";
+        out << "# TYPE " << name << " " << type << "\n";
+        for (size_t i = 0; i < input_links_snapshot_capped; ++i) {
+            const auto identity_key = metrics.input_member_identity_keys[i].load(std::memory_order_relaxed);
+            if (identity_key == 0) {
+                continue;
+            }
+            const auto socket_id = static_cast<SRTSOCKET>(metrics.input_member_ids[i].load(std::memory_order_relaxed));
+            out << name << "{link_index=\"" << (i + 1)
+                << "\",socket_id=\"" << socket_id << "\"} "
+                << values[i].load(std::memory_order_relaxed) << "\n";
+        }
+    };
 
-    out << "# HELP srt_relay_input_link_tx_bytes_total Monotonic per-link transport TX bytes for each stable input link slot.\n";
-    out << "# TYPE srt_relay_input_link_tx_bytes_total counter\n";
-    for (size_t i = 0; i < input_links_snapshot_capped; ++i) {
-        const auto identity_key = metrics.input_member_identity_keys[i].load(std::memory_order_relaxed);
-        if (identity_key == 0) {
-            continue;
-        }
-        const auto socket_id = static_cast<SRTSOCKET>(metrics.input_member_ids[i].load(std::memory_order_relaxed));
-        const auto tx_total = metrics.input_link_tx_bytes_total[i].load(std::memory_order_relaxed);
-        out << "srt_relay_input_link_tx_bytes_total{link_index=\"" << (i + 1)
-            << "\",socket_id=\"" << socket_id << "\"} "
-            << tx_total << "\n";
-    }
-
-    out << "# HELP srt_relay_input_link_rx_bytes_current Current per-link byteRecvTotal for each stable input link slot.\n";
-    out << "# TYPE srt_relay_input_link_rx_bytes_current gauge\n";
-    for (size_t i = 0; i < input_links_snapshot_capped; ++i) {
-        const auto identity_key = metrics.input_member_identity_keys[i].load(std::memory_order_relaxed);
-        if (identity_key == 0) {
-            continue;
-        }
-        const auto socket_id = static_cast<SRTSOCKET>(metrics.input_member_ids[i].load(std::memory_order_relaxed));
-        const auto rx_current = metrics.input_link_rx_bytes_current[i].load(std::memory_order_relaxed);
-        out << "srt_relay_input_link_rx_bytes_current{link_index=\"" << (i + 1)
-            << "\",socket_id=\"" << socket_id << "\"} "
-            << rx_current << "\n";
-    }
-
-    out << "# HELP srt_relay_input_link_tx_bytes_current Current per-link byteSentTotal for each stable input link slot.\n";
-    out << "# TYPE srt_relay_input_link_tx_bytes_current gauge\n";
-    for (size_t i = 0; i < input_links_snapshot_capped; ++i) {
-        const auto identity_key = metrics.input_member_identity_keys[i].load(std::memory_order_relaxed);
-        if (identity_key == 0) {
-            continue;
-        }
-        const auto socket_id = static_cast<SRTSOCKET>(metrics.input_member_ids[i].load(std::memory_order_relaxed));
-        const auto tx_current = metrics.input_link_tx_bytes_current[i].load(std::memory_order_relaxed);
-        out << "srt_relay_input_link_tx_bytes_current{link_index=\"" << (i + 1)
-            << "\",socket_id=\"" << socket_id << "\"} "
-            << tx_current << "\n";
-    }
-
-    out << "# HELP srt_relay_input_link_rtt_ms Per-link RTT in milliseconds for each stable input link slot.\n";
-    out << "# TYPE srt_relay_input_link_rtt_ms gauge\n";
-    for (size_t i = 0; i < input_links_snapshot_capped; ++i) {
-        const auto identity_key = metrics.input_member_identity_keys[i].load(std::memory_order_relaxed);
-        if (identity_key == 0) {
-            continue;
-        }
-        const auto socket_id = static_cast<SRTSOCKET>(metrics.input_member_ids[i].load(std::memory_order_relaxed));
-        const auto link_rtt_ms = metrics.input_link_rtt_ms[i].load(std::memory_order_relaxed);
-        out << "srt_relay_input_link_rtt_ms{link_index=\"" << (i + 1)
-            << "\",socket_id=\"" << socket_id << "\"} "
-            << link_rtt_ms << "\n";
-    }
+    emit_input_link_metric_i32("srt_relay_input_link_connected",
+                               "gauge",
+                               "Per-input-link connection state in the active SRT group (1/0).",
+                               metrics.input_member_connected);
+    emit_input_link_metric_u64("srt_relay_input_link_rx_bytes_total",
+                               "counter",
+                               "Monotonic per-link transport RX bytes for each stable input link slot.",
+                               metrics.input_link_rx_bytes_total);
+    emit_input_link_metric_u64("srt_relay_input_link_tx_bytes_total",
+                               "counter",
+                               "Monotonic per-link transport TX bytes for each stable input link slot.",
+                               metrics.input_link_tx_bytes_total);
+    emit_input_link_metric_u64("srt_relay_input_link_rx_bytes_current",
+                               "gauge",
+                               "Current per-link byteRecvTotal for each stable input link slot.",
+                               metrics.input_link_rx_bytes_current);
+    emit_input_link_metric_u64("srt_relay_input_link_tx_bytes_current",
+                               "gauge",
+                               "Current per-link byteSentTotal for each stable input link slot.",
+                               metrics.input_link_tx_bytes_current);
+    emit_input_link_metric_i64("srt_relay_input_link_rtt_ms",
+                               "gauge",
+                               "Per-link RTT in milliseconds for each stable input link slot.",
+                               metrics.input_link_rtt_ms);
 
     emit_u64("srt_relay_input_transport_byte_recv_total", "counter", "Monotonic input transport bytes received across tracked SRT member sockets (includes duplicate traffic).", input_transport_byte_recv_total);
     emit_u64("srt_relay_input_transport_byte_recv_unique_total", "counter", "Monotonic input transport unique bytes received across tracked SRT member sockets.", input_transport_byte_recv_unique_total);
