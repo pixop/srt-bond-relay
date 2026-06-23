@@ -100,10 +100,9 @@ Metrics endpoint:
 Metrics include:
 
 - relay throughput and message counters
-- input/output connection state and path readiness
-- bonded input link health summary (`total`, `healthy`, `running`)
-- transport-level counters (monotonic `*_total`) and snapshot gauges (`*_current`)
-- RTT and last activity timestamps
+- input/output state, path readiness, and detected input bond mode
+- bonded input link health summary and stable-slot per-link status/traffic/RTT
+- aggregate transport counters plus session-level RTT and activity timestamps
 
 Logs are structured key-value lines (startup, connection transitions, periodic stats, shutdown totals).
 
@@ -133,3 +132,4 @@ Applied as socket flags when present:
 - input is listener-oriented (caller/rendezvous input modes not implemented)
 - URI parser is intentionally narrow (`srt://host:port?...`)
 - unsupported URI options are ignored (debug logged)
+- per-link observability depends on bonded member snapshot availability from libsrt; when unavailable, relay falls back to a single synthetic input-link slot for continuity
