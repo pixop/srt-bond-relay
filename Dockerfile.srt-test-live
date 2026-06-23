@@ -1,0 +1,82 @@
+FROM ubuntu:24.04 AS build
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG SRT_TAG=v1.5.5
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    cmake \
+    git \
+    python3 \
+    pkg-config \
+    libssl-dev \
+    zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+RUN git clone --depth 1 --branch "${SRT_TAG}" https://github.com/Haivision/srt.git
+
+RUN python3 - <<'PY'
+from pathlib import Path
+
+old = "result = srt_setsockopt(sock, 0, SRTO_SENDER, &yes, sizeof yes);"
+new = (
+    "// Socket groups reject SRTO_SENDER; keep this for plain sockets only.\n"
+    " if ((sock & SRTGROUP_MASK) == 0)\n"
+    " result = srt_setsockopt(sock, 0, SRTO_SENDER, &yes, sizeof yes);"
+)
+
+patched_any = False
+for rel in ("testing/testmedia.cpp", "apps/transmitmedia.cpp"):
+    p = Path("/src/srt") / rel
+    if not p.exists():
+        continue
+    src = p.read_text()
+    if old in src:
+        p.write_text(src.replace(old, new, 1))
+        patched_any = True
+
+if not patched_any:
+    raise SystemExit("expected SRTO_SENDER line not found in known source files")
+PY
+
+RUN cmake -S /src/srt -B /src/srt/build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/opt/pixop-srt \
+    -DENABLE_SHARED=ON \
+    -DENABLE_STATIC=OFF \
+    -DENABLE_ENCRYPTION=ON \
+    -DUSE_OPENSSL_PC=ON \
+    -DENABLE_BONDING=ON \
+    -DENABLE_TESTING=ON \
+    -DENABLE_APPS=ON \
+    && cmake --build /src/srt/build --target srt-test-live --parallel \
+    && cmake --install /src/srt/build \
+    && set -eux; \
+       if [ -x /src/srt/build/testing/srt-test-live ]; then \
+         cp /src/srt/build/testing/srt-test-live /usr/local/bin/srt-test-live; \
+       elif [ -x /src/srt/build/srt-test-live ]; then \
+         cp /src/srt/build/srt-test-live /usr/local/bin/srt-test-live; \
+       else \
+         echo "srt-test-live binary not found after build" >&2; \
+         exit 1; \
+       fi
+
+FROM ubuntu:24.04 AS runtime
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /opt/pixop-srt /opt/pixop-srt
+COPY --from=build /usr/local/bin/srt-test-live /usr/local/bin/srt-test-live
+
+ENV LD_LIBRARY_PATH=/opt/pixop-srt/lib
+
+ENTRYPOINT ["srt-test-live"]

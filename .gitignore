@@ -1,0 +1,43 @@
+# Build artifacts
+/build/
+/cmake-build-*/
+*.o
+*.obj
+*.so
+*.a
+*.dylib
+*.dll
+*.exe
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+Makefile
+
+# Testing and runtime outputs
+*.log
+*.tmp
+*.pid
+core
+core.*
+
+# Python virtual environments and caches (used for local tooling/tests)
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Editor and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local helper/runtime folders
+terminals/
+agent-tools/
