@@ -509,6 +509,7 @@ struct MetricsState {
     std::array<std::atomic<uint64_t>, kMaxTrackedMembers> input_link_tx_bytes_current {};
     std::array<std::atomic<uint64_t>, kMaxTrackedMembers> input_link_rx_bytes_last {};
     std::array<std::atomic<uint64_t>, kMaxTrackedMembers> input_link_tx_bytes_last {};
+    std::array<std::atomic<int64_t>, kMaxTrackedMembers> input_link_rtt_ms {};
 
     std::atomic<uint64_t> output_transport_byte_sent_total{0};
     std::atomic<uint64_t> output_transport_byte_sent_unique_total{0};
@@ -544,6 +545,7 @@ struct MetricsState {
             input_link_tx_bytes_current[i].store(0, std::memory_order_relaxed);
             input_link_rx_bytes_last[i].store(0, std::memory_order_relaxed);
             input_link_tx_bytes_last[i].store(0, std::memory_order_relaxed);
+            input_link_rtt_ms[i].store(-1, std::memory_order_relaxed);
         }
     }
 };
@@ -964,6 +966,7 @@ void UpdateInputLinkTrafficPerSlot(MetricsState* metrics) {
         if (i >= capped || identity_key == 0) {
             metrics->input_link_rx_bytes_current[i].store(0, std::memory_order_relaxed);
             metrics->input_link_tx_bytes_current[i].store(0, std::memory_order_relaxed);
+            metrics->input_link_rtt_ms[i].store(-1, std::memory_order_relaxed);
             continue;
         }
 
@@ -972,11 +975,13 @@ void UpdateInputLinkTrafficPerSlot(MetricsState* metrics) {
 
         uint64_t rx_current = 0;
         uint64_t tx_current = 0;
+        int64_t rtt_ms = -1;
         if (member_connected && member_sock != SRT_INVALID_SOCK) {
             SRT_TRACEBSTATS member_stats {};
             if (srt_bstats(member_sock, &member_stats, 0) != SRT_ERROR) {
                 rx_current = member_stats.byteRecvTotal;
                 tx_current = member_stats.byteSentTotal;
+                rtt_ms = static_cast<int64_t>(member_stats.msRTT);
             }
         }
 
@@ -993,6 +998,7 @@ void UpdateInputLinkTrafficPerSlot(MetricsState* metrics) {
         metrics->input_link_tx_bytes_current[i].store(tx_current, std::memory_order_relaxed);
         metrics->input_link_rx_bytes_last[i].store(rx_current, std::memory_order_relaxed);
         metrics->input_link_tx_bytes_last[i].store(tx_current, std::memory_order_relaxed);
+        metrics->input_link_rtt_ms[i].store(rtt_ms, std::memory_order_relaxed);
     }
 }
 
@@ -1247,6 +1253,20 @@ std::string RenderPrometheusMetrics(const MetricsState& metrics) {
         out << "srt_relay_input_link_tx_bytes_current{link_index=\"" << (i + 1)
             << "\",socket_id=\"" << socket_id << "\"} "
             << tx_current << "\n";
+    }
+
+    out << "# HELP srt_relay_input_link_rtt_ms Per-link RTT in milliseconds for each stable input link slot.\n";
+    out << "# TYPE srt_relay_input_link_rtt_ms gauge\n";
+    for (size_t i = 0; i < input_links_snapshot_capped; ++i) {
+        const auto identity_key = metrics.input_member_identity_keys[i].load(std::memory_order_relaxed);
+        if (identity_key == 0) {
+            continue;
+        }
+        const auto socket_id = static_cast<SRTSOCKET>(metrics.input_member_ids[i].load(std::memory_order_relaxed));
+        const auto link_rtt_ms = metrics.input_link_rtt_ms[i].load(std::memory_order_relaxed);
+        out << "srt_relay_input_link_rtt_ms{link_index=\"" << (i + 1)
+            << "\",socket_id=\"" << socket_id << "\"} "
+            << link_rtt_ms << "\n";
     }
 
     emit_u64("srt_relay_input_transport_byte_recv_total", "counter", "Monotonic input transport bytes received across tracked SRT member sockets (includes duplicate traffic).", input_transport_byte_recv_total);
