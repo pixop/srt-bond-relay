@@ -522,6 +522,7 @@ struct MetricsState {
 
     std::atomic<int64_t> input_rtt_ms{-1};
     std::atomic<int64_t> output_rtt_ms{-1};
+    std::atomic<int> input_bond_mode{0};  // 0=unknown, 1=broadcast, 2=backup
 
     std::atomic<int64_t> last_rx_unix_ms{0};
     std::atomic<int64_t> last_tx_unix_ms{0};
@@ -561,6 +562,37 @@ void MaybeUpdateRttMetric(SRTSOCKET sock, std::atomic<int64_t>* out_rtt_ms) {
         return;
     }
     out_rtt_ms->store(static_cast<int64_t>(sock_stats.msRTT), std::memory_order_relaxed);
+}
+
+int ReadBondModeForSocket(SRTSOCKET sock) {
+    if (sock == SRT_INVALID_SOCK) {
+        return 0;
+    }
+    int group_type = static_cast<int>(SRT_GTYPE_UNDEFINED);
+    int opt_len = sizeof(group_type);
+    if (srt_getsockflag(sock, SRTO_GROUPTYPE, &group_type, &opt_len) == SRT_ERROR) {
+        return 0;
+    }
+    if (group_type == static_cast<int>(SRT_GTYPE_BROADCAST)) {
+        return 1;
+    }
+    if (group_type == static_cast<int>(SRT_GTYPE_BACKUP)) {
+        return 2;
+    }
+    return 0;
+}
+
+void UpdateInputBondModeMetric(SRTSOCKET input_session_sock, MetricsState* metrics) {
+    if (input_session_sock == SRT_INVALID_SOCK) {
+        metrics->input_bond_mode.store(0, std::memory_order_relaxed);
+        return;
+    }
+    int mode = ReadBondModeForSocket(input_session_sock);
+    if (mode == 0) {
+        const SRTSOCKET input_group_sock = srt_groupof(input_session_sock);
+        mode = ReadBondModeForSocket(input_group_sock);
+    }
+    metrics->input_bond_mode.store(mode, std::memory_order_relaxed);
 }
 
 bool IsHealthyGroupMember(const SRT_SOCKGROUPDATA& member) {
@@ -1147,6 +1179,7 @@ std::string RenderPrometheusMetrics(const MetricsState& metrics) {
     const auto output_transport_byte_retrans_current = metrics.output_transport_byte_retrans_current.load(std::memory_order_relaxed);
     const auto output_transport_byte_drop_current = metrics.output_transport_byte_drop_current.load(std::memory_order_relaxed);
     const auto path_ready = (input_connected == 1 && output_connected == 1) ? 1 : 0;
+    const auto input_bond_mode = metrics.input_bond_mode.load(std::memory_order_relaxed);
 
     const auto input_rtt_ms = metrics.input_rtt_ms.load(std::memory_order_relaxed);
     const auto output_rtt_ms = metrics.output_rtt_ms.load(std::memory_order_relaxed);
@@ -1290,6 +1323,11 @@ std::string RenderPrometheusMetrics(const MetricsState& metrics) {
 
     emit_i64("srt_relay_input_rtt_ms", "gauge", "Input socket RTT in milliseconds.", input_rtt_ms);
     emit_i64("srt_relay_output_rtt_ms", "gauge", "Output socket RTT in milliseconds.", output_rtt_ms);
+    out << "# HELP srt_relay_input_bond_mode Input bonded mode for active input session (1 for current mode, 0 otherwise).\n";
+    out << "# TYPE srt_relay_input_bond_mode gauge\n";
+    out << "srt_relay_input_bond_mode{mode=\"unknown\"} " << (input_bond_mode == 0 ? 1 : 0) << "\n";
+    out << "srt_relay_input_bond_mode{mode=\"broadcast\"} " << (input_bond_mode == 1 ? 1 : 0) << "\n";
+    out << "srt_relay_input_bond_mode{mode=\"backup\"} " << (input_bond_mode == 2 ? 1 : 0) << "\n";
     emit_i64("srt_relay_last_rx_unix_seconds", "gauge", "Unix timestamp of last received packet.", last_rx_unix_seconds);
     emit_i64("srt_relay_last_tx_unix_seconds", "gauge", "Unix timestamp of last forwarded packet.", last_tx_unix_seconds);
 
@@ -1409,6 +1447,7 @@ void MaybeLogStats(const Config& cfg,
     const auto tx_mps = static_cast<uint64_t>(stats->interval_tx_msgs / sec);
     MaybeUpdateRttMetric(input_session_sock, &metrics->input_rtt_ms);
     MaybeUpdateRttMetric(output_sock, &metrics->output_rtt_ms);
+    UpdateInputBondModeMetric(input_session_sock, metrics);
     UpdateInputLinkHealthMetrics(input_session_sock, metrics);
     UpdateTransportTrafficMetrics(output_sock, metrics);
     const auto input_rtt_ms = metrics->input_rtt_ms.load(std::memory_order_relaxed);
@@ -1418,6 +1457,13 @@ void MaybeLogStats(const Config& cfg,
     const auto input_links_running = metrics->input_links_running.load(std::memory_order_relaxed);
     const auto input_transport_byte_recv_total = metrics->input_transport_byte_recv_total.load(std::memory_order_relaxed);
     const auto output_transport_byte_sent_total = metrics->output_transport_byte_sent_total.load(std::memory_order_relaxed);
+    const auto input_bond_mode = metrics->input_bond_mode.load(std::memory_order_relaxed);
+    const char* input_bond_mode_name = "unknown";
+    if (input_bond_mode == 1) {
+        input_bond_mode_name = "broadcast";
+    } else if (input_bond_mode == 2) {
+        input_bond_mode_name = "backup";
+    }
     const auto input_link_status = BuildInputLinkStatusCompact(*metrics);
 
     metrics->rx_bytes_per_sec.store(rx_bps, std::memory_order_relaxed);
@@ -1442,6 +1488,7 @@ void MaybeLogStats(const Config& cfg,
                "input_link_status=" + input_link_status,
                "input_transport_byte_recv_total=" + std::to_string(input_transport_byte_recv_total),
                "output_transport_byte_sent_total=" + std::to_string(output_transport_byte_sent_total),
+               std::string("input_bond_mode=") + input_bond_mode_name,
                std::string("input_state=") + (state.input_connected ? "connected" : (state.input_listening ? "listening" : "down")),
                std::string("output_state=") + (state.output_connected ? "connected" : "down"));
 
