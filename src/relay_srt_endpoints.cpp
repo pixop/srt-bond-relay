@@ -1,5 +1,8 @@
 #include "relay_io_internal.hpp"
 
+#include <netdb.h>
+
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -63,6 +66,42 @@ SRTSOCKET AcceptBondSession(const std::vector<SRTSOCKET>& listeners, const Confi
 }
 
 namespace {
+
+const std::string* QueryFirstValue(const std::map<std::string, std::string>& query,
+                                   std::initializer_list<const char*> keys) {
+    for (const char* key : keys) {
+        const auto it = query.find(key);
+        if (it != query.end() && !it->second.empty()) return &it->second;
+    }
+    return nullptr;
+}
+
+bool ResolveSourceSockaddrForPeerFamily(const std::string& source_host,
+                                        int peer_family,
+                                        sockaddr_storage* out_addr,
+                                        socklen_t* out_len) {
+    if (source_host.empty() || out_addr == nullptr || out_len == nullptr) {
+        return false;
+    }
+
+    addrinfo hints {};
+    hints.ai_family = (peer_family == AF_INET || peer_family == AF_INET6) ? peer_family : AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_protocol = IPPROTO_UDP;
+    hints.ai_flags = AI_NUMERICHOST;
+
+    addrinfo* result = nullptr;
+    const int rc = getaddrinfo(source_host.c_str(), "0", &hints, &result);
+    if (rc != 0 || result == nullptr) {
+        return false;
+    }
+
+    std::memset(out_addr, 0, sizeof(*out_addr));
+    std::memcpy(out_addr, result->ai_addr, result->ai_addrlen);
+    *out_len = static_cast<socklen_t>(result->ai_addrlen);
+    freeaddrinfo(result);
+    return true;
+}
 
 void AddConfigIntOption(SRT_SOCKOPT_CONFIG* cfg, SRT_SOCKOPT opt, int value, const char* opt_name) {
     if (cfg == nullptr) return;
@@ -209,8 +248,23 @@ SRTSOCKET ConnectBondedCallerGroup(const std::vector<SrtUri>& uris,
         for (const auto& uri : uris) {
             socklen_t addr_len = 0;
             sockaddr_storage addr = ResolveSockaddr(uri.host, uri.port, &addr_len);
+            const sockaddr* src_addr_ptr = nullptr;
+            sockaddr_storage src_addr {};
+            socklen_t src_addr_len = 0;
+
+            if (const std::string* source_host =
+                    QueryFirstValue(uri.query, {"srcip", "sourceip", "localip", "adapterip", "adapter_ip"})) {
+                if (!ResolveSourceSockaddrForPeerFamily(*source_host,
+                                                        reinterpret_cast<const sockaddr*>(&addr)->sa_family,
+                                                        &src_addr,
+                                                        &src_addr_len)) {
+                    throw std::runtime_error("failed to resolve source adapter IP for bonded member: " + *source_host);
+                }
+                src_addr_ptr = reinterpret_cast<const sockaddr*>(&src_addr);
+            }
+
             SRT_SOCKGROUPCONFIG endpoint =
-                srt_prepare_endpoint(nullptr, reinterpret_cast<const sockaddr*>(&addr), static_cast<int>(addr_len));
+                srt_prepare_endpoint(src_addr_ptr, reinterpret_cast<const sockaddr*>(&addr), static_cast<int>(addr_len));
             endpoint.config = opt_cfg;
             endpoints.push_back(endpoint);
         }

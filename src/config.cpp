@@ -29,6 +29,7 @@ void PrintUsage() {
         << "  Output: srt mode=caller|listener, stdout aliases: stdout|-|fd://stdout\n"
         << "  Group list for bonded SRT: separate endpoints with ';' or ','\n"
         << "  Bond mode query options: grouptype|group_type|bond|bond_mode\n"
+        << "  Bonded per-path source IP options: srcip|sourceip|localip|adapterip|adapter_ip\n"
         << "  --help\n";
 }
 

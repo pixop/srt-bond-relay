@@ -107,14 +107,15 @@ Bonded SRT endpoint list syntax:
 
 - Provide multiple SRT URIs in one flag, separated by `;` (preferred) or `,`
 - Example:
-  - `--input "srt://10.0.0.1:9000?mode=caller;srt://10.0.1.1:9000?mode=caller&grouptype=broadcast"`
-  - `--output "srt://10.0.0.2:5000?mode=caller;srt://10.0.1.2:5000?mode=caller&grouptype=broadcast"`
+  - `--input "srt://10.0.0.1:9000?mode=caller&srcip=10.0.0.10;srt://10.0.1.1:9000?mode=caller&srcip=10.0.1.10&grouptype=broadcast"`
+  - `--output "srt://10.0.0.2:5000?mode=caller&srcip=10.0.0.10;srt://10.0.1.2:5000?mode=caller&srcip=10.0.1.10&grouptype=broadcast"`
 - Bond query aliases: `grouptype`, `group_type`, `bond`, `bond_mode` (`broadcast` or `backup`)
+- Per-member source adapter IP aliases: `srcip`, `sourceip`, `localip`, `adapterip`, `adapter_ip`
 
 Two-path bonded connection to a server:
 
 - Caller side example (connect over two paths to one server):
-  - `--output "srt://10.10.1.20:5000?mode=caller&transtype=live&latency=120;srt://10.20.1.20:5000?mode=caller&transtype=live&latency=120&grouptype=broadcast"`
+  - `--output "srt://10.10.1.20:5000?mode=caller&transtype=live&latency=120&srcip=10.10.1.10;srt://10.20.1.20:5000?mode=caller&transtype=live&latency=120&srcip=10.20.1.10&grouptype=broadcast"`
 - Same pattern also works for `--input` in caller mode.
 - All URIs in one grouped endpoint must use the same `mode`.
 
