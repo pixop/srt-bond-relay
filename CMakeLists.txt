@@ -33,6 +33,16 @@ endif()
 
 add_executable(srt-bond-relay
     main.cpp
+    src/config.cpp
+    src/linkage.cpp
+    src/logger.cpp
+    src/metrics.cpp
+    src/relay_endpoint_specs.cpp
+    src/relay_input_sources.cpp
+    src/relay_output_sinks.cpp
+    src/relay_srt_endpoints.cpp
+    src/relay_runtime.cpp
+    src/srt_utils.cpp
 )
 
 target_compile_options(srt-bond-relay PRIVATE
@@ -44,6 +54,9 @@ target_compile_options(srt-bond-relay PRIVATE
 if (PIXOP_SRT_INCLUDE_DIRS)
     target_include_directories(srt-bond-relay PRIVATE ${PIXOP_SRT_INCLUDE_DIRS})
 endif()
+target_include_directories(srt-bond-relay PRIVATE
+    include
+)
 if (PIXOP_SRT_LIBRARY_DIRS)
     target_link_directories(srt-bond-relay PRIVATE ${PIXOP_SRT_LIBRARY_DIRS})
 endif()

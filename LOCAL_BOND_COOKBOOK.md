@@ -4,6 +4,11 @@ This cookbook shows how to test bonded SRT input to `srt-bond-relay` fully local
 
 It uses two Docker bridge networks as two virtual links, one relay instance, one bonded sender, and one local SRT sink.
 
+This runbook validates the SRT output path (`--output srt://...`).  
+For stdout egress (`--output stdout`), use the main README examples instead of this sink-based topology.
+
+The relay now also supports input `mode=caller` and output `mode=listener`, but this cookbook keeps the original topology (`input listener` -> `output caller`) for repeatable baseline validation.
+
 ## Fast path (recommended)
 
 Use the automation script:

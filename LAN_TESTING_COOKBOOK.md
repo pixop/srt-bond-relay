@@ -9,6 +9,11 @@ It focuses on:
 - relay output recovery
 - transport-level observability checks
 
+This guide targets SRT output mode (`--output srt://...`).  
+If you run stdout mode (`--output stdout`), SRT output socket metrics (RTT and output transport counters) are not applicable.
+
+The relay supports both caller/listener SRT roles on input and output. This cookbook uses caller output for sink compatibility, but you can adapt it to output listener mode by reversing sink/relay connect direction.
+
 ## Scope and Goal
 
 Validate that the relay can:

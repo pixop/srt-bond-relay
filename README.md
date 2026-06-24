@@ -1,11 +1,17 @@
 # srt-bond-relay
 
-`srt-bond-relay` is a production-focused SRT relay for MPEG-TS workflows.  
-It accepts bonded or regular SRT input and forwards it to a single SRT output, with reconnect/failover logic and Prometheus metrics.
+`srt-bond-relay` is a production-focused relay for MPEG-TS workflows.  
+It supports SRT listener/caller on both input and output, bonded SRT on both sides, and stdin/stdout endpoints, with reconnect/failover logic and Prometheus metrics.
 
 ## Repository Layout
 
-- `main.cpp`: relay runtime (receive/forward loop, reconnects, metrics)
+- `main.cpp`: process entrypoint (args, signals, startup/cleanup)
+- `src/config.cpp`: CLI parsing and validation
+- `src/logger.cpp`: structured logging
+- `src/srt_utils.cpp`: SRT URI parsing, sockopts, and socket utilities
+- `src/metrics.cpp`: bonded-link metrics, Prometheus rendering, metrics server
+- `src/linkage.cpp`: linkage verification path (`--verify-linkage`)
+- `include/srtrelay/*.hpp`: shared interfaces/types used by modules
 - `CMakeLists.txt`: standalone CMake build
 - `Dockerfile`: image for `srt-bond-relay` (custom `libsrt`)
 - `Dockerfile.srt-test-live`: image for `srt-test-live` used in tests
@@ -71,6 +77,17 @@ docker run --rm --network my_media_net \
   --reconnect-delay-ms 1000
 ```
 
+Stdout egress example (binary payload on stdout):
+
+```bash
+docker run --rm --network host \
+  srt-bond-relay:dev \
+  --input "srt://0.0.0.0:9000?mode=listener&transtype=live&latency=120" \
+  --output "stdout" \
+  --stats-interval-ms 1000 \
+  --reconnect-delay-ms 1000 > stream.ts
+```
+
 ## CLI (Core Flags)
 
 Required:
@@ -85,10 +102,30 @@ Common optional flags:
 - `--max-message-size`
 - `--io-timeout-ms`
 - `--log-level`
+- `--exit-on-input-failure`
+- `--exit-on-output-failure`
 - `--metrics-enabled`
 - `--metrics-host`
 - `--metrics-port`
 - `--verify-linkage`
+
+`--input` accepted values:
+
+- `srt://...` with `mode=listener|caller` (default `listener` when omitted)
+- `stdin`, `-`, or `fd://stdin`
+
+`--output` accepted values:
+
+- `srt://...` with `mode=caller|listener` (default `caller` when omitted)
+- `stdout`, `-`, or `fd://stdout` (binary MPEG-TS to process stdout)
+
+Bonded SRT endpoint list syntax:
+
+- Provide multiple SRT URIs in one flag, separated by `;` (preferred) or `,`
+- Example:
+  - `--input "srt://10.0.0.1:9000?mode=caller;srt://10.0.1.1:9000?mode=caller&grouptype=broadcast"`
+  - `--output "srt://10.0.0.2:5000?mode=caller;srt://10.0.1.2:5000?mode=caller&grouptype=broadcast"`
+- Bond query aliases: `grouptype`, `group_type`, `bond`, `bond_mode` (`broadcast` or `backup`)
 
 ## Observability
 
@@ -104,7 +141,13 @@ Metrics include:
 - bonded input link health summary and stable-slot per-link status/traffic/RTT
 - aggregate transport counters plus session-level RTT and activity timestamps
 
-Logs are structured key-value lines (startup, connection transitions, periodic stats, shutdown totals).
+When output mode is `stdout`:
+
+- `srt_relay_output_rtt_ms` is set to `0`
+- output SRT transport counters stay at neutral values because no output SRT socket exists
+- total relay tx/rx counters still reflect forwarded traffic
+
+Logs are structured key-value lines (startup, connection transitions, periodic stats, shutdown totals) and are emitted on `stderr`.
 
 ## Testing Guides
 
@@ -129,7 +172,7 @@ Applied as socket flags when present:
 
 ## Current Limitations
 
-- input is listener-oriented (caller/rendezvous input modes not implemented)
-- URI parser is intentionally narrow (`srt://host:port?...`)
-- unsupported URI options are ignored (debug logged)
+- unsupported URI query options are ignored (debug logged)
+- output listener mode is single-consumer at a time (no fanout/multi-client)
+- output listener mode blocks forwarding until a downstream client is connected
 - per-link observability depends on bonded member snapshot availability from libsrt; when unavailable, relay falls back to a single synthetic input-link slot for continuity
