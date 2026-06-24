@@ -3,22 +3,6 @@
 `srt-bond-relay` is a production-focused relay for MPEG-TS workflows.  
 It supports SRT listener/caller on both input and output, bonded SRT on both sides, and stdin/stdout endpoints, with reconnect/failover logic and Prometheus metrics.
 
-## Repository Layout
-
-- `main.cpp`: process entrypoint (args, signals, startup/cleanup)
-- `src/config.cpp`: CLI parsing and validation
-- `src/logger.cpp`: structured logging
-- `src/srt_utils.cpp`: SRT URI parsing, sockopts, and socket utilities
-- `src/metrics.cpp`: bonded-link metrics, Prometheus rendering, metrics server
-- `src/linkage.cpp`: linkage verification path (`--verify-linkage`)
-- `include/srtrelay/*.hpp`: shared interfaces/types used by modules
-- `CMakeLists.txt`: standalone CMake build
-- `Dockerfile`: image for `srt-bond-relay` (custom `libsrt`)
-- `Dockerfile.srt-test-live`: image for `srt-test-live` used in tests
-- `scripts/local-bond-lab.sh`: local bonded test automation
-- `LOCAL_BOND_COOKBOOK.md`: single-host bonded lab guide
-- `LAN_TESTING_COOKBOOK.md`: multi-host LAN testing guide
-
 ## Build Images
 
 Build relay image:
@@ -126,6 +110,13 @@ Bonded SRT endpoint list syntax:
   - `--input "srt://10.0.0.1:9000?mode=caller;srt://10.0.1.1:9000?mode=caller&grouptype=broadcast"`
   - `--output "srt://10.0.0.2:5000?mode=caller;srt://10.0.1.2:5000?mode=caller&grouptype=broadcast"`
 - Bond query aliases: `grouptype`, `group_type`, `bond`, `bond_mode` (`broadcast` or `backup`)
+
+Two-path bonded connection to a server:
+
+- Caller side example (connect over two paths to one server):
+  - `--output "srt://10.10.1.20:5000?mode=caller&transtype=live&latency=120;srt://10.20.1.20:5000?mode=caller&transtype=live&latency=120&grouptype=broadcast"`
+- Same pattern also works for `--input` in caller mode.
+- All URIs in one grouped endpoint must use the same `mode`.
 
 ## Observability
 
