@@ -114,7 +114,7 @@ Minimal conceptual encrypted bonded receive -> local unencrypted SRT relay:
 docker run --rm --network host \
   srt-bond-relay:dev \
   --input "srt://LOCAL_NIC_A:5000?passphrase=SECRET&pbkeylen=32;\
-           srt://LOCAL_NIC_B:5000?passphrase=SECRET&pbkeylen=32&grouptype=broadcast" \
+           srt://LOCAL_NIC_B:5000?passphrase=SECRET&pbkeylen=32" \
   --output "srt://127.0.0.1:5010?latency=20"
 ```
 
