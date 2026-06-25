@@ -114,7 +114,7 @@ Minimal conceptual encrypted bonded receive -> local unencrypted SRT relay:
 docker run --rm --network host \
   srt-bond-relay:dev \
   --input "srt://LOCAL_NIC_A:5000?passphrase=SECRET&pbkeylen=32;\
-           srt://LOCAL_NIC_B:5000?passphrase=SECRET&pbkeylen=32&grouptype=broadcast" \
+           srt://LOCAL_NIC_B:5000?passphrase=SECRET&pbkeylen=32" \
   --output "srt://127.0.0.1:5010?latency=20"
 ```
 
@@ -184,25 +184,34 @@ Two-path bonded connection to a server:
 
 ## Observability
 
-Metrics endpoint:
+Metrics server:
 
 - `GET /metrics` on `http://<metrics-host>:<metrics-port>`
 - `GET /healthz` returns `ok`
+- Controlled by `--metrics-enabled`, `--metrics-host`, `--metrics-port`
 
-Metrics include:
+Metrics are refreshed on each stats tick (`--stats-interval-ms`) and include:
 
-- relay throughput and message counters
-- input/output state, path readiness, and detected input bond mode
-- bonded input link health summary and stable-slot per-link status/traffic/RTT
-- aggregate transport counters plus session-level RTT and activity timestamps
+- Relay totals and rates (`*_bytes_*`, `*_messages_*`, reconnect/send-failure counters)
+- Path state (`input_listening`, `input_connected`, `output_connected`, `path_ready`)
+- Bond mode gauges for both directions (`srt_relay_input_bond_mode{mode=...}`, `srt_relay_output_bond_mode{mode=...}`)
+- Input and output link health (`*_links_total|healthy|running`) plus per-link stable-slot metrics (`*_link_connected`, `*_link_*_bytes_*`, `*_link_rtt_ms` with `link_index`/`socket_id` labels)
+- Transport-level SRT counters for both directions (total/current recv or sent bytes, unique bytes, retrans, loss/drop, tracked member count)
+- Session RTT and last-activity timestamps (`srt_relay_input_rtt_ms`, `srt_relay_output_rtt_ms`, `srt_relay_last_*_unix_seconds`)
+
+When input mode is `stdin` or `udp://...`:
+
+- input SRT link/transport metrics and input bond mode stay in neutral/unknown states because no input SRT session socket exists
+- `srt_relay_input_rtt_ms` remains `-1` when no input SRT socket is present
+- relay tx/rx totals and rates still reflect forwarded traffic
 
 When output mode is `stdout` or `udp://...`:
 
 - `srt_relay_output_rtt_ms` is set to `0`
-- output SRT transport counters stay at neutral values because no output SRT socket exists
-- total relay tx/rx counters still reflect forwarded traffic
+- output SRT link/transport metrics and output bond mode stay in neutral/unknown states because no output SRT socket exists
+- relay tx/rx totals and rates still reflect forwarded traffic
 
-Logs are structured key-value lines (startup, connection transitions, periodic stats, shutdown totals) and are emitted on `stderr`.
+Logs are structured key-value lines on `stderr` (`startup`, connection transitions, periodic `stats`, `shutdown`, and metrics server lifecycle events).
 
 ## Testing Guides
 
