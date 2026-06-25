@@ -204,8 +204,9 @@ Two-path bonded connection to a server:
 
 Metrics server:
 
-- `GET /metrics` on `http://<metrics-host>:<metrics-port>`
 - `GET /healthz` returns `ok`
+- `GET /metrics` on `http://<metrics-host>:<metrics-port>`
+- `POST /metrics/links/compact?direction=input|output|both` compacts active per-link slot indexes and drops disconnected slots from exported stable-slot series (when `direction` is omitted, default is `both`)
 - Controlled by `--metrics-enabled`, `--metrics-host`, `--metrics-port`
 
 Metrics are refreshed on each stats tick (`--stats-interval-ms`) and include:

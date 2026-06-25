@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -129,6 +130,7 @@ struct MetricsState {
 
     std::unordered_map<SRTSOCKET, TransportCounterSnapshot> input_transport_last_by_socket;
     std::unordered_map<SRTSOCKET, TransportCounterSnapshot> output_transport_last_by_socket;
+    mutable std::mutex link_metrics_mutex;
 
     MetricsState();
 };
@@ -140,7 +142,7 @@ enum class OutputMetricsMode {
 
 class MetricsServer {
 public:
-    MetricsServer(const Config& cfg, const Logger& logger, const MetricsState& metrics);
+    MetricsServer(const Config& cfg, const Logger& logger, MetricsState& metrics);
     ~MetricsServer();
 
     void Start();
@@ -149,7 +151,7 @@ public:
 private:
     const Config& cfg_;
     const Logger& logger_;
-    const MetricsState& metrics_;
+    MetricsState& metrics_;
     httplib::Server server_;
     std::thread thread_;
 };
