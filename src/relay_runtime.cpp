@@ -1,8 +1,6 @@
 #include "srtrelay/relay.hpp"
 
-#include <cerrno>
 #include <chrono>
-#include <cstring>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -28,6 +26,42 @@ void SleepReconnectDelay(const Config& cfg) {
     }
 }
 
+const char* InputModeLabel(InputEndpointKind kind) {
+    switch (kind) {
+        case InputEndpointKind::kStdin:
+            return "stdin";
+        case InputEndpointKind::kSrtCaller:
+            return "srt-caller";
+        case InputEndpointKind::kSrtListener:
+            return "srt-listener";
+        case InputEndpointKind::kUdpCaller:
+            return "udp-caller";
+        case InputEndpointKind::kUdpListener:
+            return "udp-listener";
+    }
+    return "unknown";
+}
+
+const char* OutputModeLabel(OutputEndpointKind kind) {
+    switch (kind) {
+        case OutputEndpointKind::kStdout:
+            return "stdout";
+        case OutputEndpointKind::kSrtListener:
+            return "srt-listener";
+        case OutputEndpointKind::kSrtCaller:
+            return "srt-caller";
+        case OutputEndpointKind::kUdpCaller:
+            return "udp-caller";
+        case OutputEndpointKind::kUdpListener:
+            return "udp-listener";
+    }
+    return "unknown";
+}
+
+bool IsSrtInputKind(InputEndpointKind kind) {
+    return kind == InputEndpointKind::kSrtListener || kind == InputEndpointKind::kSrtCaller;
+}
+
 int RelayMain(const Config& cfg, const Logger& logger) {
     const InputEndpointSpec input_spec = ParseInputEndpointSpec(cfg);
     const OutputEndpointSpec output_spec = ParseOutputEndpointSpec(cfg);
@@ -49,10 +83,8 @@ int RelayMain(const Config& cfg, const Logger& logger) {
     logger.Log(LogLevel::kInfo, "startup",
                "input_uri=" + cfg.input_uri,
                "output_uri=" + cfg.output_uri,
-               "input_mode=" + std::string(input_spec.kind == InputEndpointKind::kStdin ? "stdin" :
-                                            (input_spec.kind == InputEndpointKind::kSrtCaller ? "srt-caller" : "srt-listener")),
-               "output_mode=" + std::string(output_spec.kind == OutputEndpointKind::kStdout ? "stdout" :
-                                             (output_spec.kind == OutputEndpointKind::kSrtListener ? "srt-listener" : "srt-caller")),
+               "input_mode=" + std::string(InputModeLabel(input_spec.kind)),
+               "output_mode=" + std::string(OutputModeLabel(output_spec.kind)),
                "input_bonded=" + std::string(input_spec.bonded ? "true" : "false"),
                "output_bonded=" + std::string(output_spec.bonded ? "true" : "false"),
                "stats_interval_ms=" + std::to_string(cfg.stats_interval_ms),
@@ -75,10 +107,13 @@ int RelayMain(const Config& cfg, const Logger& logger) {
             try {
                 input_source->EnsureReady(cfg, logger, &metrics);
             } catch (const std::exception& ex) {
-                if (IsSrtTimeoutError()) {
+                if (input_source->LastEnsureErrorKind() == IoErrorKind::kTimeout) {
                     continue;
                 }
-                logger.Log(LogLevel::kWarn, "input-ensure-failed", "error=" + std::string(ex.what()));
+                const std::string message = input_source->LastEnsureErrorMessage().empty()
+                                                ? std::string(ex.what())
+                                                : input_source->LastEnsureErrorMessage();
+                logger.Log(LogLevel::kWarn, "input-ensure-failed", "error=" + message);
                 input_source->HandleReceiveError(cfg, logger, &metrics);
                 if (cfg.exit_on_input_failure) return 2;
                 SleepReconnectDelay(cfg);
@@ -90,11 +125,14 @@ int RelayMain(const Config& cfg, const Logger& logger) {
             try {
                 output_sink->EnsureReady(cfg, logger, &stats, &metrics);
             } catch (const std::exception& ex) {
-                if (IsSrtTimeoutError()) {
+                if (output_sink->LastEnsureErrorKind() == IoErrorKind::kTimeout) {
                     continue;
                 }
+                const std::string message = output_sink->LastEnsureErrorMessage().empty()
+                                                ? std::string(ex.what())
+                                                : output_sink->LastEnsureErrorMessage();
                 logger.Log(LogLevel::kWarn, "output-connect-failed",
-                           "error=" + std::string(ex.what()),
+                           "error=" + message,
                            "reconnect_count=" + std::to_string(stats.reconnect_count));
                 output_sink->MarkDisconnected(&metrics);
                 if (cfg.exit_on_output_failure) return 3;
@@ -113,13 +151,11 @@ int RelayMain(const Config& cfg, const Logger& logger) {
                 logger.Log(LogLevel::kInfo, "input-eof");
                 break;
             }
-            if (IsSrtTimeoutError()) {
+            if (input_source->LastReceiveErrorKind() == IoErrorKind::kTimeout) {
                 continue;
             }
-            std::string err = SrtLastErrorString();
-            if (input_spec.kind == InputEndpointKind::kStdin && errno != 0) {
-                err = std::strerror(errno);
-            }
+            std::string err = input_source->LastReceiveErrorMessage();
+            if (err.empty()) err = "input receive failed";
             logger.Log(LogLevel::kWarn, "input-disconnected", "error=" + err);
             input_source->HandleReceiveError(cfg, logger, &metrics);
             if (cfg.exit_on_input_failure) return 2;
@@ -130,7 +166,7 @@ int RelayMain(const Config& cfg, const Logger& logger) {
         stats.total_rx_msgs += 1;
         stats.interval_rx_bytes += static_cast<uint64_t>(recv_size);
         stats.interval_rx_msgs += 1;
-        if (input_spec.kind != InputEndpointKind::kStdin) {
+        if (IsSrtInputKind(input_spec.kind)) {
             UpdateInputLinkHealthFromMsgCtrl(rx_ctrl, &metrics);
         }
         metrics.total_rx_bytes.store(stats.total_rx_bytes, std::memory_order_relaxed);
@@ -145,10 +181,8 @@ int RelayMain(const Config& cfg, const Logger& logger) {
             metrics.total_send_failures.store(stats.total_send_failures, std::memory_order_relaxed);
             metrics.reconnect_count.store(stats.reconnect_count, std::memory_order_relaxed);
 
-            std::string err = SrtLastErrorString();
-            if (output_sink->MetricsMode() == OutputMetricsMode::kStdout) {
-                err = std::strerror(errno);
-            }
+            std::string err = output_sink->LastSendErrorMessage();
+            if (err.empty()) err = "output send failed";
             logger.Log(LogLevel::kWarn, "output-send-failed",
                        "error=" + err,
                        "reconnect_count=" + std::to_string(stats.reconnect_count));

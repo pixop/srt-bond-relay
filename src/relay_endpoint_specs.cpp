@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -57,6 +58,24 @@ std::vector<SrtUri> ParseSrtUriList(const std::string& spec) {
     return uris;
 }
 
+enum class EndpointScheme {
+    kSrt,
+    kUdp,
+};
+
+EndpointScheme DetectScheme(const std::string& value) {
+    if (value.rfind("srt://", 0) == 0) return EndpointScheme::kSrt;
+    if (value.rfind("udp://", 0) == 0) return EndpointScheme::kUdp;
+    throw std::runtime_error("unsupported endpoint URI scheme: " + value);
+}
+
+bool HasBondQueryOption(const std::map<std::string, std::string>& query) {
+    return !QueryString(query, "grouptype").empty() ||
+           !QueryString(query, "group_type").empty() ||
+           !QueryString(query, "bond").empty() ||
+           !QueryString(query, "bond_mode").empty();
+}
+
 std::optional<SRT_GROUP_TYPE> ParseBondGroupType(const std::map<std::string, std::string>& query) {
     std::string value = QueryString(query, "grouptype");
     if (value.empty()) value = QueryString(query, "group_type");
@@ -87,6 +106,21 @@ SRT_GROUP_TYPE ResolveGroupType(const std::vector<SrtUri>& uris) {
     return SRT_GTYPE_UNDEFINED;
 }
 
+std::vector<std::string> ParseRawUriList(const std::string& spec, EndpointScheme* out_scheme) {
+    const auto raw = SplitSpecList(spec);
+    if (raw.empty()) {
+        throw std::runtime_error("empty endpoint specification");
+    }
+    const EndpointScheme scheme = DetectScheme(raw.front());
+    for (const auto& token : raw) {
+        if (DetectScheme(token) != scheme) {
+            throw std::runtime_error("mixed endpoint URI schemes are not supported in one endpoint list");
+        }
+    }
+    *out_scheme = scheme;
+    return raw;
+}
+
 }  // namespace
 
 InputEndpointSpec ParseInputEndpointSpec(const Config& cfg) {
@@ -96,31 +130,53 @@ InputEndpointSpec ParseInputEndpointSpec(const Config& cfg) {
         return out;
     }
 
-    out.uris = ParseSrtUriList(cfg.input_uri);
-    const std::string mode = QueryString(out.uris.front().query, "mode");
-    const std::string resolved_mode = mode.empty() ? "listener" : mode;
-    for (const auto& uri : out.uris) {
-        const std::string uri_mode = QueryString(uri.query, "mode");
-        const std::string uri_resolved_mode = uri_mode.empty() ? "listener" : uri_mode;
-        if (uri_resolved_mode != resolved_mode) {
-            throw std::runtime_error("all input SRT URIs must use the same mode");
+    EndpointScheme scheme = EndpointScheme::kSrt;
+    const auto raw = ParseRawUriList(cfg.input_uri, &scheme);
+    if (scheme == EndpointScheme::kSrt) {
+        out.uris = ParseSrtUriList(cfg.input_uri);
+        const std::string mode = QueryString(out.uris.front().query, "mode");
+        const std::string resolved_mode = mode.empty() ? "listener" : mode;
+        for (const auto& uri : out.uris) {
+            const std::string uri_mode = QueryString(uri.query, "mode");
+            const std::string uri_resolved_mode = uri_mode.empty() ? "listener" : uri_mode;
+            if (uri_resolved_mode != resolved_mode) {
+                throw std::runtime_error("all input SRT URIs must use the same mode");
+            }
         }
+
+        if (resolved_mode == "listener") {
+            out.kind = InputEndpointKind::kSrtListener;
+        } else if (resolved_mode == "caller") {
+            out.kind = InputEndpointKind::kSrtCaller;
+        } else {
+            throw std::runtime_error("input SRT URI mode must be listener or caller");
+        }
+
+        out.group_type = ResolveGroupType(out.uris);
+        out.bonded = out.uris.size() > 1 || out.group_type != SRT_GTYPE_UNDEFINED;
+        if (!out.bonded) {
+            out.group_type = SRT_GTYPE_UNDEFINED;
+        } else if (out.group_type == SRT_GTYPE_UNDEFINED) {
+            out.group_type = SRT_GTYPE_BROADCAST;
+        }
+        return out;
     }
 
+    if (raw.size() != 1) {
+        throw std::runtime_error("grouped endpoint lists are only supported for SRT URIs");
+    }
+    out.udp_uri = ParseUdpUri(raw.front());
+    if (HasBondQueryOption(out.udp_uri.query)) {
+        throw std::runtime_error("bond options are only supported for SRT URIs");
+    }
+    const std::string mode = QueryString(out.udp_uri.query, "mode");
+    const std::string resolved_mode = mode.empty() ? "listener" : mode;
     if (resolved_mode == "listener") {
-        out.kind = InputEndpointKind::kSrtListener;
+        out.kind = InputEndpointKind::kUdpListener;
     } else if (resolved_mode == "caller") {
-        out.kind = InputEndpointKind::kSrtCaller;
+        throw std::runtime_error("input UDP caller mode is not supported; use mode=listener");
     } else {
-        throw std::runtime_error("input URI mode must be listener or caller");
-    }
-
-    out.group_type = ResolveGroupType(out.uris);
-    out.bonded = out.uris.size() > 1 || out.group_type != SRT_GTYPE_UNDEFINED;
-    if (!out.bonded) {
-        out.group_type = SRT_GTYPE_UNDEFINED;
-    } else if (out.group_type == SRT_GTYPE_UNDEFINED) {
-        out.group_type = SRT_GTYPE_BROADCAST;
+        throw std::runtime_error("input UDP URI mode must be listener or caller");
     }
     return out;
 }
@@ -132,31 +188,53 @@ OutputEndpointSpec ParseOutputEndpointSpec(const Config& cfg) {
         return out;
     }
 
-    out.uris = ParseSrtUriList(cfg.output_uri);
-    const std::string mode = QueryString(out.uris.front().query, "mode");
-    const std::string resolved_mode = mode.empty() ? "caller" : mode;
-    for (const auto& uri : out.uris) {
-        const std::string uri_mode = QueryString(uri.query, "mode");
-        const std::string uri_resolved_mode = uri_mode.empty() ? "caller" : uri_mode;
-        if (uri_resolved_mode != resolved_mode) {
-            throw std::runtime_error("all output SRT URIs must use the same mode");
+    EndpointScheme scheme = EndpointScheme::kSrt;
+    const auto raw = ParseRawUriList(cfg.output_uri, &scheme);
+    if (scheme == EndpointScheme::kSrt) {
+        out.uris = ParseSrtUriList(cfg.output_uri);
+        const std::string mode = QueryString(out.uris.front().query, "mode");
+        const std::string resolved_mode = mode.empty() ? "caller" : mode;
+        for (const auto& uri : out.uris) {
+            const std::string uri_mode = QueryString(uri.query, "mode");
+            const std::string uri_resolved_mode = uri_mode.empty() ? "caller" : uri_mode;
+            if (uri_resolved_mode != resolved_mode) {
+                throw std::runtime_error("all output SRT URIs must use the same mode");
+            }
         }
+
+        if (resolved_mode == "caller") {
+            out.kind = OutputEndpointKind::kSrtCaller;
+        } else if (resolved_mode == "listener") {
+            out.kind = OutputEndpointKind::kSrtListener;
+        } else {
+            throw std::runtime_error("output SRT URI mode must be caller or listener");
+        }
+
+        out.group_type = ResolveGroupType(out.uris);
+        out.bonded = out.uris.size() > 1 || out.group_type != SRT_GTYPE_UNDEFINED;
+        if (!out.bonded) {
+            out.group_type = SRT_GTYPE_UNDEFINED;
+        } else if (out.group_type == SRT_GTYPE_UNDEFINED) {
+            out.group_type = SRT_GTYPE_BROADCAST;
+        }
+        return out;
     }
 
+    if (raw.size() != 1) {
+        throw std::runtime_error("grouped endpoint lists are only supported for SRT URIs");
+    }
+    out.udp_uri = ParseUdpUri(raw.front());
+    if (HasBondQueryOption(out.udp_uri.query)) {
+        throw std::runtime_error("bond options are only supported for SRT URIs");
+    }
+    const std::string mode = QueryString(out.udp_uri.query, "mode");
+    const std::string resolved_mode = mode.empty() ? "caller" : mode;
     if (resolved_mode == "caller") {
-        out.kind = OutputEndpointKind::kSrtCaller;
+        out.kind = OutputEndpointKind::kUdpCaller;
     } else if (resolved_mode == "listener") {
-        out.kind = OutputEndpointKind::kSrtListener;
+        throw std::runtime_error("output UDP listener mode is not supported; use mode=caller");
     } else {
-        throw std::runtime_error("output URI mode must be caller or listener");
-    }
-
-    out.group_type = ResolveGroupType(out.uris);
-    out.bonded = out.uris.size() > 1 || out.group_type != SRT_GTYPE_UNDEFINED;
-    if (!out.bonded) {
-        out.group_type = SRT_GTYPE_UNDEFINED;
-    } else if (out.group_type == SRT_GTYPE_UNDEFINED) {
-        out.group_type = SRT_GTYPE_BROADCAST;
+        throw std::runtime_error("output UDP URI mode must be caller or listener");
     }
     return out;
 }

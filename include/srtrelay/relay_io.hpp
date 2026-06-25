@@ -15,18 +15,30 @@ namespace srtrelay {
 enum class InputEndpointKind {
     kSrtListener,
     kSrtCaller,
+    kUdpListener,
+    kUdpCaller,
     kStdin,
 };
 
 enum class OutputEndpointKind {
     kSrtCaller,
     kSrtListener,
+    kUdpCaller,
+    kUdpListener,
     kStdout,
+};
+
+enum class IoErrorKind {
+    kNone,
+    kTimeout,
+    kDisconnected,
+    kError,
 };
 
 struct InputEndpointSpec {
     InputEndpointKind kind = InputEndpointKind::kSrtListener;
     std::vector<SrtUri> uris;
+    UdpUri udp_uri;
     bool bonded = false;
     SRT_GROUP_TYPE group_type = SRT_GTYPE_UNDEFINED;
 };
@@ -34,6 +46,7 @@ struct InputEndpointSpec {
 struct OutputEndpointSpec {
     OutputEndpointKind kind = OutputEndpointKind::kSrtCaller;
     std::vector<SrtUri> uris;
+    UdpUri udp_uri;
     bool bonded = false;
     SRT_GROUP_TYPE group_type = SRT_GTYPE_UNDEFINED;
 };
@@ -48,6 +61,10 @@ public:
     virtual bool IsListening() const = 0;
     virtual bool IsConnected() const = 0;
     virtual bool IsTerminalEof() const = 0;
+    virtual IoErrorKind LastReceiveErrorKind() const = 0;
+    virtual std::string LastReceiveErrorMessage() const = 0;
+    virtual IoErrorKind LastEnsureErrorKind() const = 0;
+    virtual std::string LastEnsureErrorMessage() const = 0;
 };
 
 class OutputSink {
@@ -59,6 +76,10 @@ public:
     virtual SRTSOCKET TransportSocket() const = 0;
     virtual OutputMetricsMode MetricsMode() const = 0;
     virtual bool IsConnected() const = 0;
+    virtual IoErrorKind LastSendErrorKind() const = 0;
+    virtual std::string LastSendErrorMessage() const = 0;
+    virtual IoErrorKind LastEnsureErrorKind() const = 0;
+    virtual std::string LastEnsureErrorMessage() const = 0;
 };
 
 InputEndpointSpec ParseInputEndpointSpec(const Config& cfg);

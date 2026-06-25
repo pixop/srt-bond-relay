@@ -20,8 +20,15 @@ struct SrtUri {
     std::map<std::string, std::string> query;
 };
 
+struct UdpUri {
+    std::string host;
+    int port = 0;
+    std::map<std::string, std::string> query;
+};
+
 std::string PercentDecode(std::string value);
 SrtUri ParseSrtUri(const std::string& uri);
+UdpUri ParseUdpUri(const std::string& uri);
 std::string QueryString(const std::map<std::string, std::string>& query, const std::string& key);
 int ParseIntOptionValue(const std::string& value, const char* opt_name);
 

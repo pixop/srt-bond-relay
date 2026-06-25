@@ -1,7 +1,7 @@
 # srt-bond-relay
 
 `srt-bond-relay` is a production-focused relay for MPEG-TS workflows.  
-It supports SRT listener/caller on both input and output, bonded SRT on both sides, and stdin/stdout endpoints, with reconnect/failover logic and Prometheus metrics.
+It supports SRT listener/caller on both input and output, bonded SRT on both sides, UDP listener/caller endpoints, and stdin/stdout endpoints, with reconnect/failover logic and Prometheus metrics.
 
 ## Build Images
 
@@ -72,6 +72,28 @@ docker run --rm --network host \
   --reconnect-delay-ms 1000 > stream.ts
 ```
 
+UDP output example (SRT ingest -> UDP egress):
+
+```bash
+docker run --rm --network host \
+  srt-bond-relay:dev \
+  --input "srt://0.0.0.0:9000?mode=listener" \
+  --output "udp://127.0.0.1:5000" \
+  --stats-interval-ms 1000 \
+  --reconnect-delay-ms 1000
+```
+
+UDP input example (UDP ingest -> SRT egress):
+
+```bash
+docker run --rm --network host \
+  srt-bond-relay:dev \
+  --input "udp://0.0.0.0:9000" \
+  --output "srt://127.0.0.1:5000?mode=caller" \
+  --stats-interval-ms 1000 \
+  --reconnect-delay-ms 1000
+```
+
 ## CLI (Core Flags)
 
 Required:
@@ -96,12 +118,23 @@ Common optional flags:
 `--input` accepted values:
 
 - `srt://...` with `mode=listener|caller` (default `listener` when omitted)
+- `udp://...` with `mode=listener` (input `mode=caller` is rejected in first pass)
 - `stdin`, `-`, or `fd://stdin`
 
 `--output` accepted values:
 
 - `srt://...` with `mode=caller|listener` (default `caller` when omitted)
+- `udp://...` with `mode=caller` (output `mode=listener` is rejected in first pass)
 - `stdout`, `-`, or `fd://stdout` (binary MPEG-TS to process stdout)
+
+UDP query options:
+
+- `rcvbuf`, `sndbuf`, `reuseaddr`, `ttl`, `localip`, `localport`
+
+UDP notes:
+
+- grouped endpoint lists (`;` or `,`) and bond options are SRT-only
+- UDP transport is best-effort (no reliability, no ordering guarantees)
 
 Bonded SRT endpoint list syntax:
 
@@ -133,7 +166,7 @@ Metrics include:
 - bonded input link health summary and stable-slot per-link status/traffic/RTT
 - aggregate transport counters plus session-level RTT and activity timestamps
 
-When output mode is `stdout`:
+When output mode is `stdout` or `udp://...`:
 
 - `srt_relay_output_rtt_ms` is set to `0`
 - output SRT transport counters stay at neutral values because no output SRT socket exists
@@ -158,9 +191,15 @@ bash scripts/local-bond-lab.sh logs-relay
 
 Applied as socket flags when present:
 
+SRT:
+
 - `passphrase`, `pbkeylen`, `transtype`, `latency`
 - `peeridletimeo`, `conntimeo`, `linger`
 - `rcvbuf`, `sndbuf`, `oheadbw`, `streamid`
+
+UDP:
+
+- `rcvbuf`, `sndbuf`, `reuseaddr`, `ttl`, `localip`, `localport`
 
 ## Current Limitations
 
@@ -168,3 +207,4 @@ Applied as socket flags when present:
 - output listener mode is single-consumer at a time (no fanout/multi-client)
 - output listener mode blocks forwarding until a downstream client is connected
 - per-link observability depends on bonded member snapshot availability from libsrt; when unavailable, relay falls back to a single synthetic input-link slot for continuity
+- UDP endpoint lists are single-endpoint only (no bonded/multipath UDP)

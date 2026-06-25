@@ -46,10 +46,10 @@ std::string PercentDecode(std::string value) {
     return out;
 }
 
-SrtUri ParseSrtUri(const std::string& uri) {
-    const std::string prefix = "srt://";
+template <typename UriT>
+UriT ParseUriWithPrefix(const std::string& uri, const std::string& prefix, const std::string& scheme_name) {
     if (uri.rfind(prefix, 0) != 0) {
-        throw std::runtime_error("only srt:// URIs are supported: " + uri);
+        throw std::runtime_error("only " + scheme_name + ":// URIs are supported: " + uri);
     }
 
     const std::string rest = uri.substr(prefix.size());
@@ -61,7 +61,7 @@ SrtUri ParseSrtUri(const std::string& uri) {
     if (colon == std::string::npos) {
         throw std::runtime_error("SRT URI must include host:port: " + uri);
     }
-    SrtUri parsed;
+    UriT parsed;
     parsed.host = authority.substr(0, colon);
     parsed.port = std::stoi(authority.substr(colon + 1));
     if (parsed.port <= 0 || parsed.port > 65535) {
@@ -87,6 +87,14 @@ SrtUri ParseSrtUri(const std::string& uri) {
         start = amp + 1;
     }
     return parsed;
+}
+
+SrtUri ParseSrtUri(const std::string& uri) {
+    return ParseUriWithPrefix<SrtUri>(uri, "srt://", "srt");
+}
+
+UdpUri ParseUdpUri(const std::string& uri) {
+    return ParseUriWithPrefix<UdpUri>(uri, "udp://", "udp");
 }
 
 const std::string* QueryFirstValue(const std::map<std::string, std::string>& query,
