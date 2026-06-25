@@ -178,6 +178,7 @@ Logs are structured key-value lines (startup, connection transitions, periodic s
 
 - Local single-host bonded lab: `LOCAL_BOND_COOKBOOK.md`
 - Multi-host LAN testing (Docker + MPEG-TS): `LAN_TESTING_COOKBOOK.md`
+- Multi-NIC sender/receiver routing (AWS + local adapters): `MULTI_NIC_ROUTING_GUIDE.md`
 
 For quick local runs:
 
