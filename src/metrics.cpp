@@ -955,6 +955,50 @@ void UpdateTransportTrafficMetrics(SRTSOCKET output_sock, MetricsState* metrics)
     metrics->output_transport_byte_drop_current.store(output_byte_drop_current, std::memory_order_relaxed);
 }
 
+template <typename ConnectedArr, typename RttArr>
+bool TryComputeMaxConnectedLinkRttGeneric(int64_t snapshot_count,
+                                          const ConnectedArr& connected,
+                                          const RttArr& rtt_values,
+                                          int64_t* out_max_rtt_ms) {
+    if (out_max_rtt_ms == nullptr) {
+        return false;
+    }
+    if (snapshot_count < 0) snapshot_count = 0;
+    const size_t capped = std::min(static_cast<size_t>(snapshot_count), MetricsState::kMaxTrackedMembers);
+    int64_t max_rtt = -1;
+    for (size_t i = 0; i < capped; ++i) {
+        if (connected[i].load(std::memory_order_relaxed) != 1) {
+            continue;
+        }
+        const int64_t rtt_ms = rtt_values[i].load(std::memory_order_relaxed);
+        if (rtt_ms < 0) {
+            continue;
+        }
+        max_rtt = std::max(max_rtt, rtt_ms);
+    }
+    if (max_rtt < 0) {
+        return false;
+    }
+    *out_max_rtt_ms = max_rtt;
+    return true;
+}
+
+bool TryComputeMaxConnectedInputLinkRtt(const MetricsState& metrics, int64_t* out_max_rtt_ms) {
+    const int64_t count = metrics.input_links_snapshot_count.load(std::memory_order_relaxed);
+    return TryComputeMaxConnectedLinkRttGeneric(count,
+                                                metrics.input_member_connected,
+                                                metrics.input_link_rtt_ms,
+                                                out_max_rtt_ms);
+}
+
+bool TryComputeMaxConnectedOutputLinkRtt(const MetricsState& metrics, int64_t* out_max_rtt_ms) {
+    const int64_t count = metrics.output_links_snapshot_count.load(std::memory_order_relaxed);
+    return TryComputeMaxConnectedLinkRttGeneric(count,
+                                                metrics.output_member_connected,
+                                                metrics.output_link_rtt_ms,
+                                                out_max_rtt_ms);
+}
+
 }  // namespace
 
 std::string RenderPrometheusMetrics(const MetricsState& metrics) {
@@ -1308,6 +1352,14 @@ void MaybeLogStats(const Config& cfg,
     UpdateOutputLinkHealthMetrics(output_metrics_mode == OutputMetricsMode::kSrtSocket ? output_sock : SRT_INVALID_SOCK, metrics);
     UpdateTransportTrafficMetrics(output_metrics_mode == OutputMetricsMode::kSrtSocket ? output_sock : SRT_INVALID_SOCK,
                                   metrics);
+    int64_t max_input_link_rtt_ms = -1;
+    if (TryComputeMaxConnectedInputLinkRtt(*metrics, &max_input_link_rtt_ms)) {
+        metrics->input_rtt_ms.store(max_input_link_rtt_ms, std::memory_order_relaxed);
+    }
+    int64_t max_output_link_rtt_ms = -1;
+    if (TryComputeMaxConnectedOutputLinkRtt(*metrics, &max_output_link_rtt_ms)) {
+        metrics->output_rtt_ms.store(max_output_link_rtt_ms, std::memory_order_relaxed);
+    }
     const auto input_rtt_ms = metrics->input_rtt_ms.load(std::memory_order_relaxed);
     const auto output_rtt_ms = metrics->output_rtt_ms.load(std::memory_order_relaxed);
     const auto input_links_total = metrics->input_links_total.load(std::memory_order_relaxed);
