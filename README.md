@@ -108,6 +108,18 @@ ffmpeg -re -stream_loop -1 -i input.mp4 -f mpegts pipe: \
 
 Replace `REMOTE_A`/`REMOTE_B` and `LOCAL_NIC_A`/`LOCAL_NIC_B` with your real remote hosts and local adapter IPs.
 
+Minimal conceptual bonded receive -> local SRT relay:
+
+```bash
+docker run --rm --network host \
+  srt-bond-relay:dev \
+  --input "srt://LOCAL_NIC_A:5000?passphrase=SECRET_IN&pbkeylen=32;\
+           srt://LOCAL_NIC_B:5000?passphrase=SECRET_IN&pbkeylen=32&grouptype=broadcast" \
+  --output "srt://127.0.0.1:5010?latency=20"
+```
+
+Replace `LOCAL_NIC_A`/`LOCAL_NIC_B` with the receiver host's NIC IPs bound to each bonded input path.
+
 ## CLI (Core Flags)
 
 Required:
