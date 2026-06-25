@@ -94,6 +94,20 @@ docker run --rm --network host \
   --reconnect-delay-ms 1000
 ```
 
+Minimal conceptual pipeline (`ffmpeg` stdout -> relay stdin -> bonded SRT broadcast):
+
+```bash
+ffmpeg -re -stream_loop -1 -i input.mp4 -f mpegts pipe: \
+| docker run --rm -i --network host \
+    srt-bond-relay:dev \
+    --input "stdin" \
+    --output "srt://REMOTE_A:5000?mode=caller&srcip=LOCAL_NIC_A;\
+              srt://REMOTE_B:5000?mode=caller&srcip=LOCAL_NIC_B&grouptype=broadcast" \
+    --max-message-size 1316
+```
+
+Replace `REMOTE_A`/`REMOTE_B` and `LOCAL_NIC_A`/`LOCAL_NIC_B` with your real remote hosts and local adapter IPs.
+
 ## CLI (Core Flags)
 
 Required:
