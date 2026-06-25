@@ -52,7 +52,7 @@ void MaybeUpdateRttMetric(SRTSOCKET sock, std::atomic<int64_t>* out_rtt_ms) {
     }
 
     SRT_TRACEBSTATS sock_stats {};
-    if (srt_bstats(sock, &sock_stats, 1) == SRT_ERROR) {
+    if (srt_bstats(sock, &sock_stats, 0) == SRT_ERROR) {
         return;
     }
     out_rtt_ms->store(static_cast<int64_t>(sock_stats.msRTT), std::memory_order_relaxed);
@@ -751,7 +751,26 @@ uint64_t CounterDeltaWithReset(uint64_t prev, uint64_t curr) {
     return curr;
 }
 
-void UpdateInputLinkTrafficPerSlot(MetricsState* metrics) {
+using SocketStatsSnapshot = std::unordered_map<SRTSOCKET, SRT_TRACEBSTATS>;
+
+SocketStatsSnapshot CollectSocketStatsSnapshot(const std::vector<SRTSOCKET>& sockets) {
+    SocketStatsSnapshot stats_by_socket;
+    stats_by_socket.reserve(sockets.size());
+    for (const auto sock : sockets) {
+        if (sock == SRT_INVALID_SOCK || sock == 0) {
+            continue;
+        }
+        SRT_TRACEBSTATS stats {};
+        // Use non-clearing reads so all metrics in this interval see the same counters.
+        if (srt_bstats(sock, &stats, 0) == SRT_ERROR) {
+            continue;
+        }
+        stats_by_socket.emplace(sock, stats);
+    }
+    return stats_by_socket;
+}
+
+void UpdateInputLinkTrafficPerSlot(MetricsState* metrics, const SocketStatsSnapshot& input_stats_by_socket) {
     int64_t count = metrics->input_links_snapshot_count.load(std::memory_order_relaxed);
     if (count < 0) count = 0;
     const size_t capped = std::min(static_cast<size_t>(count), MetricsState::kMaxTrackedMembers);
@@ -774,10 +793,11 @@ void UpdateInputLinkTrafficPerSlot(MetricsState* metrics) {
             continue;
         }
 
-        SRT_TRACEBSTATS stats {};
-        if (srt_bstats(member_sock, &stats, 1) == SRT_ERROR) {
+        const auto stats_it = input_stats_by_socket.find(member_sock);
+        if (stats_it == input_stats_by_socket.end()) {
             continue;
         }
+        const auto& stats = stats_it->second;
 
         const auto rx_current = static_cast<uint64_t>(stats.byteRecvTotal);
         const auto tx_current = static_cast<uint64_t>(stats.byteSentTotal);
@@ -798,7 +818,7 @@ void UpdateInputLinkTrafficPerSlot(MetricsState* metrics) {
     }
 }
 
-void UpdateOutputLinkTrafficPerSlot(MetricsState* metrics) {
+void UpdateOutputLinkTrafficPerSlot(MetricsState* metrics, const SocketStatsSnapshot& output_stats_by_socket) {
     int64_t count = metrics->output_links_snapshot_count.load(std::memory_order_relaxed);
     if (count < 0) count = 0;
     const size_t capped = std::min(static_cast<size_t>(count), MetricsState::kMaxTrackedMembers);
@@ -821,10 +841,11 @@ void UpdateOutputLinkTrafficPerSlot(MetricsState* metrics) {
             continue;
         }
 
-        SRT_TRACEBSTATS stats {};
-        if (srt_bstats(member_sock, &stats, 1) == SRT_ERROR) {
+        const auto stats_it = output_stats_by_socket.find(member_sock);
+        if (stats_it == output_stats_by_socket.end()) {
             continue;
         }
+        const auto& stats = stats_it->second;
 
         const auto rx_current = static_cast<uint64_t>(stats.byteRecvTotal);
         const auto tx_current = static_cast<uint64_t>(stats.byteSentTotal);
@@ -846,9 +867,9 @@ void UpdateOutputLinkTrafficPerSlot(MetricsState* metrics) {
 }
 
 void UpdateTransportTrafficMetrics(SRTSOCKET output_sock, MetricsState* metrics) {
-    UpdateInputLinkTrafficPerSlot(metrics);
-    UpdateOutputLinkTrafficPerSlot(metrics);
     const auto member_sockets = GetInputMemberSocketsSnapshot(*metrics);
+    const auto input_stats_by_socket = CollectSocketStatsSnapshot(member_sockets);
+    UpdateInputLinkTrafficPerSlot(metrics, input_stats_by_socket);
     std::unordered_set<SRTSOCKET> sockets_with_stats;
     sockets_with_stats.reserve(member_sockets.size());
     uint64_t input_byte_recv_total = metrics->input_transport_byte_recv_total.load(std::memory_order_relaxed);
@@ -860,11 +881,7 @@ void UpdateTransportTrafficMetrics(SRTSOCKET output_sock, MetricsState* metrics)
     uint64_t input_byte_retrans_current = 0;
     uint64_t input_byte_loss_current = 0;
 
-    for (const auto member_sock : member_sockets) {
-        SRT_TRACEBSTATS in_stats {};
-        if (srt_bstats(member_sock, &in_stats, 1) == SRT_ERROR) {
-            continue;
-        }
+    for (const auto& [member_sock, in_stats] : input_stats_by_socket) {
         sockets_with_stats.insert(member_sock);
 
         input_byte_recv_current += static_cast<uint64_t>(in_stats.byteRecvTotal);
@@ -904,6 +921,8 @@ void UpdateTransportTrafficMetrics(SRTSOCKET output_sock, MetricsState* metrics)
     if (output_member_sockets.empty() && output_sock != SRT_INVALID_SOCK) {
         output_member_sockets.push_back(output_sock);
     }
+    const auto output_stats_by_socket = CollectSocketStatsSnapshot(output_member_sockets);
+    UpdateOutputLinkTrafficPerSlot(metrics, output_stats_by_socket);
     std::unordered_set<SRTSOCKET> output_sockets_with_stats;
     output_sockets_with_stats.reserve(output_member_sockets.size());
     uint64_t output_byte_sent_total = metrics->output_transport_byte_sent_total.load(std::memory_order_relaxed);
@@ -915,11 +934,7 @@ void UpdateTransportTrafficMetrics(SRTSOCKET output_sock, MetricsState* metrics)
     uint64_t output_byte_retrans_current = 0;
     uint64_t output_byte_drop_current = 0;
 
-    for (const auto member_sock : output_member_sockets) {
-        SRT_TRACEBSTATS output_stats {};
-        if (srt_bstats(member_sock, &output_stats, 1) == SRT_ERROR) {
-            continue;
-        }
+    for (const auto& [member_sock, output_stats] : output_stats_by_socket) {
         output_sockets_with_stats.insert(member_sock);
         output_byte_sent_current += static_cast<uint64_t>(output_stats.byteSentTotal);
         output_byte_sent_unique_current += static_cast<uint64_t>(output_stats.byteSentUniqueTotal);
