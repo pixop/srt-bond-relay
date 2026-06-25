@@ -21,6 +21,24 @@ bool IsUdpTimeoutErrno(int err) {
     return err == EAGAIN || err == EWOULDBLOCK;
 }
 
+bool HasMeaningfulSrtError(const std::string& value) {
+    return !value.empty() && value != "Success";
+}
+
+std::string ComposeSrtEnsureErrorMessage(const std::string& cause) {
+    const std::string srt_error = SrtLastErrorString();
+    if (!HasMeaningfulSrtError(srt_error)) {
+        return cause.empty() ? std::string("unknown error") : cause;
+    }
+    if (cause.empty()) {
+        return srt_error;
+    }
+    if (cause.find(srt_error) != std::string::npos) {
+        return cause;
+    }
+    return cause + " (srt: " + srt_error + ")";
+}
+
 void SetUdpTimeoutMs(int fd, int timeout_ms) {
     timeval tv {};
     tv.tv_sec = timeout_ms / 1000;
@@ -96,9 +114,13 @@ public:
                 metrics->input_connected.store(1, std::memory_order_relaxed);
                 logger.Log(LogLevel::kInfo, "input-connected", "socket=" + std::to_string(accepted));
             }
+        } catch (const std::exception& ex) {
+            ensure_error_kind_ = IsSrtTimeoutError() ? IoErrorKind::kTimeout : IoErrorKind::kError;
+            ensure_error_message_ = ComposeSrtEnsureErrorMessage(ex.what());
+            throw;
         } catch (...) {
             ensure_error_kind_ = IsSrtTimeoutError() ? IoErrorKind::kTimeout : IoErrorKind::kError;
-            ensure_error_message_ = SrtLastErrorString();
+            ensure_error_message_ = ComposeSrtEnsureErrorMessage("unknown exception");
             throw;
         }
     }
@@ -173,9 +195,13 @@ public:
                        "bonded=" + std::string(bonded_ ? "true" : "false"),
                        "members=" + std::to_string(uris_.size()),
                        "socket=" + std::to_string(sock));
+        } catch (const std::exception& ex) {
+            ensure_error_kind_ = IsSrtTimeoutError() ? IoErrorKind::kTimeout : IoErrorKind::kError;
+            ensure_error_message_ = ComposeSrtEnsureErrorMessage(ex.what());
+            throw;
         } catch (...) {
             ensure_error_kind_ = IsSrtTimeoutError() ? IoErrorKind::kTimeout : IoErrorKind::kError;
-            ensure_error_message_ = SrtLastErrorString();
+            ensure_error_message_ = ComposeSrtEnsureErrorMessage("unknown exception");
             throw;
         }
     }

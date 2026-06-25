@@ -103,94 +103,6 @@ bool ResolveSourceSockaddrForPeerFamily(const std::string& source_host,
     return true;
 }
 
-void AddConfigIntOption(SRT_SOCKOPT_CONFIG* cfg, SRT_SOCKOPT opt, int value, const char* opt_name) {
-    if (cfg == nullptr) return;
-    if (srt_config_add(cfg, opt, &value, sizeof(value)) == SRT_ERROR) {
-        throw std::runtime_error(std::string("failed to set ") + opt_name + " on SRT group config: " + SrtLastErrorString());
-    }
-}
-
-void AddConfigStringOption(SRT_SOCKOPT_CONFIG* cfg, SRT_SOCKOPT opt, const std::string& value, const char* opt_name) {
-    if (cfg == nullptr || value.empty()) return;
-    if (srt_config_add(cfg, opt, value.data(), static_cast<int>(value.size())) == SRT_ERROR) {
-        throw std::runtime_error(std::string("failed to set ") + opt_name + " on SRT group config: " + SrtLastErrorString());
-    }
-}
-
-void AddConfigLingerOption(SRT_SOCKOPT_CONFIG* cfg, int seconds) {
-    linger lin {};
-    lin.l_linger = seconds;
-    lin.l_onoff = (seconds > 0) ? 1 : 0;
-    if (srt_config_add(cfg, SRTO_LINGER, &lin, sizeof(lin)) == SRT_ERROR) {
-        throw std::runtime_error("failed to set SRTO_LINGER on SRT group config: " + SrtLastErrorString());
-    }
-}
-
-void ApplyCommonSrtConfigOptions(SRT_SOCKOPT_CONFIG* group_cfg,
-                                 const SrtUri& uri,
-                                 const Config& cfg,
-                                 bool for_output,
-                                 const Logger& logger) {
-    if (const std::string passphrase = QueryString(uri.query, "passphrase"); !passphrase.empty()) {
-        AddConfigStringOption(group_cfg, SRTO_PASSPHRASE, passphrase, "SRTO_PASSPHRASE");
-    }
-    if (const std::string pbkeylen = QueryString(uri.query, "pbkeylen"); !pbkeylen.empty()) {
-        AddConfigIntOption(group_cfg, SRTO_PBKEYLEN, ParseIntOptionValue(pbkeylen, "pbkeylen"), "SRTO_PBKEYLEN");
-    }
-    if (const std::string latency = QueryString(uri.query, "latency"); !latency.empty()) {
-        AddConfigIntOption(group_cfg, SRTO_LATENCY, ParseIntOptionValue(latency, "latency"), "SRTO_LATENCY");
-    }
-    if (const std::string peeridletimeo = QueryString(uri.query, "peeridletimeo"); !peeridletimeo.empty()) {
-        AddConfigIntOption(group_cfg, SRTO_PEERIDLETIMEO, ParseIntOptionValue(peeridletimeo, "peeridletimeo"), "SRTO_PEERIDLETIMEO");
-    }
-    if (const std::string conntimeo = QueryString(uri.query, "conntimeo"); !conntimeo.empty()) {
-        AddConfigIntOption(group_cfg, SRTO_CONNTIMEO, ParseIntOptionValue(conntimeo, "conntimeo"), "SRTO_CONNTIMEO");
-    } else {
-        AddConfigIntOption(group_cfg, SRTO_CONNTIMEO, cfg.io_timeout_ms, "SRTO_CONNTIMEO");
-    }
-    if (const std::string linger = QueryString(uri.query, "linger"); !linger.empty()) {
-        AddConfigLingerOption(group_cfg, ParseIntOptionValue(linger, "linger"));
-    }
-    if (const std::string rcvbuf = QueryString(uri.query, "rcvbuf"); !rcvbuf.empty()) {
-        AddConfigIntOption(group_cfg, SRTO_RCVBUF, ParseIntOptionValue(rcvbuf, "rcvbuf"), "SRTO_RCVBUF");
-    }
-    if (const std::string sndbuf = QueryString(uri.query, "sndbuf"); !sndbuf.empty()) {
-        AddConfigIntOption(group_cfg, SRTO_SNDBUF, ParseIntOptionValue(sndbuf, "sndbuf"), "SRTO_SNDBUF");
-    }
-    if (const std::string oheadbw = QueryString(uri.query, "oheadbw"); !oheadbw.empty()) {
-        AddConfigIntOption(group_cfg, SRTO_OHEADBW, ParseIntOptionValue(oheadbw, "oheadbw"), "SRTO_OHEADBW");
-    }
-    if (const std::string streamid = QueryString(uri.query, "streamid"); !streamid.empty()) {
-        AddConfigStringOption(group_cfg, SRTO_STREAMID, streamid, "SRTO_STREAMID");
-    }
-    if (const std::string transtype = QueryString(uri.query, "transtype"); !transtype.empty()) {
-        int tt = SRTT_LIVE;
-        if (transtype == "live") {
-            tt = SRTT_LIVE;
-        } else if (transtype == "file") {
-            tt = SRTT_FILE;
-        } else {
-            throw std::runtime_error("unsupported transtype value: " + transtype);
-        }
-        AddConfigIntOption(group_cfg, SRTO_TRANSTYPE, tt, "SRTO_TRANSTYPE");
-    }
-
-    if (for_output) {
-        AddConfigIntOption(group_cfg, SRTO_SNDTIMEO, cfg.io_timeout_ms, "SRTO_SNDTIMEO");
-    } else {
-        AddConfigIntOption(group_cfg, SRTO_RCVTIMEO, cfg.io_timeout_ms, "SRTO_RCVTIMEO");
-    }
-
-    for (const auto& [key, value] : uri.query) {
-        if (key == "mode" || key == "grouptype" || key == "group_type" || key == "bond" || key == "bond_mode" ||
-            key == "passphrase" || key == "pbkeylen" || key == "latency" || key == "peeridletimeo" || key == "conntimeo" ||
-            key == "linger" || key == "rcvbuf" || key == "sndbuf" || key == "oheadbw" || key == "streamid" || key == "transtype") {
-            continue;
-        }
-        logger.Log(LogLevel::kDebug, "uri-option-ignored", "key=" + key, "value=" + value);
-    }
-}
-
 }  // namespace
 
 SRTSOCKET ConnectSingleCallerSocket(const SrtUri& uri, const Config& cfg, const Logger& logger, bool for_output) {
@@ -235,13 +147,17 @@ SRTSOCKET ConnectBondedCallerGroup(const std::vector<SrtUri>& uris,
         throw std::runtime_error("failed to create SRT group: " + SrtLastErrorString());
     }
 
-    SRT_SOCKOPT_CONFIG* opt_cfg = nullptr;
     try {
-        opt_cfg = srt_create_config();
-        if (opt_cfg == nullptr) {
-            throw std::runtime_error("failed to create SRT group config");
+        ApplyIntSockOpt(group, SRTO_CONNTIMEO, cfg.io_timeout_ms, "SRTO_CONNTIMEO");
+        if (for_output) {
+            ApplyIntSockOpt(group, SRTO_SNDTIMEO, cfg.io_timeout_ms, "SRTO_SNDTIMEO");
+        } else {
+            ApplyIntSockOpt(group, SRTO_RCVTIMEO, cfg.io_timeout_ms, "SRTO_RCVTIMEO");
         }
-        ApplyCommonSrtConfigOptions(opt_cfg, uris.front(), cfg, for_output, logger);
+        SrtUri group_options_uri = uris.front();
+        // Some libsrt builds reject SRTO_TRANSTYPE on group sockets.
+        group_options_uri.query.erase("transtype");
+        ApplyCommonSrtOptions(group, group_options_uri, logger);
 
         std::vector<SRT_SOCKGROUPCONFIG> endpoints;
         endpoints.reserve(uris.size());
@@ -265,7 +181,6 @@ SRTSOCKET ConnectBondedCallerGroup(const std::vector<SrtUri>& uris,
 
             SRT_SOCKGROUPCONFIG endpoint =
                 srt_prepare_endpoint(src_addr_ptr, reinterpret_cast<const sockaddr*>(&addr), static_cast<int>(addr_len));
-            endpoint.config = opt_cfg;
             endpoints.push_back(endpoint);
         }
 
@@ -273,15 +188,8 @@ SRTSOCKET ConnectBondedCallerGroup(const std::vector<SrtUri>& uris,
             throw std::runtime_error("bonded group connect failed: " + SrtLastErrorString());
         }
     } catch (...) {
-        if (opt_cfg != nullptr) {
-            srt_delete_config(opt_cfg);
-        }
         srt_close(group);
         throw;
-    }
-
-    if (opt_cfg != nullptr) {
-        srt_delete_config(opt_cfg);
     }
 
     return group;

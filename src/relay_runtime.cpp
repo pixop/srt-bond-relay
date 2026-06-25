@@ -70,6 +70,8 @@ int RelayMain(const Config& cfg, const Logger& logger) {
     RelayState state;
     MetricsState metrics;
     std::vector<char> buffer(static_cast<size_t>(cfg.max_message_size));
+    std::vector<char> stdin_pending;
+    size_t stdin_pending_offset = 0;
     auto last_stats_at = std::chrono::steady_clock::now();
     const auto startup_ms = UnixNowMs();
     metrics.last_rx_unix_ms.store(startup_ms, std::memory_order_relaxed);
@@ -77,6 +79,19 @@ int RelayMain(const Config& cfg, const Logger& logger) {
 
     std::unique_ptr<InputSource> input_source = BuildInputSource(input_spec);
     std::unique_ptr<OutputSink> output_sink = BuildOutputSink(output_spec);
+    const bool stdin_repacketize_enabled = (input_spec.kind == InputEndpointKind::kStdin);
+    int stdin_chunk_size = cfg.max_message_size;
+    if (stdin_repacketize_enabled) {
+        constexpr int kTsPacketSize = 188;
+        const int ts_aligned = (cfg.max_message_size / kTsPacketSize) * kTsPacketSize;
+        if (ts_aligned > 0) {
+            stdin_chunk_size = ts_aligned;
+        }
+        logger.Log(LogLevel::kInfo,
+                   "stdin-repacketizer-enabled",
+                   "chunk_size=" + std::to_string(stdin_chunk_size),
+                   "max_message_size=" + std::to_string(cfg.max_message_size));
+    }
     MetricsServer metrics_server(cfg, logger, metrics);
     metrics_server.Start();
 
@@ -172,33 +187,62 @@ int RelayMain(const Config& cfg, const Logger& logger) {
         metrics.total_rx_bytes.store(stats.total_rx_bytes, std::memory_order_relaxed);
         metrics.total_rx_msgs.store(stats.total_rx_msgs, std::memory_order_relaxed);
         metrics.last_rx_unix_ms.store(UnixNowMs(), std::memory_order_relaxed);
+        auto send_chunk = [&](const char* data, int size) -> bool {
+            const int sent_size = output_sink->Send(data, size);
+            if (sent_size == SRT_ERROR) {
+                stats.total_send_failures += 1;
+                stats.interval_send_failures += 1;
+                stats.reconnect_count += 1;
+                metrics.total_send_failures.store(stats.total_send_failures, std::memory_order_relaxed);
+                metrics.reconnect_count.store(stats.reconnect_count, std::memory_order_relaxed);
 
-        const int sent_size = output_sink->Send(buffer.data(), recv_size);
-        if (sent_size == SRT_ERROR) {
-            stats.total_send_failures += 1;
-            stats.interval_send_failures += 1;
-            stats.reconnect_count += 1;
-            metrics.total_send_failures.store(stats.total_send_failures, std::memory_order_relaxed);
-            metrics.reconnect_count.store(stats.reconnect_count, std::memory_order_relaxed);
+                std::string err = output_sink->LastSendErrorMessage();
+                if (err.empty()) err = "output send failed";
+                logger.Log(LogLevel::kWarn, "output-send-failed",
+                           "error=" + err,
+                           "reconnect_count=" + std::to_string(stats.reconnect_count));
+                output_sink->MarkDisconnected(&metrics);
+                if (cfg.exit_on_output_failure) {
+                    g_shutdown_requested.store(true);
+                } else {
+                    SleepReconnectDelay(cfg);
+                }
+                return false;
+            }
 
-            std::string err = output_sink->LastSendErrorMessage();
-            if (err.empty()) err = "output send failed";
-            logger.Log(LogLevel::kWarn, "output-send-failed",
-                       "error=" + err,
-                       "reconnect_count=" + std::to_string(stats.reconnect_count));
-            output_sink->MarkDisconnected(&metrics);
-            if (cfg.exit_on_output_failure) return 3;
-            SleepReconnectDelay(cfg);
+            stats.total_tx_bytes += static_cast<uint64_t>(sent_size);
+            stats.total_tx_msgs += 1;
+            stats.interval_tx_bytes += static_cast<uint64_t>(sent_size);
+            stats.interval_tx_msgs += 1;
+            metrics.total_tx_bytes.store(stats.total_tx_bytes, std::memory_order_relaxed);
+            metrics.total_tx_msgs.store(stats.total_tx_msgs, std::memory_order_relaxed);
+            metrics.last_tx_unix_ms.store(UnixNowMs(), std::memory_order_relaxed);
+            return true;
+        };
+
+        if (!stdin_repacketize_enabled) {
+            if (!send_chunk(buffer.data(), recv_size)) {
+                if (cfg.exit_on_output_failure) return 3;
+                continue;
+            }
             continue;
         }
 
-        stats.total_tx_bytes += static_cast<uint64_t>(sent_size);
-        stats.total_tx_msgs += 1;
-        stats.interval_tx_bytes += static_cast<uint64_t>(sent_size);
-        stats.interval_tx_msgs += 1;
-        metrics.total_tx_bytes.store(stats.total_tx_bytes, std::memory_order_relaxed);
-        metrics.total_tx_msgs.store(stats.total_tx_msgs, std::memory_order_relaxed);
-        metrics.last_tx_unix_ms.store(UnixNowMs(), std::memory_order_relaxed);
+        stdin_pending.insert(stdin_pending.end(), buffer.begin(), buffer.begin() + recv_size);
+        while ((stdin_pending.size() - stdin_pending_offset) >= static_cast<size_t>(stdin_chunk_size)) {
+            if (!send_chunk(stdin_pending.data() + stdin_pending_offset, stdin_chunk_size)) {
+                if (cfg.exit_on_output_failure) return 3;
+                break;
+            }
+            stdin_pending_offset += static_cast<size_t>(stdin_chunk_size);
+            if (stdin_pending_offset == stdin_pending.size()) {
+                stdin_pending.clear();
+                stdin_pending_offset = 0;
+            } else if (stdin_pending_offset > (stdin_pending.size() / 2)) {
+                stdin_pending.erase(stdin_pending.begin(), stdin_pending.begin() + static_cast<std::ptrdiff_t>(stdin_pending_offset));
+                stdin_pending_offset = 0;
+            }
+        }
     }
 
     logger.Log(LogLevel::kInfo, "shutdown",
