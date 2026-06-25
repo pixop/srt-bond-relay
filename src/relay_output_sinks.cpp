@@ -81,6 +81,7 @@ public:
     void EnsureReady(const Config& cfg, const Logger& logger, RelayStats* stats, MetricsState* metrics) override {
         ensure_error_kind_ = IoErrorKind::kNone;
         ensure_error_message_.clear();
+        metrics_ = metrics;
         if (socket_.Valid()) return;
         try {
             SRTSOCKET sock = SRT_INVALID_SOCK;
@@ -108,11 +109,17 @@ public:
 
     int Send(const char* data, int size) override {
         SRT_MSGCTRL tx_ctrl = srt_msgctrl_default;
+        SRT_SOCKGROUPDATA tx_group_data[MetricsState::kMaxTrackedMembers] {};
+        tx_ctrl.grpdata = tx_group_data;
+        tx_ctrl.grpdata_size = sizeof(tx_group_data) / sizeof(tx_group_data[0]);
         const int rc = srt_sendmsg2(socket_.Get(), data, size, &tx_ctrl);
         if (rc == SRT_ERROR) {
             send_error_kind_ = IsSrtTimeoutError() ? IoErrorKind::kTimeout : IoErrorKind::kDisconnected;
             send_error_message_ = SrtLastErrorString();
             return SRT_ERROR;
+        }
+        if (metrics_ != nullptr) {
+            UpdateOutputLinkHealthFromMsgCtrl(tx_ctrl, metrics_);
         }
         send_error_kind_ = IoErrorKind::kNone;
         send_error_message_.clear();
@@ -122,6 +129,7 @@ public:
     void MarkDisconnected(MetricsState* metrics) override {
         socket_.Reset();
         metrics->output_connected.store(0, std::memory_order_relaxed);
+        ResetOutputTrackingMetrics(metrics);
     }
 
     SRTSOCKET TransportSocket() const override { return socket_.Get(); }
@@ -141,6 +149,7 @@ private:
     std::string send_error_message_;
     IoErrorKind ensure_error_kind_ = IoErrorKind::kNone;
     std::string ensure_error_message_;
+    MetricsState* metrics_ = nullptr;
 };
 
 class SrtOutputListenerSink : public OutputSink {
@@ -151,6 +160,7 @@ public:
     void EnsureReady(const Config& cfg, const Logger& logger, RelayStats*, MetricsState* metrics) override {
         ensure_error_kind_ = IoErrorKind::kNone;
         ensure_error_message_.clear();
+        metrics_ = metrics;
         try {
             if (listeners_.empty()) {
                 listeners_.reserve(uris_.size());
@@ -175,11 +185,17 @@ public:
 
     int Send(const char* data, int size) override {
         SRT_MSGCTRL tx_ctrl = srt_msgctrl_default;
+        SRT_SOCKGROUPDATA tx_group_data[MetricsState::kMaxTrackedMembers] {};
+        tx_ctrl.grpdata = tx_group_data;
+        tx_ctrl.grpdata_size = sizeof(tx_group_data) / sizeof(tx_group_data[0]);
         const int rc = srt_sendmsg2(session_.Get(), data, size, &tx_ctrl);
         if (rc == SRT_ERROR) {
             send_error_kind_ = IsSrtTimeoutError() ? IoErrorKind::kTimeout : IoErrorKind::kDisconnected;
             send_error_message_ = SrtLastErrorString();
             return SRT_ERROR;
+        }
+        if (metrics_ != nullptr) {
+            UpdateOutputLinkHealthFromMsgCtrl(tx_ctrl, metrics_);
         }
         send_error_kind_ = IoErrorKind::kNone;
         send_error_message_.clear();
@@ -189,6 +205,7 @@ public:
     void MarkDisconnected(MetricsState* metrics) override {
         session_.Reset();
         metrics->output_connected.store(0, std::memory_order_relaxed);
+        ResetOutputTrackingMetrics(metrics);
     }
 
     SRTSOCKET TransportSocket() const override { return session_.Get(); }
@@ -207,6 +224,7 @@ private:
     std::string send_error_message_;
     IoErrorKind ensure_error_kind_ = IoErrorKind::kNone;
     std::string ensure_error_message_;
+    MetricsState* metrics_ = nullptr;
 };
 
 class UdpOutputSink : public OutputSink {
@@ -273,6 +291,7 @@ public:
     void MarkDisconnected(MetricsState* metrics) override {
         CloseSocket();
         metrics->output_connected.store(0, std::memory_order_relaxed);
+        ResetOutputTrackingMetrics(metrics);
     }
 
     SRTSOCKET TransportSocket() const override { return SRT_INVALID_SOCK; }
@@ -332,6 +351,7 @@ public:
     void MarkDisconnected(MetricsState* metrics) override {
         healthy_ = false;
         metrics->output_connected.store(0, std::memory_order_relaxed);
+        ResetOutputTrackingMetrics(metrics);
     }
 
     SRTSOCKET TransportSocket() const override { return SRT_INVALID_SOCK; }

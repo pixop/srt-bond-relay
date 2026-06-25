@@ -73,6 +73,10 @@ struct MetricsState {
     std::atomic<int64_t> input_links_healthy{0};
     std::atomic<int64_t> input_links_running{0};
     std::atomic<int64_t> input_links_snapshot_count{0};
+    std::atomic<int64_t> output_links_total{0};
+    std::atomic<int64_t> output_links_healthy{0};
+    std::atomic<int64_t> output_links_running{0};
+    std::atomic<int64_t> output_links_snapshot_count{0};
 
     std::atomic<uint64_t> input_transport_byte_recv_total{0};
     std::atomic<uint64_t> input_transport_byte_recv_unique_total{0};
@@ -95,6 +99,7 @@ struct MetricsState {
     std::atomic<uint64_t> output_transport_byte_sent_unique_total{0};
     std::atomic<uint64_t> output_transport_byte_retrans_total{0};
     std::atomic<uint64_t> output_transport_byte_drop_total{0};
+    std::atomic<int64_t> output_transport_members_total{0};
     std::atomic<uint64_t> output_transport_byte_sent_current{0};
     std::atomic<uint64_t> output_transport_byte_sent_unique_current{0};
     std::atomic<uint64_t> output_transport_byte_retrans_current{0};
@@ -103,6 +108,7 @@ struct MetricsState {
     std::atomic<int64_t> input_rtt_ms{-1};
     std::atomic<int64_t> output_rtt_ms{-1};
     std::atomic<int> input_bond_mode{0};  // 0=unknown, 1=broadcast, 2=backup
+    std::atomic<int> output_bond_mode{0};  // 0=unknown, 1=broadcast, 2=backup
 
     std::atomic<int64_t> last_rx_unix_ms{0};
     std::atomic<int64_t> last_tx_unix_ms{0};
@@ -110,10 +116,19 @@ struct MetricsState {
     std::array<std::atomic<int64_t>, kMaxTrackedMembers> input_member_ids {};
     std::array<std::atomic<int>, kMaxTrackedMembers> input_member_connected {};
     std::array<std::atomic<uint64_t>, kMaxTrackedMembers> input_member_identity_keys {};
+    std::array<std::atomic<int64_t>, kMaxTrackedMembers> output_member_ids {};
+    std::array<std::atomic<int>, kMaxTrackedMembers> output_member_connected {};
+    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> output_member_identity_keys {};
+    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> output_link_rx_bytes_total {};
+    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> output_link_tx_bytes_total {};
+    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> output_link_rx_bytes_current {};
+    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> output_link_tx_bytes_current {};
+    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> output_link_rx_bytes_last {};
+    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> output_link_tx_bytes_last {};
+    std::array<std::atomic<int64_t>, kMaxTrackedMembers> output_link_rtt_ms {};
 
     std::unordered_map<SRTSOCKET, TransportCounterSnapshot> input_transport_last_by_socket;
-    TransportCounterSnapshot output_transport_last;
-    SRTSOCKET output_transport_last_socket = SRT_INVALID_SOCK;
+    std::unordered_map<SRTSOCKET, TransportCounterSnapshot> output_transport_last_by_socket;
 
     MetricsState();
 };
@@ -141,9 +156,13 @@ private:
 
 std::string RenderPrometheusMetrics(const MetricsState& metrics);
 std::string BuildInputLinkStatusCompact(const MetricsState& metrics);
+std::string BuildOutputLinkStatusCompact(const MetricsState& metrics);
 void MarkAllTrackedInputLinksDisconnected(MetricsState* metrics);
+void MarkAllTrackedOutputLinksDisconnected(MetricsState* metrics);
 void UpdateInputLinkHealthFromMsgCtrl(const SRT_MSGCTRL& rx_ctrl, MetricsState* metrics);
+void UpdateOutputLinkHealthFromMsgCtrl(const SRT_MSGCTRL& tx_ctrl, MetricsState* metrics);
 void ResetInputTrackingMetrics(MetricsState* metrics);
+void ResetOutputTrackingMetrics(MetricsState* metrics);
 
 void MaybeLogStats(const Config& cfg,
                    const Logger& logger,
