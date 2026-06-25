@@ -122,15 +122,19 @@ Replace `LOCAL_NIC_A`/`LOCAL_NIC_B` with the receiver host's NIC IPs bound to ea
 
 ## CLI (Core Flags)
 
-Required:
+Required in normal relay mode:
 
 - `--input`
 - `--output`
-- `--stats-interval-ms`
-- `--reconnect-delay-ms`
+
+Required for linkage check mode:
+
+- `--verify-linkage` (when this flag is used, `--input`/`--output` are not required)
 
 Common optional flags:
 
+- `--stats-interval-ms` (default `1000`)
+- `--reconnect-delay-ms` (default `1000`)
 - `--max-message-size`
 - `--io-timeout-ms`
 - `--log-level`
@@ -216,17 +220,18 @@ bash scripts/local-bond-lab.sh logs-relay
 
 ## Supported URI Query Options
 
-Applied as socket flags when present:
+Recognized SRT query keys:
 
-SRT:
+- Endpoint behavior: `mode` (`listener`/`caller`; defaults: input=`listener`, output=`caller`)
+- Bond mode aliases: `grouptype`, `group_type`, `bond`, `bond_mode` (`broadcast`/`backup`)
+- Bonded source adapter aliases (caller groups): `srcip`, `sourceip`, `localip`, `adapterip`, `adapter_ip`
+- Socket options: `passphrase`, `pbkeylen`, `transtype` (`live`/`file`), `latency`
+- Socket options: `peeridletimeo`, `conntimeo`, `linger`, `rcvbuf`, `sndbuf`, `oheadbw`, `streamid`
 
-- `passphrase`, `pbkeylen`, `transtype`, `latency`
-- `peeridletimeo`, `conntimeo`, `linger`
-- `rcvbuf`, `sndbuf`, `oheadbw`, `streamid`
+Recognized UDP query keys:
 
-UDP:
-
-- `rcvbuf`, `sndbuf`, `reuseaddr`, `ttl`, `localip`, `localport`
+- Endpoint behavior: `mode` (input supports listener only; output supports caller only)
+- Socket options: `rcvbuf`, `sndbuf`, `reuseaddr`, `ttl`, `localip`, `localport`
 
 ## Current Limitations
 
