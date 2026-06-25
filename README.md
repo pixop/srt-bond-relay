@@ -101,8 +101,8 @@ ffmpeg -re -stream_loop -1 -i input.mp4 -f mpegts pipe: \
 | docker run --rm -i --network host \
     srt-bond-relay:dev \
     --input "stdin" \
-    --output "srt://REMOTE_A:5000?mode=caller&srcip=LOCAL_NIC_A;\
-              srt://REMOTE_B:5000?mode=caller&srcip=LOCAL_NIC_B&grouptype=broadcast" \
+    --output "srt://REMOTE_A:5000?srcip=LOCAL_NIC_A;\
+              srt://REMOTE_B:5000?srcip=LOCAL_NIC_B&grouptype=broadcast" \
     --max-message-size 1316
 ```
 
