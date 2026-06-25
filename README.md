@@ -10,8 +10,25 @@ Build relay image:
 ```bash
 docker build \
   --build-arg SRT_TAG=v1.5.5 \
+  --build-arg SRT_LINKAGE=dynamic \
   -t srt-bond-relay:dev .
 ```
+
+Build static-SRT artifact and copy executable to host (after compile finishes):
+
+```bash
+mkdir -p artifacts/static-srt
+docker build \
+  --build-arg SRT_TAG=v1.5.5 \
+  --build-arg SRT_LINKAGE=static \
+  --target static-artifact \
+  --output type=local,dest=./artifacts/static-srt \
+  .
+```
+
+Host output path:
+
+- `./artifacts/static-srt/srt-bond-relay`
 
 Build `srt-test-live` image (from `Dockerfile.srt-test-live`):
 
@@ -29,7 +46,8 @@ docker run --rm srt-bond-relay:dev --verify-linkage
 
 Expected output includes:
 
-- loaded `libsrt` path
+- configured SRT linkage mode (`dynamic` or `static`)
+- resolved SRT symbol owner path
 - SRT version
 - bonding API probe result
 

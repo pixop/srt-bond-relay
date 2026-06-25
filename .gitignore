@@ -1,5 +1,5 @@
 # Build artifacts
-/build/
+/build*/
 /cmake-build-*/
 *.o
 *.obj
@@ -41,3 +41,4 @@ Thumbs.db
 # Local helper/runtime folders
 terminals/
 agent-tools/
+artifacts/

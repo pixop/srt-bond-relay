@@ -15,20 +15,63 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(cpp_httplib)
 
 find_package(SRT QUIET)
+
+set(SRT_LINKAGE "dynamic" CACHE STRING "SRT linkage mode: dynamic or static")
+set_property(CACHE SRT_LINKAGE PROPERTY STRINGS dynamic static)
+if (NOT SRT_LINKAGE STREQUAL "dynamic" AND NOT SRT_LINKAGE STREQUAL "static")
+    message(FATAL_ERROR "SRT_LINKAGE must be one of: dynamic, static")
+endif()
+
 set(PIXOP_SRT_LINK_TARGET "")
 set(PIXOP_SRT_INCLUDE_DIRS "")
 set(PIXOP_SRT_LIBRARY_DIRS "")
 set(PIXOP_SRT_LIBRARIES "")
+set(PIXOP_SRT_LINK_OPTIONS "")
 
-if (SRT_FOUND AND TARGET SRT::srt)
+if (SRT_LINKAGE STREQUAL "dynamic" AND SRT_FOUND AND TARGET SRT::srt)
     set(PIXOP_SRT_LINK_TARGET "SRT::srt")
 else()
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(SRT REQUIRED IMPORTED_TARGET srt)
-    set(PIXOP_SRT_LINK_TARGET "PkgConfig::SRT")
+
     set(PIXOP_SRT_INCLUDE_DIRS "${SRT_INCLUDE_DIRS}")
     set(PIXOP_SRT_LIBRARY_DIRS "${SRT_LIBRARY_DIRS}")
-    set(PIXOP_SRT_LIBRARIES "${SRT_LIBRARIES}")
+
+    if (SRT_LINKAGE STREQUAL "dynamic")
+        set(PIXOP_SRT_LINK_TARGET "PkgConfig::SRT")
+        set(PIXOP_SRT_LIBRARIES "${SRT_LIBRARIES}")
+    else()
+        set(PKG_CONFIG_USE_STATIC_LIBS ON)
+        pkg_check_modules(SRT_STATIC REQUIRED srt)
+        set(PKG_CONFIG_USE_STATIC_LIBS OFF)
+
+        set(_pixop_srt_static_candidates)
+        foreach(_dir IN LISTS SRT_LIBRARY_DIRS SRT_STATIC_LIBRARY_DIRS)
+            list(APPEND _pixop_srt_static_candidates
+                "${_dir}/libsrt.a"
+            )
+        endforeach()
+        list(APPEND _pixop_srt_static_candidates
+            "/opt/pixop-srt/lib/libsrt.a"
+            "/opt/pixop-srt/lib64/libsrt.a"
+        )
+
+        set(_pixop_srt_static_lib "")
+        foreach(_candidate IN LISTS _pixop_srt_static_candidates)
+            if (EXISTS "${_candidate}")
+                set(_pixop_srt_static_lib "${_candidate}")
+                break()
+            endif()
+        endforeach()
+        if (_pixop_srt_static_lib STREQUAL "")
+            message(FATAL_ERROR "SRT_LINKAGE=static requested but libsrt.a was not found")
+        endif()
+
+        set(PIXOP_SRT_LINK_TARGET "${_pixop_srt_static_lib}")
+        set(PIXOP_SRT_LIBRARIES "${SRT_STATIC_LIBRARIES}")
+        list(REMOVE_ITEM PIXOP_SRT_LIBRARIES srt)
+        set(PIXOP_SRT_LINK_OPTIONS "${SRT_STATIC_LDFLAGS_OTHER}")
+    endif()
 endif()
 
 add_executable(srt-bond-relay
@@ -44,6 +87,8 @@ add_executable(srt-bond-relay
     src/relay_runtime.cpp
     src/srt_utils.cpp
 )
+
+target_compile_definitions(srt-bond-relay PRIVATE SRT_LINKAGE_MODE="${SRT_LINKAGE}")
 
 target_compile_options(srt-bond-relay PRIVATE
     -Wall
@@ -67,6 +112,9 @@ target_link_libraries(srt-bond-relay PRIVATE
     httplib::httplib
     dl
 )
+if (PIXOP_SRT_LINK_OPTIONS)
+    target_link_options(srt-bond-relay PRIVATE ${PIXOP_SRT_LINK_OPTIONS})
+endif()
 
 # Keep runtime linkage pinned to the custom libsrt directory in the image.
 set_target_properties(srt-bond-relay PROPERTIES
