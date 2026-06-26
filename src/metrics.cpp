@@ -1706,6 +1706,8 @@ std::string RenderPrometheusMetrics(const MetricsState& metrics) {
 
     const auto input_rtt_ms = metrics.input_rtt_ms.load(std::memory_order_relaxed);
     const auto output_rtt_ms = metrics.output_rtt_ms.load(std::memory_order_relaxed);
+    const auto input_effective_latency_ms = metrics.input_effective_latency_ms.load(std::memory_order_relaxed);
+    const auto output_effective_latency_ms = metrics.output_effective_latency_ms.load(std::memory_order_relaxed);
     const auto last_rx_unix_seconds = metrics.last_rx_unix_ms.load(std::memory_order_relaxed) / 1000;
     const auto last_tx_unix_seconds = metrics.last_tx_unix_ms.load(std::memory_order_relaxed) / 1000;
 
@@ -1907,6 +1909,14 @@ std::string RenderPrometheusMetrics(const MetricsState& metrics) {
 
     emit_i64("srt_relay_input_rtt_ms", "gauge", "Input socket RTT in milliseconds.", input_rtt_ms);
     emit_i64("srt_relay_output_rtt_ms", "gauge", "Output socket RTT in milliseconds.", output_rtt_ms);
+    emit_i64("srt_relay_input_effective_latency_ms",
+             "gauge",
+             "Input effective latency in milliseconds (negotiated latency when available, otherwise socket latency, else -1).",
+             input_effective_latency_ms);
+    emit_i64("srt_relay_output_effective_latency_ms",
+             "gauge",
+             "Output effective latency in milliseconds (negotiated latency when available, otherwise socket latency, else -1).",
+             output_effective_latency_ms);
     out << "# HELP srt_relay_input_bond_mode Input bonded mode for active input session (1 for current mode, 0 otherwise).\n";
     out << "# TYPE srt_relay_input_bond_mode gauge\n";
     out << "srt_relay_input_bond_mode{mode=\"unknown\"} " << (input_bond_mode == 0 ? 1 : 0) << "\n";
@@ -2095,6 +2105,8 @@ void MaybeLogStats(const Config& cfg,
         ReadRuntimeLatencySnapshot(output_metrics_mode == OutputMetricsMode::kSrtSocket ? output_sock : SRT_INVALID_SOCK);
     const int input_effective_latency_ms = EffectiveLatencyMsOrMinusOne(input_latency_snapshot);
     const int output_effective_latency_ms = EffectiveLatencyMsOrMinusOne(output_latency_snapshot);
+    metrics->input_effective_latency_ms.store(input_effective_latency_ms, std::memory_order_relaxed);
+    metrics->output_effective_latency_ms.store(output_effective_latency_ms, std::memory_order_relaxed);
 
     metrics->rx_bytes_per_sec.store(rx_bps, std::memory_order_relaxed);
     metrics->tx_bytes_per_sec.store(tx_bps, std::memory_order_relaxed);

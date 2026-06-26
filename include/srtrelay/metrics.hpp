@@ -111,6 +111,8 @@ struct MetricsState {
 
     std::atomic<int64_t> input_rtt_ms{-1};
     std::atomic<int64_t> output_rtt_ms{-1};
+    std::atomic<int64_t> input_effective_latency_ms{-1};
+    std::atomic<int64_t> output_effective_latency_ms{-1};
     std::atomic<int> input_bond_mode{0};  // 0=unknown, 1=broadcast, 2=backup
     std::atomic<int> output_bond_mode{0};  // 0=unknown, 1=broadcast, 2=backup
 
