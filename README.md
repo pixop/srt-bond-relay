@@ -234,6 +234,114 @@ When output mode is `stdout` or `udp://...`:
 
 Logs are structured key-value lines on `stderr` (`startup`, connection transitions, periodic `stats`, `shutdown`, and metrics server lifecycle events).
 
+### Failure Taxonomy (Reason Codes)
+
+Failure and reconnect logs now include:
+
+- `reason_code`: stable machine-parseable code
+- `reason_class`: one of `timeout`, `disconnect`, `connect_failure`, `io_failure`, `protocol_state`, `internal`
+- `reason_detail`: original transport/library error text
+
+Current stable `reason_code` values:
+
+- `connect_timeout`
+- `receive_timeout`
+- `send_timeout`
+- `accept_timeout`
+- `connect_failed`
+- `receive_failed`
+- `send_failed`
+- `accept_failed`
+- `disconnected`
+- `protocol_eof`
+- `internal_error`
+
+Timeouts are explicitly disambiguated by code (`connect_timeout`, `receive_timeout`, `send_timeout`, `accept_timeout`), so send timeouts can be separated from hard send failures (`send_failed`) and disconnects (`disconnected`).
+
+### Incident and Attempt Semantics
+
+The relay now tracks first-fault incidents and per-side reconnect attempts:
+
+- `incident_id`: created on first detected path degradation (`incident-open`), reused across related failure/reconnect logs, and closed with `incident-close` when both sides are connected again.
+- `attempt_id`: independent for input/output reconnect cycles; starts on first failure/degradation for that side, remains active through ensure/connect retries, and clears after successful reconnect.
+
+Key incident lifecycle logs:
+
+- `incident-open` includes first fault side, first reason code/class/detail, source, socket, and attempt
+- `incident-close` includes duration and summary counters (`input_failures`, `output_failures`, `input_timeouts`, `output_timeouts`)
+
+Failure/reconnect logs now include causal keys:
+
+- `side`, `attempt_id`, `incident_id`, `reason_code`, `reason_class`, `reason_detail`
+
+### Member/Link Transition Events
+
+On every stats interval, explicit transition events are emitted when tracked member status changes:
+
+- event: `member-transition`
+- fields: `side`, `member_socket_id`, `peer_host`, `peer_port`, `prior_state`, `new_state`, `prior_connected`, `new_connected`, `incident_id`
+
+State transitions are normalized to `down`, `up`, `running`, `broken`.
+
+### New Prometheus Metrics
+
+Added causal reconstruction metrics (bounded-label cardinality):
+
+- `srt_relay_timeouts_total{side,timeout_type}` (`timeout_type`: `connect|receive|send|accept`)
+- `srt_relay_disconnects_total{side,reason_class,reason_code}`
+- `srt_relay_reconnect_attempts_total{side}`
+- `srt_relay_last_input_failure_unix_seconds`
+- `srt_relay_last_output_failure_unix_seconds`
+- `srt_relay_incident_active`
+- `srt_relay_incident_age_seconds`
+
+No raw error strings are used as labels; free-form details remain in logs only (`reason_detail`).
+
+### `/session/specs` Last-Fault Snapshot
+
+`GET /session/specs` now includes a compact `last_failure` snapshot under both `input` and `output`:
+
+- `timestamp`
+- `reason_code`
+- `reason_class`
+- `reason_detail`
+- `incident_id`
+- `attempt_id`
+- `source`
+
+All previously documented fields remain unchanged.
+
+### Causality Quick Use
+
+Example causal log sequence:
+
+1. `incident-open` (`first_fault_side=output`, `first_reason_code=send_timeout`)
+2. `output-send-failed` (`attempt_id=17`, `incident_id=inc-42`)
+3. `output-reset` (`attempt_id=17`, `incident_id=inc-42`)
+4. `output-ensure-attempt` (`attempt_id=17`, `incident_id=inc-42`)
+5. `output-connected` (`attempt_id=17`, `incident_id=inc-42`)
+6. `incident-close` (`incident_id=inc-42`, `duration_ms=...`)
+
+Interpretation guidance:
+
+- First cause is the `incident-open` tuple (`first_fault_side`, `first_reason_code`), not the last error before recovery.
+- Use `attempt_id` to isolate one reconnect cycle per side.
+- Use `member-transition` events to confirm whether member degradation preceded session-level failure.
+
+Prometheus query examples:
+
+```promql
+sum by (side, timeout_type) (increase(srt_relay_timeouts_total[15m]))
+```
+
+```promql
+sum by (side, reason_class, reason_code) (increase(srt_relay_disconnects_total[15m]))
+```
+
+```promql
+max(srt_relay_incident_active), max(srt_relay_incident_age_seconds)
+```
+
 ## Testing Guides
 
 - Local single-host bonded lab: `LOCAL_BOND_COOKBOOK.md`

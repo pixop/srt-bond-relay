@@ -12,6 +12,7 @@
 
 #include <srt.h>
 
+#include "srtrelay/causality.hpp"
 #include "srtrelay/config.hpp"
 #include "srtrelay/logger.hpp"
 #include <httplib.h>
@@ -134,10 +135,37 @@ struct MetricsState {
     std::array<std::atomic<uint64_t>, kMaxTrackedMembers> output_link_rx_bytes_last {};
     std::array<std::atomic<uint64_t>, kMaxTrackedMembers> output_link_tx_bytes_last {};
     std::array<std::atomic<int64_t>, kMaxTrackedMembers> output_link_rtt_ms {};
+    std::array<std::atomic<int>, kMaxTrackedMembers> input_member_sock_state {};
+    std::array<std::atomic<int>, kMaxTrackedMembers> input_member_group_state {};
+    std::array<std::atomic<int>, kMaxTrackedMembers> input_member_peer_port {};
+    std::array<std::atomic<int>, kMaxTrackedMembers> output_member_sock_state {};
+    std::array<std::atomic<int>, kMaxTrackedMembers> output_member_group_state {};
+    std::array<std::atomic<int>, kMaxTrackedMembers> output_member_peer_port {};
 
     std::unordered_map<SRTSOCKET, TransportCounterSnapshot> input_transport_last_by_socket;
     std::unordered_map<SRTSOCKET, TransportCounterSnapshot> output_transport_last_by_socket;
+
+    std::array<std::array<std::atomic<uint64_t>, kTimeoutTypes>, kFailureSides> timeouts_total {};
+    std::array<std::array<std::atomic<uint64_t>, kReasonCodes>, kFailureSides> disconnects_total {};
+    std::array<std::atomic<uint64_t>, kFailureSides> reconnect_attempts_total {};
+    std::atomic<int64_t> last_input_failure_unix_seconds{0};
+    std::atomic<int64_t> last_output_failure_unix_seconds{0};
+    std::atomic<int> incident_active{0};
+    std::atomic<int64_t> incident_open_unix_ms{0};
+
+    std::array<std::atomic<uint64_t>, kFailureSides> active_attempt_id {};
+    std::string active_incident_id;
+    LastFailureSnapshot input_last_failure;
+    LastFailureSnapshot output_last_failure;
+    std::array<std::string, kMaxTrackedMembers> input_member_peer_host {};
+    std::array<std::string, kMaxTrackedMembers> output_member_peer_host {};
+    std::array<int, kMaxTrackedMembers> input_member_status_last_logged {};
+    std::array<int, kMaxTrackedMembers> output_member_status_last_logged {};
+    std::array<int, kMaxTrackedMembers> input_member_connected_last_logged {};
+    std::array<int, kMaxTrackedMembers> output_member_connected_last_logged {};
+
     mutable std::mutex link_metrics_mutex;
+    mutable std::mutex causality_mutex;
 
     MetricsState();
 };
@@ -187,6 +215,7 @@ void MaybeLogStats(const Config& cfg,
                    SRTSOCKET input_session_sock,
                    SRTSOCKET output_sock,
                    OutputMetricsMode output_metrics_mode,
+                   const std::string& active_incident_id,
                    std::chrono::steady_clock::time_point* last_stats_at);
 
 }  // namespace srtrelay

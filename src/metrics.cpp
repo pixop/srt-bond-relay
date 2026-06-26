@@ -43,6 +43,26 @@ MetricsState::MetricsState() {
         output_link_rx_bytes_last[i].store(0, std::memory_order_relaxed);
         output_link_tx_bytes_last[i].store(0, std::memory_order_relaxed);
         output_link_rtt_ms[i].store(-1, std::memory_order_relaxed);
+        input_member_sock_state[i].store(SRTS_NONEXIST, std::memory_order_relaxed);
+        input_member_group_state[i].store(SRT_GST_IDLE, std::memory_order_relaxed);
+        input_member_peer_port[i].store(0, std::memory_order_relaxed);
+        output_member_sock_state[i].store(SRTS_NONEXIST, std::memory_order_relaxed);
+        output_member_group_state[i].store(SRT_GST_IDLE, std::memory_order_relaxed);
+        output_member_peer_port[i].store(0, std::memory_order_relaxed);
+        input_member_status_last_logged[i] = -1;
+        output_member_status_last_logged[i] = -1;
+        input_member_connected_last_logged[i] = -1;
+        output_member_connected_last_logged[i] = -1;
+    }
+    for (size_t side = 0; side < kFailureSides; ++side) {
+        for (size_t i = 0; i < kTimeoutTypes; ++i) {
+            timeouts_total[side][i].store(0, std::memory_order_relaxed);
+        }
+        for (size_t i = 0; i < kReasonCodes; ++i) {
+            disconnects_total[side][i].store(0, std::memory_order_relaxed);
+        }
+        reconnect_attempts_total[side].store(0, std::memory_order_relaxed);
+        active_attempt_id[side].store(0, std::memory_order_relaxed);
     }
 }
 
@@ -355,6 +375,21 @@ bool TryExtractEndpoint(const sockaddr_storage& addr, std::string* out_host, int
 
 json BuildConnectedMembersJson(SRTSOCKET session_sock);
 
+json BuildLastFailureJson(const LastFailureSnapshot& snapshot) {
+    if (snapshot.timestamp_unix_seconds <= 0) {
+        return nullptr;
+    }
+    return json{
+        {"timestamp", snapshot.timestamp_unix_seconds},
+        {"reason_code", snapshot.reason_code},
+        {"reason_class", snapshot.reason_class},
+        {"reason_detail", snapshot.reason_detail},
+        {"incident_id", snapshot.incident_id.empty() ? json(nullptr) : json(snapshot.incident_id)},
+        {"attempt_id", snapshot.attempt_id == 0 ? json(nullptr) : json(snapshot.attempt_id)},
+        {"source", snapshot.source},
+    };
+}
+
 json BuildInputSessionSpecJson(const InputEndpointSpec& spec, const MetricsState& metrics) {
     const auto connected = metrics.input_connected.load(std::memory_order_relaxed) == 1;
     const auto listening = metrics.input_listening.load(std::memory_order_relaxed) == 1;
@@ -389,6 +424,11 @@ json BuildInputSessionSpecJson(const InputEndpointSpec& spec, const MetricsState
     const bool runtime_bonded = (runtime_group_type == SRT_GTYPE_BROADCAST ||
                                  runtime_group_type == SRT_GTYPE_BACKUP ||
                                  connected_members.size() > 1);
+    LastFailureSnapshot last_failure;
+    {
+        std::lock_guard<std::mutex> causality_lock(metrics.causality_mutex);
+        last_failure = metrics.input_last_failure;
+    }
     return json{
         {"protocol", InputProtocolName(spec.kind)},
         {"mode", InputModeName(spec.kind)},
@@ -405,6 +445,7 @@ json BuildInputSessionSpecJson(const InputEndpointSpec& spec, const MetricsState
         {"runtime_transtype", runtime_transtype},
         {"session_transtype", session_transtype},
         {"connected_members", connected_members},
+        {"last_failure", BuildLastFailureJson(last_failure)},
     };
 }
 
@@ -441,6 +482,11 @@ json BuildOutputSessionSpecJson(const OutputEndpointSpec& spec, const MetricsSta
     const bool runtime_bonded = (runtime_group_type == SRT_GTYPE_BROADCAST ||
                                  runtime_group_type == SRT_GTYPE_BACKUP ||
                                  connected_members.size() > 1);
+    LastFailureSnapshot last_failure;
+    {
+        std::lock_guard<std::mutex> causality_lock(metrics.causality_mutex);
+        last_failure = metrics.output_last_failure;
+    }
     return json{
         {"protocol", OutputProtocolName(spec.kind)},
         {"mode", OutputModeName(spec.kind)},
@@ -456,6 +502,7 @@ json BuildOutputSessionSpecJson(const OutputEndpointSpec& spec, const MetricsSta
         {"runtime_transtype", runtime_transtype},
         {"session_transtype", session_transtype},
         {"connected_members", connected_members},
+        {"last_failure", BuildLastFailureJson(last_failure)},
     };
 }
 
@@ -543,6 +590,44 @@ bool IsConnectedGroupMember(const SRT_SOCKGROUPDATA& member) {
     return member.sockstate == SRTS_CONNECTED;
 }
 
+enum class MemberLinkState {
+    kDown = 0,
+    kUp = 1,
+    kRunning = 2,
+    kBroken = 3,
+};
+
+MemberLinkState DeriveMemberLinkState(int sock_state, int member_state, int connected) {
+    if (member_state == SRT_GST_BROKEN ||
+        sock_state == SRTS_BROKEN ||
+        sock_state == SRTS_CLOSING ||
+        sock_state == SRTS_CLOSED ||
+        sock_state == SRTS_NONEXIST) {
+        return MemberLinkState::kBroken;
+    }
+    if (member_state == SRT_GST_RUNNING) {
+        return MemberLinkState::kRunning;
+    }
+    if (connected == 1 || sock_state == SRTS_CONNECTED) {
+        return MemberLinkState::kUp;
+    }
+    return MemberLinkState::kDown;
+}
+
+const char* MemberLinkStateName(MemberLinkState state) {
+    switch (state) {
+        case MemberLinkState::kDown:
+            return "down";
+        case MemberLinkState::kUp:
+            return "up";
+        case MemberLinkState::kRunning:
+            return "running";
+        case MemberLinkState::kBroken:
+            return "broken";
+    }
+    return "down";
+}
+
 bool HasUsablePeerAddress(const SRT_SOCKGROUPDATA& member) {
     return member.peeraddr.ss_family == AF_INET || member.peeraddr.ss_family == AF_INET6;
 }
@@ -558,6 +643,104 @@ bool IsUsableGroupMemberSnapshot(const SRT_SOCKGROUPDATA& member) {
         return true;
     }
     return false;
+}
+
+void EmitMemberTransitionEvents(const Logger& logger,
+                                MetricsState* metrics,
+                                const std::string& active_incident_id) {
+    struct TransitionEvent {
+        const char* side = "input";
+        int64_t socket_id = SRT_INVALID_SOCK;
+        std::string peer_host;
+        int peer_port = 0;
+        MemberLinkState prior_state = MemberLinkState::kDown;
+        MemberLinkState new_state = MemberLinkState::kDown;
+        int prior_connected = 0;
+        int new_connected = 0;
+    };
+
+    std::vector<TransitionEvent> events;
+    {
+        std::lock_guard<std::mutex> lock(metrics->link_metrics_mutex);
+        auto inspect_side =
+            [&](const char* side_name,
+                const std::array<std::atomic<int64_t>, MetricsState::kMaxTrackedMembers>& member_ids,
+                const std::array<std::atomic<uint64_t>, MetricsState::kMaxTrackedMembers>& identity_keys,
+                const std::array<std::atomic<int>, MetricsState::kMaxTrackedMembers>& connected,
+                const std::array<std::atomic<int>, MetricsState::kMaxTrackedMembers>& sock_states,
+                const std::array<std::atomic<int>, MetricsState::kMaxTrackedMembers>& group_states,
+                const std::array<std::atomic<int>, MetricsState::kMaxTrackedMembers>& peer_ports,
+                const std::array<std::string, MetricsState::kMaxTrackedMembers>& peer_hosts,
+                std::array<int, MetricsState::kMaxTrackedMembers>* last_status,
+                std::array<int, MetricsState::kMaxTrackedMembers>* last_connected) {
+                for (size_t i = 0; i < MetricsState::kMaxTrackedMembers; ++i) {
+                    if (identity_keys[i].load(std::memory_order_relaxed) == 0) {
+                        (*last_status)[i] = -1;
+                        (*last_connected)[i] = -1;
+                        continue;
+                    }
+                    const int current_connected = connected[i].load(std::memory_order_relaxed);
+                    const int current_sock_state = sock_states[i].load(std::memory_order_relaxed);
+                    const int current_group_state = group_states[i].load(std::memory_order_relaxed);
+                    const MemberLinkState current_state =
+                        DeriveMemberLinkState(current_sock_state, current_group_state, current_connected);
+                    const int current_state_i = static_cast<int>(current_state);
+                    const int previous_state_i = (*last_status)[i];
+                    const int previous_connected = (*last_connected)[i];
+
+                    if (previous_state_i >= 0 &&
+                        (previous_state_i != current_state_i || previous_connected != current_connected)) {
+                        TransitionEvent event;
+                        event.side = side_name;
+                        event.socket_id = member_ids[i].load(std::memory_order_relaxed);
+                        event.peer_host = peer_hosts[i];
+                        event.peer_port = peer_ports[i].load(std::memory_order_relaxed);
+                        event.prior_state = static_cast<MemberLinkState>(previous_state_i);
+                        event.new_state = current_state;
+                        event.prior_connected = previous_connected;
+                        event.new_connected = current_connected;
+                        events.push_back(std::move(event));
+                    }
+                    (*last_status)[i] = current_state_i;
+                    (*last_connected)[i] = current_connected;
+                }
+            };
+
+        inspect_side("input",
+                     metrics->input_member_ids,
+                     metrics->input_member_identity_keys,
+                     metrics->input_member_connected,
+                     metrics->input_member_sock_state,
+                     metrics->input_member_group_state,
+                     metrics->input_member_peer_port,
+                     metrics->input_member_peer_host,
+                     &metrics->input_member_status_last_logged,
+                     &metrics->input_member_connected_last_logged);
+        inspect_side("output",
+                     metrics->output_member_ids,
+                     metrics->output_member_identity_keys,
+                     metrics->output_member_connected,
+                     metrics->output_member_sock_state,
+                     metrics->output_member_group_state,
+                     metrics->output_member_peer_port,
+                     metrics->output_member_peer_host,
+                     &metrics->output_member_status_last_logged,
+                     &metrics->output_member_connected_last_logged);
+    }
+
+    for (const auto& event : events) {
+        logger.Log(LogLevel::kInfo,
+                   "member-transition",
+                   std::string("side=") + event.side,
+                   "member_socket_id=" + std::to_string(event.socket_id),
+                   "peer_host=" + (event.peer_host.empty() ? std::string("unknown") : event.peer_host),
+                   "peer_port=" + std::to_string(event.peer_port),
+                   std::string("prior_state=") + MemberLinkStateName(event.prior_state),
+                   std::string("new_state=") + MemberLinkStateName(event.new_state),
+                   "prior_connected=" + std::to_string(event.prior_connected),
+                   "new_connected=" + std::to_string(event.new_connected),
+                   "incident_id=" + (active_incident_id.empty() ? std::string("none") : active_incident_id));
+    }
 }
 
 bool TryGetPeerAddrForSocket(SRTSOCKET sock, sockaddr_storage* out_peer_addr) {
@@ -723,6 +906,10 @@ void UpdateInputLinkHealthFallbackSingleSocket(SRTSOCKET input_session_sock, Met
             metrics->input_member_connected[i].store(0, std::memory_order_relaxed);
             metrics->input_member_ids[i].store(static_cast<int64_t>(SRT_INVALID_SOCK), std::memory_order_relaxed);
             metrics->input_member_identity_keys[i].store(0, std::memory_order_relaxed);
+            metrics->input_member_sock_state[i].store(SRTS_NONEXIST, std::memory_order_relaxed);
+            metrics->input_member_group_state[i].store(SRT_GST_IDLE, std::memory_order_relaxed);
+            metrics->input_member_peer_port[i].store(0, std::memory_order_relaxed);
+            metrics->input_member_peer_host[i].clear();
             metrics->input_link_rx_bytes_current[i].store(0, std::memory_order_relaxed);
             metrics->input_link_tx_bytes_current[i].store(0, std::memory_order_relaxed);
             metrics->input_link_rx_bytes_last[i].store(0, std::memory_order_relaxed);
@@ -743,10 +930,18 @@ void SaveInputMemberSnapshot(const std::vector<SRT_SOCKGROUPDATA>& group_members
     std::array<SRTSOCKET, MetricsState::kMaxTrackedMembers> slot_ids {};
     std::array<int, MetricsState::kMaxTrackedMembers> slot_connected {};
     std::array<uint64_t, MetricsState::kMaxTrackedMembers> slot_identity_keys {};
+    std::array<int, MetricsState::kMaxTrackedMembers> slot_sock_state {};
+    std::array<int, MetricsState::kMaxTrackedMembers> slot_group_state {};
+    std::array<int, MetricsState::kMaxTrackedMembers> slot_peer_port {};
+    std::array<std::string, MetricsState::kMaxTrackedMembers> slot_peer_host {};
     for (size_t i = 0; i < MetricsState::kMaxTrackedMembers; ++i) {
         slot_ids[i] = static_cast<SRTSOCKET>(metrics->input_member_ids[i].load(std::memory_order_relaxed));
         slot_connected[i] = metrics->input_member_connected[i].load(std::memory_order_relaxed);
         slot_identity_keys[i] = metrics->input_member_identity_keys[i].load(std::memory_order_relaxed);
+        slot_sock_state[i] = metrics->input_member_sock_state[i].load(std::memory_order_relaxed);
+        slot_group_state[i] = metrics->input_member_group_state[i].load(std::memory_order_relaxed);
+        slot_peer_port[i] = metrics->input_member_peer_port[i].load(std::memory_order_relaxed);
+        slot_peer_host[i] = metrics->input_member_peer_host[i];
     }
 
     std::array<bool, MetricsState::kMaxTrackedMembers> slot_used {};
@@ -809,6 +1004,17 @@ void SaveInputMemberSnapshot(const std::vector<SRT_SOCKGROUPDATA>& group_members
         const auto& member = group_members[i];
         slot_ids[slot] = member.id;
         slot_connected[slot] = IsConnectedGroupMember(member) ? 1 : 0;
+        slot_sock_state[slot] = member.sockstate;
+        slot_group_state[slot] = member.memberstate;
+        std::string peer_host;
+        int peer_port = 0;
+        if (TryExtractEndpoint(member.peeraddr, &peer_host, &peer_port)) {
+            slot_peer_host[slot] = peer_host;
+            slot_peer_port[slot] = peer_port;
+        } else {
+            slot_peer_host[slot].clear();
+            slot_peer_port[slot] = 0;
+        }
         uint64_t identity_key = MemberIdentityKey(member);
         if (identity_key == 0) {
             identity_key = slot_identity_keys[slot];
@@ -823,6 +1029,10 @@ void SaveInputMemberSnapshot(const std::vector<SRT_SOCKGROUPDATA>& group_members
         if (slot_identity_keys[slot] == 0) {
             slot_ids[slot] = SRT_INVALID_SOCK;
             slot_connected[slot] = 0;
+            slot_sock_state[slot] = SRTS_NONEXIST;
+            slot_group_state[slot] = SRT_GST_IDLE;
+            slot_peer_host[slot].clear();
+            slot_peer_port[slot] = 0;
             continue;
         }
         slot_ids[slot] = SRT_INVALID_SOCK;
@@ -834,6 +1044,10 @@ void SaveInputMemberSnapshot(const std::vector<SRT_SOCKGROUPDATA>& group_members
         metrics->input_member_ids[slot].store(static_cast<int64_t>(slot_ids[slot]), std::memory_order_relaxed);
         metrics->input_member_connected[slot].store(slot_connected[slot], std::memory_order_relaxed);
         metrics->input_member_identity_keys[slot].store(slot_identity_keys[slot], std::memory_order_relaxed);
+        metrics->input_member_sock_state[slot].store(slot_sock_state[slot], std::memory_order_relaxed);
+        metrics->input_member_group_state[slot].store(slot_group_state[slot], std::memory_order_relaxed);
+        metrics->input_member_peer_port[slot].store(slot_peer_port[slot], std::memory_order_relaxed);
+        metrics->input_member_peer_host[slot] = slot_peer_host[slot];
         if (slot_identity_keys[slot] != 0) {
             span = slot + 1;
         }
@@ -863,10 +1077,18 @@ void SaveOutputMemberSnapshot(const std::vector<SRT_SOCKGROUPDATA>& group_member
     std::array<SRTSOCKET, MetricsState::kMaxTrackedMembers> slot_ids {};
     std::array<int, MetricsState::kMaxTrackedMembers> slot_connected {};
     std::array<uint64_t, MetricsState::kMaxTrackedMembers> slot_identity_keys {};
+    std::array<int, MetricsState::kMaxTrackedMembers> slot_sock_state {};
+    std::array<int, MetricsState::kMaxTrackedMembers> slot_group_state {};
+    std::array<int, MetricsState::kMaxTrackedMembers> slot_peer_port {};
+    std::array<std::string, MetricsState::kMaxTrackedMembers> slot_peer_host {};
     for (size_t i = 0; i < MetricsState::kMaxTrackedMembers; ++i) {
         slot_ids[i] = static_cast<SRTSOCKET>(metrics->output_member_ids[i].load(std::memory_order_relaxed));
         slot_connected[i] = metrics->output_member_connected[i].load(std::memory_order_relaxed);
         slot_identity_keys[i] = metrics->output_member_identity_keys[i].load(std::memory_order_relaxed);
+        slot_sock_state[i] = metrics->output_member_sock_state[i].load(std::memory_order_relaxed);
+        slot_group_state[i] = metrics->output_member_group_state[i].load(std::memory_order_relaxed);
+        slot_peer_port[i] = metrics->output_member_peer_port[i].load(std::memory_order_relaxed);
+        slot_peer_host[i] = metrics->output_member_peer_host[i];
     }
 
     std::array<bool, MetricsState::kMaxTrackedMembers> slot_used {};
@@ -929,6 +1151,17 @@ void SaveOutputMemberSnapshot(const std::vector<SRT_SOCKGROUPDATA>& group_member
         const auto& member = group_members[i];
         slot_ids[slot] = member.id;
         slot_connected[slot] = IsConnectedGroupMember(member) ? 1 : 0;
+        slot_sock_state[slot] = member.sockstate;
+        slot_group_state[slot] = member.memberstate;
+        std::string peer_host;
+        int peer_port = 0;
+        if (TryExtractEndpoint(member.peeraddr, &peer_host, &peer_port)) {
+            slot_peer_host[slot] = peer_host;
+            slot_peer_port[slot] = peer_port;
+        } else {
+            slot_peer_host[slot].clear();
+            slot_peer_port[slot] = 0;
+        }
         uint64_t identity_key = MemberIdentityKey(member);
         if (identity_key == 0) {
             identity_key = slot_identity_keys[slot];
@@ -943,6 +1176,10 @@ void SaveOutputMemberSnapshot(const std::vector<SRT_SOCKGROUPDATA>& group_member
         if (slot_identity_keys[slot] == 0) {
             slot_ids[slot] = SRT_INVALID_SOCK;
             slot_connected[slot] = 0;
+            slot_sock_state[slot] = SRTS_NONEXIST;
+            slot_group_state[slot] = SRT_GST_IDLE;
+            slot_peer_host[slot].clear();
+            slot_peer_port[slot] = 0;
             continue;
         }
         slot_ids[slot] = SRT_INVALID_SOCK;
@@ -954,6 +1191,10 @@ void SaveOutputMemberSnapshot(const std::vector<SRT_SOCKGROUPDATA>& group_member
         metrics->output_member_ids[slot].store(static_cast<int64_t>(slot_ids[slot]), std::memory_order_relaxed);
         metrics->output_member_connected[slot].store(slot_connected[slot], std::memory_order_relaxed);
         metrics->output_member_identity_keys[slot].store(slot_identity_keys[slot], std::memory_order_relaxed);
+        metrics->output_member_sock_state[slot].store(slot_sock_state[slot], std::memory_order_relaxed);
+        metrics->output_member_group_state[slot].store(slot_group_state[slot], std::memory_order_relaxed);
+        metrics->output_member_peer_port[slot].store(slot_peer_port[slot], std::memory_order_relaxed);
+        metrics->output_member_peer_host[slot] = slot_peer_host[slot];
         if (slot_identity_keys[slot] != 0) {
             span = slot + 1;
         }
@@ -973,6 +1214,10 @@ void UpdateOutputLinkHealthFallbackSingleSocket(SRTSOCKET output_sock, MetricsSt
             metrics->output_member_connected[i].store(0, std::memory_order_relaxed);
             metrics->output_member_ids[i].store(static_cast<int64_t>(SRT_INVALID_SOCK), std::memory_order_relaxed);
             metrics->output_member_identity_keys[i].store(0, std::memory_order_relaxed);
+        metrics->output_member_sock_state[i].store(SRTS_NONEXIST, std::memory_order_relaxed);
+        metrics->output_member_group_state[i].store(SRT_GST_IDLE, std::memory_order_relaxed);
+        metrics->output_member_peer_port[i].store(0, std::memory_order_relaxed);
+        metrics->output_member_peer_host[i].clear();
             metrics->output_link_rx_bytes_current[i].store(0, std::memory_order_relaxed);
             metrics->output_link_tx_bytes_current[i].store(0, std::memory_order_relaxed);
             metrics->output_link_rx_bytes_last[i].store(0, std::memory_order_relaxed);
@@ -1782,6 +2027,14 @@ std::string RenderPrometheusMetrics(const MetricsState& metrics) {
     const auto output_effective_latency_ms = metrics.output_effective_latency_ms.load(std::memory_order_relaxed);
     const auto last_rx_unix_seconds = metrics.last_rx_unix_ms.load(std::memory_order_relaxed) / 1000;
     const auto last_tx_unix_seconds = metrics.last_tx_unix_ms.load(std::memory_order_relaxed) / 1000;
+    const auto last_input_failure_unix_seconds = metrics.last_input_failure_unix_seconds.load(std::memory_order_relaxed);
+    const auto last_output_failure_unix_seconds = metrics.last_output_failure_unix_seconds.load(std::memory_order_relaxed);
+    const auto incident_active = metrics.incident_active.load(std::memory_order_relaxed);
+    const auto incident_open_unix_ms = metrics.incident_open_unix_ms.load(std::memory_order_relaxed);
+    const int64_t incident_age_seconds =
+        (incident_active == 1 && incident_open_unix_ms > 0)
+            ? std::max<int64_t>(0, (UnixNowMs() - incident_open_unix_ms) / 1000)
+            : 0;
 
     std::ostringstream out;
     auto emit_u64 = [&](const char* name, const char* type, const char* help, uint64_t value) {
@@ -2001,6 +2254,39 @@ std::string RenderPrometheusMetrics(const MetricsState& metrics) {
     out << "srt_relay_output_bond_mode{mode=\"backup\"} " << (output_bond_mode == 2 ? 1 : 0) << "\n";
     emit_i64("srt_relay_last_rx_unix_seconds", "gauge", "Unix timestamp of last received packet.", last_rx_unix_seconds);
     emit_i64("srt_relay_last_tx_unix_seconds", "gauge", "Unix timestamp of last forwarded packet.", last_tx_unix_seconds);
+    emit_i64("srt_relay_last_input_failure_unix_seconds", "gauge", "Unix timestamp of last input-side failure.", last_input_failure_unix_seconds);
+    emit_i64("srt_relay_last_output_failure_unix_seconds", "gauge", "Unix timestamp of last output-side failure.", last_output_failure_unix_seconds);
+    emit_i64("srt_relay_incident_active", "gauge", "Whether a causal incident is active (1/0).", incident_active);
+    emit_i64("srt_relay_incident_age_seconds", "gauge", "Age of active incident in seconds.", incident_age_seconds);
+    out << "# HELP srt_relay_timeouts_total Total timeout events by side and timeout type.\n";
+    out << "# TYPE srt_relay_timeouts_total counter\n";
+    for (FailureSide side : {FailureSide::kInput, FailureSide::kOutput}) {
+        for (TimeoutType timeout_type : AllTimeoutTypes()) {
+            out << "srt_relay_timeouts_total{side=\"" << FailureSideName(side)
+                << "\",timeout_type=\"" << TimeoutTypeName(timeout_type) << "\"} "
+                << metrics.timeouts_total[SideIndex(side)][TimeoutTypeIndex(timeout_type)].load(std::memory_order_relaxed)
+                << "\n";
+        }
+    }
+    out << "# HELP srt_relay_disconnects_total Total disconnect/failure events by side, class, and code.\n";
+    out << "# TYPE srt_relay_disconnects_total counter\n";
+    for (FailureSide side : {FailureSide::kInput, FailureSide::kOutput}) {
+        for (ReasonCode code : AllReasonCodes()) {
+            const ReasonClass reason_class = ReasonClassFromCode(code);
+            out << "srt_relay_disconnects_total{side=\"" << FailureSideName(side)
+                << "\",reason_class=\"" << ReasonClassName(reason_class)
+                << "\",reason_code=\"" << ReasonCodeName(code) << "\"} "
+                << metrics.disconnects_total[SideIndex(side)][ReasonCodeIndex(code)].load(std::memory_order_relaxed)
+                << "\n";
+        }
+    }
+    out << "# HELP srt_relay_reconnect_attempts_total Total reconnect attempts by side.\n";
+    out << "# TYPE srt_relay_reconnect_attempts_total counter\n";
+    for (FailureSide side : {FailureSide::kInput, FailureSide::kOutput}) {
+        out << "srt_relay_reconnect_attempts_total{side=\"" << FailureSideName(side) << "\"} "
+            << metrics.reconnect_attempts_total[SideIndex(side)].load(std::memory_order_relaxed)
+            << "\n";
+    }
 
     return out.str();
 }
@@ -2115,6 +2401,7 @@ void MaybeLogStats(const Config& cfg,
                    SRTSOCKET input_session_sock,
                    SRTSOCKET output_sock,
                    OutputMetricsMode output_metrics_mode,
+                   const std::string& active_incident_id,
                    std::chrono::steady_clock::time_point* last_stats_at) {
     const auto now = std::chrono::steady_clock::now();
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - *last_stats_at).count();
@@ -2138,6 +2425,7 @@ void MaybeLogStats(const Config& cfg,
     UpdateOutputLinkHealthMetrics(output_metrics_mode == OutputMetricsMode::kSrtSocket ? output_sock : SRT_INVALID_SOCK, metrics);
     UpdateTransportTrafficMetrics(output_metrics_mode == OutputMetricsMode::kSrtSocket ? output_sock : SRT_INVALID_SOCK,
                                   metrics);
+    EmitMemberTransitionEvents(logger, metrics, active_incident_id);
     int64_t max_input_link_rtt_ms = -1;
     if (TryComputeMaxConnectedInputLinkRtt(*metrics, &max_input_link_rtt_ms)) {
         metrics->input_rtt_ms.store(max_input_link_rtt_ms, std::memory_order_relaxed);

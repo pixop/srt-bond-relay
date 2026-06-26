@@ -96,7 +96,11 @@ public:
     SrtOutputCallerSink(std::vector<SrtUri> uris, bool bonded, SRT_GROUP_TYPE group_type)
         : uris_(std::move(uris)), bonded_(bonded), group_type_(group_type) {}
 
-    void EnsureReady(const Config& cfg, const Logger& logger, RelayStats* stats, MetricsState* metrics) override {
+    void EnsureReady(const Config& cfg,
+                     const Logger& logger,
+                     RelayStats* stats,
+                     MetricsState* metrics,
+                     const EnsureAttemptContext& attempt_ctx) override {
         ensure_error_kind_ = IoErrorKind::kNone;
         ensure_error_message_.clear();
         metrics_ = metrics;
@@ -114,7 +118,9 @@ public:
                        std::string("mode=caller"),
                        "bonded=" + std::string(bonded_ ? "true" : "false"),
                        "members=" + std::to_string(uris_.size()),
-                       "socket=" + std::to_string(sock));
+                       "socket=" + std::to_string(sock),
+                       "attempt_id=" + std::to_string(attempt_ctx.attempt_id),
+                       "incident_id=" + (attempt_ctx.incident_id.empty() ? std::string("none") : attempt_ctx.incident_id));
         } catch (const std::exception& ex) {
             stats->reconnect_count++;
             metrics->reconnect_count.store(stats->reconnect_count, std::memory_order_relaxed);
@@ -182,7 +188,11 @@ public:
     explicit SrtOutputListenerSink(std::vector<SrtUri> uris) : uris_(std::move(uris)) {}
     ~SrtOutputListenerSink() override { detail::CloseSocketList(&listeners_); }
 
-    void EnsureReady(const Config& cfg, const Logger& logger, RelayStats*, MetricsState* metrics) override {
+    void EnsureReady(const Config& cfg,
+                     const Logger& logger,
+                     RelayStats*,
+                     MetricsState* metrics,
+                     const EnsureAttemptContext& attempt_ctx) override {
         ensure_error_kind_ = IoErrorKind::kNone;
         ensure_error_message_.clear();
         metrics_ = metrics;
@@ -198,7 +208,9 @@ public:
                 ApplyIntSockOpt(accepted, SRTO_SNDTIMEO, cfg.io_timeout_ms, "SRTO_SNDTIMEO");
                 session_.Set(accepted);
                 logger.Log(LogLevel::kInfo, "output-client-connected",
-                           "socket=" + std::to_string(accepted));
+                           "socket=" + std::to_string(accepted),
+                           "attempt_id=" + std::to_string(attempt_ctx.attempt_id),
+                           "incident_id=" + (attempt_ctx.incident_id.empty() ? std::string("none") : attempt_ctx.incident_id));
             }
             metrics->output_connected.store(session_.Valid() ? 1 : 0, std::memory_order_relaxed);
         } catch (const std::exception& ex) {
@@ -261,7 +273,11 @@ public:
     UdpOutputSink(UdpUri uri, bool listener) : uri_(std::move(uri)), listener_(listener) {}
     ~UdpOutputSink() override { CloseSocket(); }
 
-    void EnsureReady(const Config& cfg, const Logger&, RelayStats* stats, MetricsState* metrics) override {
+    void EnsureReady(const Config& cfg,
+                     const Logger&,
+                     RelayStats* stats,
+                     MetricsState* metrics,
+                     const EnsureAttemptContext&) override {
         ensure_error_kind_ = IoErrorKind::kNone;
         ensure_error_message_.clear();
         if (socket_fd_ >= 0) {
@@ -350,7 +366,11 @@ private:
 
 class StdoutOutputSink : public OutputSink {
 public:
-    void EnsureReady(const Config&, const Logger&, RelayStats*, MetricsState* metrics) override {
+    void EnsureReady(const Config&,
+                     const Logger&,
+                     RelayStats*,
+                     MetricsState* metrics,
+                     const EnsureAttemptContext&) override {
         ensure_error_kind_ = IoErrorKind::kNone;
         ensure_error_message_.clear();
         if (!healthy_) {

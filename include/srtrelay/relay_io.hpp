@@ -51,10 +51,18 @@ struct OutputEndpointSpec {
     SRT_GROUP_TYPE group_type = SRT_GTYPE_UNDEFINED;
 };
 
+struct EnsureAttemptContext {
+    uint64_t attempt_id = 0;
+    std::string incident_id;
+};
+
 class InputSource {
 public:
     virtual ~InputSource() = default;
-    virtual void EnsureReady(const Config& cfg, const Logger& logger, MetricsState* metrics) = 0;
+    virtual void EnsureReady(const Config& cfg,
+                             const Logger& logger,
+                             MetricsState* metrics,
+                             const EnsureAttemptContext& attempt_ctx) = 0;
     virtual int Receive(const Config& cfg, std::vector<char>* buffer, SRT_MSGCTRL* rx_ctrl) = 0;
     virtual void HandleReceiveError(const Config& cfg, const Logger& logger, MetricsState* metrics) = 0;
     virtual SRTSOCKET SessionSocket() const = 0;
@@ -70,7 +78,11 @@ public:
 class OutputSink {
 public:
     virtual ~OutputSink() = default;
-    virtual void EnsureReady(const Config& cfg, const Logger& logger, RelayStats* stats, MetricsState* metrics) = 0;
+    virtual void EnsureReady(const Config& cfg,
+                             const Logger& logger,
+                             RelayStats* stats,
+                             MetricsState* metrics,
+                             const EnsureAttemptContext& attempt_ctx) = 0;
     virtual int Send(const char* data, int size) = 0;
     virtual void MarkDisconnected(MetricsState* metrics) = 0;
     virtual SRTSOCKET TransportSocket() const = 0;

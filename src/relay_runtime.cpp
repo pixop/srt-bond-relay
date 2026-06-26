@@ -8,6 +8,7 @@
 #include "srtrelay/metrics.hpp"
 #include "srtrelay/relay_io.hpp"
 #include "srtrelay/srt_utils.hpp"
+#include "srtrelay/causality.hpp"
 
 namespace srtrelay {
 
@@ -62,6 +63,172 @@ bool IsSrtInputKind(InputEndpointKind kind) {
     return kind == InputEndpointKind::kSrtListener || kind == InputEndpointKind::kSrtCaller;
 }
 
+struct SideCausalityState {
+    uint64_t next_attempt_id = 1;
+    uint64_t active_attempt_id = 0;
+    bool attempt_active = false;
+};
+
+struct IncidentState {
+    uint64_t next_incident_seq = 1;
+    bool active = false;
+    std::string id;
+    int64_t opened_unix_ms = 0;
+    FailureSide first_side = FailureSide::kInput;
+    ReasonCode first_reason_code = ReasonCode::kInternalError;
+    uint64_t input_failures = 0;
+    uint64_t output_failures = 0;
+    uint64_t input_timeouts = 0;
+    uint64_t output_timeouts = 0;
+};
+
+class CausalityTracker {
+public:
+    explicit CausalityTracker(MetricsState* metrics) : metrics_(metrics) {}
+
+    uint64_t EnsureAttemptStarted(FailureSide side) {
+        auto& state = SideState(side);
+        if (!state.attempt_active) {
+            state.attempt_active = true;
+            state.active_attempt_id = state.next_attempt_id++;
+            const size_t side_index = SideIndex(side);
+            metrics_->active_attempt_id[side_index].store(state.active_attempt_id, std::memory_order_relaxed);
+            metrics_->reconnect_attempts_total[side_index].fetch_add(1, std::memory_order_relaxed);
+        }
+        return state.active_attempt_id;
+    }
+
+    uint64_t ActiveAttemptId(FailureSide side) const {
+        return side == FailureSide::kInput ? input_.active_attempt_id : output_.active_attempt_id;
+    }
+
+    void CompleteAttempt(FailureSide side) {
+        auto& state = SideState(side);
+        state.attempt_active = false;
+        state.active_attempt_id = 0;
+        metrics_->active_attempt_id[SideIndex(side)].store(0, std::memory_order_relaxed);
+    }
+
+    std::string ActiveIncidentId() const { return incident_.active ? incident_.id : std::string(); }
+
+    ReasonDescriptor RecordFailure(const Logger& logger,
+                                   FailureSide side,
+                                   FailureOperation operation,
+                                   bool is_timeout,
+                                   bool is_disconnected,
+                                   bool listener_mode,
+                                   const std::string& reason_detail,
+                                   const std::string& source,
+                                   uint64_t attempt_id,
+                                   int64_t socket_id) {
+        const ReasonDescriptor reason =
+            ClassifyReason(operation, is_timeout, is_disconnected, listener_mode, reason_detail);
+        const int64_t now_ms = UnixNowMs();
+        const int64_t now_seconds = now_ms / 1000;
+        if (!incident_.active) {
+            incident_.active = true;
+            incident_.id = "inc-" + std::to_string(incident_.next_incident_seq++);
+            incident_.opened_unix_ms = now_ms;
+            incident_.first_side = side;
+            incident_.first_reason_code = reason.code;
+            incident_.input_failures = 0;
+            incident_.output_failures = 0;
+            incident_.input_timeouts = 0;
+            incident_.output_timeouts = 0;
+            metrics_->incident_active.store(1, std::memory_order_relaxed);
+            metrics_->incident_open_unix_ms.store(now_ms, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lock(metrics_->causality_mutex);
+                metrics_->active_incident_id = incident_.id;
+            }
+            logger.Log(LogLevel::kWarn,
+                       "incident-open",
+                       std::string("incident_id=") + incident_.id,
+                       std::string("first_fault_side=") + FailureSideName(side),
+                       std::string("first_reason_code=") + ReasonCodeName(reason.code),
+                       std::string("first_reason_class=") + ReasonClassName(reason.reason_class),
+                       "first_reason_detail=" + reason_detail,
+                       "first_source=" + source,
+                       "first_socket_id=" + std::to_string(socket_id),
+                       "first_attempt_id=" + std::to_string(attempt_id));
+        }
+
+        if (side == FailureSide::kInput) {
+            incident_.input_failures += 1;
+            metrics_->last_input_failure_unix_seconds.store(now_seconds, std::memory_order_relaxed);
+        } else {
+            incident_.output_failures += 1;
+            metrics_->last_output_failure_unix_seconds.store(now_seconds, std::memory_order_relaxed);
+        }
+        if (reason.reason_class == ReasonClass::kTimeout) {
+            if (side == FailureSide::kInput) {
+                incident_.input_timeouts += 1;
+            } else {
+                incident_.output_timeouts += 1;
+            }
+        }
+        const size_t side_index = SideIndex(side);
+        metrics_->disconnects_total[side_index][ReasonCodeIndex(reason.code)].fetch_add(1, std::memory_order_relaxed);
+        if (reason.has_timeout_type) {
+            metrics_->timeouts_total[side_index][TimeoutTypeIndex(reason.timeout_type)].fetch_add(1, std::memory_order_relaxed);
+        }
+
+        LastFailureSnapshot snapshot;
+        snapshot.timestamp_unix_seconds = now_seconds;
+        snapshot.reason_code = ReasonCodeName(reason.code);
+        snapshot.reason_class = ReasonClassName(reason.reason_class);
+        snapshot.reason_detail = reason_detail;
+        snapshot.incident_id = incident_.id;
+        snapshot.attempt_id = attempt_id;
+        snapshot.source = source;
+        {
+            std::lock_guard<std::mutex> lock(metrics_->causality_mutex);
+            if (side == FailureSide::kInput) {
+                metrics_->input_last_failure = snapshot;
+            } else {
+                metrics_->output_last_failure = snapshot;
+            }
+        }
+        return reason;
+    }
+
+    void MaybeCloseIncident(const Logger& logger, bool input_connected, bool output_connected) {
+        if (!incident_.active || !input_connected || !output_connected) {
+            return;
+        }
+        const int64_t now_ms = UnixNowMs();
+        logger.Log(LogLevel::kInfo,
+                   "incident-close",
+                   "incident_id=" + incident_.id,
+                   "duration_ms=" + std::to_string(std::max<int64_t>(0, now_ms - incident_.opened_unix_ms)),
+                   std::string("first_fault_side=") + FailureSideName(incident_.first_side),
+                   std::string("first_reason_code=") + ReasonCodeName(incident_.first_reason_code),
+                   "input_failures=" + std::to_string(incident_.input_failures),
+                   "output_failures=" + std::to_string(incident_.output_failures),
+                   "input_timeouts=" + std::to_string(incident_.input_timeouts),
+                   "output_timeouts=" + std::to_string(incident_.output_timeouts));
+        incident_.active = false;
+        incident_.id.clear();
+        incident_.opened_unix_ms = 0;
+        metrics_->incident_active.store(0, std::memory_order_relaxed);
+        metrics_->incident_open_unix_ms.store(0, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(metrics_->causality_mutex);
+            metrics_->active_incident_id.clear();
+        }
+    }
+
+private:
+    SideCausalityState& SideState(FailureSide side) {
+        return side == FailureSide::kInput ? input_ : output_;
+    }
+
+    MetricsState* metrics_ = nullptr;
+    SideCausalityState input_;
+    SideCausalityState output_;
+    IncidentState incident_;
+};
+
 int RelayMain(const Config& cfg, const Logger& logger) {
     const InputEndpointSpec input_spec = ParseInputEndpointSpec(cfg);
     const OutputEndpointSpec output_spec = ParseOutputEndpointSpec(cfg);
@@ -110,6 +277,7 @@ int RelayMain(const Config& cfg, const Logger& logger) {
                "metrics_host=" + cfg.metrics_host,
                "metrics_port=" + std::to_string(cfg.metrics_port));
 
+    CausalityTracker causality(&metrics);
     while (!g_shutdown_requested.load()) {
         state.input_listening = input_source->IsListening();
         state.input_connected = input_source->IsConnected();
@@ -124,20 +292,62 @@ int RelayMain(const Config& cfg, const Logger& logger) {
                                                  std::memory_order_relaxed);
         MaybeLogStats(cfg, logger, &stats, state, &metrics,
                       input_source->SessionSocket(), output_sink->TransportSocket(),
-                      output_sink->MetricsMode(), &last_stats_at);
+                      output_sink->MetricsMode(), causality.ActiveIncidentId(), &last_stats_at);
+        causality.MaybeCloseIncident(logger, input_source->IsConnected(), output_sink->IsConnected());
 
         if (!input_source->IsConnected()) {
+            const uint64_t attempt_id = causality.EnsureAttemptStarted(FailureSide::kInput);
+            logger.Log(LogLevel::kInfo,
+                       "input-ensure-attempt",
+                       "side=input",
+                       "attempt_id=" + std::to_string(attempt_id),
+                       "incident_id=" + (causality.ActiveIncidentId().empty() ? std::string("none") : causality.ActiveIncidentId()));
             try {
-                input_source->EnsureReady(cfg, logger, &metrics);
+                input_source->EnsureReady(
+                    cfg, logger, &metrics, EnsureAttemptContext{attempt_id, causality.ActiveIncidentId()});
+                causality.CompleteAttempt(FailureSide::kInput);
             } catch (const std::exception& ex) {
-                if (input_source->LastEnsureErrorKind() == IoErrorKind::kTimeout) {
-                    continue;
-                }
+                const bool is_timeout = input_source->LastEnsureErrorKind() == IoErrorKind::kTimeout;
                 const std::string message = input_source->LastEnsureErrorMessage().empty()
                                                 ? std::string(ex.what())
                                                 : input_source->LastEnsureErrorMessage();
-                logger.Log(LogLevel::kWarn, "input-ensure-failed", "error=" + message);
+                const ReasonDescriptor reason = causality.RecordFailure(logger,
+                                                                        FailureSide::kInput,
+                                                                        FailureOperation::kEnsure,
+                                                                        is_timeout,
+                                                                        false,
+                                                                        input_spec.kind == InputEndpointKind::kSrtListener ||
+                                                                            input_spec.kind == InputEndpointKind::kUdpListener,
+                                                                        message,
+                                                                        "input.ensure",
+                                                                        attempt_id,
+                                                                        static_cast<int64_t>(input_source->SessionSocket()));
+                if (input_source->LastEnsureErrorKind() == IoErrorKind::kTimeout) {
+                    logger.Log(LogLevel::kDebug,
+                               "input-ensure-timeout",
+                               "side=input",
+                               "reason_code=" + std::string(ReasonCodeName(reason.code)),
+                               "reason_class=" + std::string(ReasonClassName(reason.reason_class)),
+                               "reason_detail=" + message,
+                               "attempt_id=" + std::to_string(attempt_id),
+                               "incident_id=" + causality.ActiveIncidentId());
+                    continue;
+                }
+                logger.Log(LogLevel::kWarn,
+                           "input-ensure-failed",
+                           "side=input",
+                           "reason_code=" + std::string(ReasonCodeName(reason.code)),
+                           "reason_class=" + std::string(ReasonClassName(reason.reason_class)),
+                           "reason_detail=" + message,
+                           "attempt_id=" + std::to_string(attempt_id),
+                           "incident_id=" + causality.ActiveIncidentId());
                 input_source->HandleReceiveError(cfg, logger, &metrics);
+                logger.Log(LogLevel::kWarn,
+                           "input-reset",
+                           "side=input",
+                           "attempt_id=" + std::to_string(attempt_id),
+                           "incident_id=" + causality.ActiveIncidentId(),
+                           "reason_code=" + std::string(ReasonCodeName(reason.code)));
                 if (cfg.exit_on_input_failure) return 2;
                 SleepReconnectDelay(cfg);
                 continue;
@@ -145,19 +355,58 @@ int RelayMain(const Config& cfg, const Logger& logger) {
         }
 
         if (!output_sink->IsConnected()) {
+            const uint64_t attempt_id = causality.EnsureAttemptStarted(FailureSide::kOutput);
+            logger.Log(LogLevel::kInfo,
+                       "output-ensure-attempt",
+                       "side=output",
+                       "attempt_id=" + std::to_string(attempt_id),
+                       "incident_id=" + (causality.ActiveIncidentId().empty() ? std::string("none") : causality.ActiveIncidentId()));
             try {
-                output_sink->EnsureReady(cfg, logger, &stats, &metrics);
+                output_sink->EnsureReady(
+                    cfg, logger, &stats, &metrics, EnsureAttemptContext{attempt_id, causality.ActiveIncidentId()});
+                causality.CompleteAttempt(FailureSide::kOutput);
             } catch (const std::exception& ex) {
-                if (output_sink->LastEnsureErrorKind() == IoErrorKind::kTimeout) {
-                    continue;
-                }
+                const bool is_timeout = output_sink->LastEnsureErrorKind() == IoErrorKind::kTimeout;
                 const std::string message = output_sink->LastEnsureErrorMessage().empty()
                                                 ? std::string(ex.what())
                                                 : output_sink->LastEnsureErrorMessage();
+                const ReasonDescriptor reason = causality.RecordFailure(logger,
+                                                                        FailureSide::kOutput,
+                                                                        FailureOperation::kEnsure,
+                                                                        is_timeout,
+                                                                        false,
+                                                                        output_spec.kind == OutputEndpointKind::kSrtListener ||
+                                                                            output_spec.kind == OutputEndpointKind::kUdpListener,
+                                                                        message,
+                                                                        "output.ensure",
+                                                                        attempt_id,
+                                                                        static_cast<int64_t>(output_sink->TransportSocket()));
+                if (output_sink->LastEnsureErrorKind() == IoErrorKind::kTimeout) {
+                    logger.Log(LogLevel::kDebug,
+                               "output-ensure-timeout",
+                               "side=output",
+                               "reason_code=" + std::string(ReasonCodeName(reason.code)),
+                               "reason_class=" + std::string(ReasonClassName(reason.reason_class)),
+                               "reason_detail=" + message,
+                               "attempt_id=" + std::to_string(attempt_id),
+                               "incident_id=" + causality.ActiveIncidentId());
+                    continue;
+                }
                 logger.Log(LogLevel::kWarn, "output-connect-failed",
-                           "error=" + message,
+                           "side=output",
+                           "reason_code=" + std::string(ReasonCodeName(reason.code)),
+                           "reason_class=" + std::string(ReasonClassName(reason.reason_class)),
+                           "reason_detail=" + message,
+                           "attempt_id=" + std::to_string(attempt_id),
+                           "incident_id=" + causality.ActiveIncidentId(),
                            "reconnect_count=" + std::to_string(stats.reconnect_count));
                 output_sink->MarkDisconnected(&metrics);
+                logger.Log(LogLevel::kWarn,
+                           "output-reset",
+                           "side=output",
+                           "attempt_id=" + std::to_string(attempt_id),
+                           "incident_id=" + causality.ActiveIncidentId(),
+                           "reason_code=" + std::string(ReasonCodeName(reason.code)));
                 if (cfg.exit_on_output_failure) return 3;
                 SleepReconnectDelay(cfg);
                 continue;
@@ -171,16 +420,68 @@ int RelayMain(const Config& cfg, const Logger& logger) {
         const int recv_size = input_source->Receive(cfg, &buffer, &rx_ctrl);
         if (recv_size == SRT_ERROR) {
             if (input_source->IsTerminalEof()) {
-                logger.Log(LogLevel::kInfo, "input-eof");
+                const uint64_t attempt_id = causality.EnsureAttemptStarted(FailureSide::kInput);
+                const ReasonDescriptor reason = causality.RecordFailure(logger,
+                                                                        FailureSide::kInput,
+                                                                        FailureOperation::kProtocol,
+                                                                        false,
+                                                                        false,
+                                                                        false,
+                                                                        "stdin EOF",
+                                                                        "input.protocol",
+                                                                        attempt_id,
+                                                                        static_cast<int64_t>(input_source->SessionSocket()));
+                logger.Log(LogLevel::kInfo,
+                           "input-eof",
+                           "side=input",
+                           "reason_code=" + std::string(ReasonCodeName(reason.code)),
+                           "reason_class=" + std::string(ReasonClassName(reason.reason_class)),
+                           "reason_detail=stdin EOF",
+                           "attempt_id=" + std::to_string(attempt_id),
+                           "incident_id=" + causality.ActiveIncidentId());
                 break;
             }
-            if (input_source->LastReceiveErrorKind() == IoErrorKind::kTimeout) {
-                continue;
-            }
+            const uint64_t attempt_id = causality.EnsureAttemptStarted(FailureSide::kInput);
+            const bool is_timeout = input_source->LastReceiveErrorKind() == IoErrorKind::kTimeout;
+            const bool is_disconnected = input_source->LastReceiveErrorKind() == IoErrorKind::kDisconnected;
             std::string err = input_source->LastReceiveErrorMessage();
             if (err.empty()) err = "input receive failed";
-            logger.Log(LogLevel::kWarn, "input-disconnected", "error=" + err);
+            const ReasonDescriptor reason = causality.RecordFailure(logger,
+                                                                    FailureSide::kInput,
+                                                                    FailureOperation::kReceive,
+                                                                    is_timeout,
+                                                                    is_disconnected,
+                                                                    false,
+                                                                    err,
+                                                                    "input.receive",
+                                                                    attempt_id,
+                                                                    static_cast<int64_t>(input_source->SessionSocket()));
+            if (is_timeout) {
+                logger.Log(LogLevel::kDebug,
+                           "input-receive-timeout",
+                           "side=input",
+                           "reason_code=" + std::string(ReasonCodeName(reason.code)),
+                           "reason_class=" + std::string(ReasonClassName(reason.reason_class)),
+                           "reason_detail=" + err,
+                           "attempt_id=" + std::to_string(attempt_id),
+                           "incident_id=" + causality.ActiveIncidentId());
+                continue;
+            }
+            logger.Log(LogLevel::kWarn,
+                       "input-disconnected",
+                       "side=input",
+                       "reason_code=" + std::string(ReasonCodeName(reason.code)),
+                       "reason_class=" + std::string(ReasonClassName(reason.reason_class)),
+                       "reason_detail=" + err,
+                       "attempt_id=" + std::to_string(attempt_id),
+                       "incident_id=" + causality.ActiveIncidentId());
             input_source->HandleReceiveError(cfg, logger, &metrics);
+            logger.Log(LogLevel::kWarn,
+                       "input-reset",
+                       "side=input",
+                       "reason_code=" + std::string(ReasonCodeName(reason.code)),
+                       "attempt_id=" + std::to_string(attempt_id),
+                       "incident_id=" + causality.ActiveIncidentId());
             if (cfg.exit_on_input_failure) return 2;
             continue;
         }
@@ -204,12 +505,34 @@ int RelayMain(const Config& cfg, const Logger& logger) {
                 metrics.total_send_failures.store(stats.total_send_failures, std::memory_order_relaxed);
                 metrics.reconnect_count.store(stats.reconnect_count, std::memory_order_relaxed);
 
+                const uint64_t attempt_id = causality.EnsureAttemptStarted(FailureSide::kOutput);
                 std::string err = output_sink->LastSendErrorMessage();
                 if (err.empty()) err = "output send failed";
+                const ReasonDescriptor reason = causality.RecordFailure(logger,
+                                                                        FailureSide::kOutput,
+                                                                        FailureOperation::kSend,
+                                                                        output_sink->LastSendErrorKind() == IoErrorKind::kTimeout,
+                                                                        output_sink->LastSendErrorKind() == IoErrorKind::kDisconnected,
+                                                                        false,
+                                                                        err,
+                                                                        "output.send",
+                                                                        attempt_id,
+                                                                        static_cast<int64_t>(output_sink->TransportSocket()));
                 logger.Log(LogLevel::kWarn, "output-send-failed",
-                           "error=" + err,
+                           "side=output",
+                           "reason_code=" + std::string(ReasonCodeName(reason.code)),
+                           "reason_class=" + std::string(ReasonClassName(reason.reason_class)),
+                           "reason_detail=" + err,
+                           "attempt_id=" + std::to_string(attempt_id),
+                           "incident_id=" + causality.ActiveIncidentId(),
                            "reconnect_count=" + std::to_string(stats.reconnect_count));
                 output_sink->MarkDisconnected(&metrics);
+                logger.Log(LogLevel::kWarn,
+                           "output-reset",
+                           "side=output",
+                           "reason_code=" + std::string(ReasonCodeName(reason.code)),
+                           "attempt_id=" + std::to_string(attempt_id),
+                           "incident_id=" + causality.ActiveIncidentId());
                 if (cfg.exit_on_output_failure) {
                     g_shutdown_requested.store(true);
                 } else {

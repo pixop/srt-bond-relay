@@ -82,6 +82,7 @@ endif()
 
 add_executable(srt-bond-relay
     main.cpp
+    src/causality.cpp
     src/config.cpp
     src/linkage.cpp
     src/logger.cpp
