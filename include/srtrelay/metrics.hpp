@@ -18,6 +18,9 @@
 
 namespace srtrelay {
 
+struct InputEndpointSpec;
+struct OutputEndpointSpec;
+
 struct RelayStats {
     uint64_t total_rx_bytes = 0;
     uint64_t total_tx_bytes = 0;
@@ -113,6 +116,8 @@ struct MetricsState {
 
     std::atomic<int64_t> last_rx_unix_ms{0};
     std::atomic<int64_t> last_tx_unix_ms{0};
+    std::atomic<int64_t> input_session_socket_id{static_cast<int64_t>(SRT_INVALID_SOCK)};
+    std::atomic<int64_t> output_transport_socket_id{static_cast<int64_t>(SRT_INVALID_SOCK)};
 
     std::array<std::atomic<int64_t>, kMaxTrackedMembers> input_member_ids {};
     std::array<std::atomic<int>, kMaxTrackedMembers> input_member_connected {};
@@ -142,7 +147,11 @@ enum class OutputMetricsMode {
 
 class MetricsServer {
 public:
-    MetricsServer(const Config& cfg, const Logger& logger, MetricsState& metrics);
+    MetricsServer(const Config& cfg,
+                  const Logger& logger,
+                  MetricsState& metrics,
+                  const InputEndpointSpec& input_spec,
+                  const OutputEndpointSpec& output_spec);
     ~MetricsServer();
 
     void Start();
@@ -152,6 +161,8 @@ private:
     const Config& cfg_;
     const Logger& logger_;
     MetricsState& metrics_;
+    const InputEndpointSpec* input_spec_ = nullptr;
+    const OutputEndpointSpec* output_spec_ = nullptr;
     httplib::Server server_;
     std::thread thread_;
 };

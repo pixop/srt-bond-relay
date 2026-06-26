@@ -148,6 +148,17 @@ void ApplyCommonSrtOptions(SRTSOCKET sock, const SrtUri& uri, const Logger& logg
     if (const std::string* v = QueryFirstValue(uri.query, {"pbkeylen"})) {
         ApplyIntSockOpt(sock, SRTO_PBKEYLEN, ParseIntOptionValue(*v, "pbkeylen"), "SRTO_PBKEYLEN");
     }
+    if (const std::string* v = QueryFirstValue(uri.query, {"transtype"})) {
+        int tt = SRTT_LIVE;
+        if (*v == "live") {
+            tt = SRTT_LIVE;
+        } else if (*v == "file") {
+            tt = SRTT_FILE;
+        } else {
+            throw std::runtime_error("unsupported transtype value: " + *v);
+        }
+        ApplyIntSockOpt(sock, SRTO_TRANSTYPE, tt, "SRTO_TRANSTYPE");
+    }
     if (const std::string* v = QueryFirstValue(uri.query, {"latency"})) {
         ApplyIntSockOpt(sock, SRTO_LATENCY, ParseIntOptionValue(*v, "latency"), "SRTO_LATENCY");
     }
@@ -172,18 +183,6 @@ void ApplyCommonSrtOptions(SRTSOCKET sock, const SrtUri& uri, const Logger& logg
     if (const std::string* v = QueryFirstValue(uri.query, {"streamid"})) {
         ApplyStringSockOpt(sock, SRTO_STREAMID, *v, "SRTO_STREAMID");
     }
-    if (const std::string* v = QueryFirstValue(uri.query, {"transtype"})) {
-        int tt = SRTT_LIVE;
-        if (*v == "live") {
-            tt = SRTT_LIVE;
-        } else if (*v == "file") {
-            tt = SRTT_FILE;
-        } else {
-            throw std::runtime_error("unsupported transtype value: " + *v);
-        }
-        ApplyIntSockOpt(sock, SRTO_TRANSTYPE, tt, "SRTO_TRANSTYPE");
-    }
-
     for (const auto& [key, value] : uri.query) {
         if (key == "mode" ||
             key == "passphrase" ||

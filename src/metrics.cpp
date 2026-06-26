@@ -9,6 +9,9 @@
 #include <sstream>
 #include <unordered_set>
 
+#include <nlohmann/json.hpp>
+
+#include "srtrelay/relay_io.hpp"
 #include "srtrelay/srt_utils.hpp"
 
 namespace srtrelay {
@@ -44,6 +47,357 @@ MetricsState::MetricsState() {
 }
 
 namespace {
+
+using json = nlohmann::json;
+
+const char* InputProtocolName(InputEndpointKind kind) {
+    switch (kind) {
+        case InputEndpointKind::kSrtListener:
+        case InputEndpointKind::kSrtCaller:
+            return "srt";
+        case InputEndpointKind::kUdpListener:
+        case InputEndpointKind::kUdpCaller:
+            return "udp";
+        case InputEndpointKind::kStdin:
+            return "stdin";
+    }
+    return "unknown";
+}
+
+const char* OutputProtocolName(OutputEndpointKind kind) {
+    switch (kind) {
+        case OutputEndpointKind::kSrtCaller:
+        case OutputEndpointKind::kSrtListener:
+            return "srt";
+        case OutputEndpointKind::kUdpCaller:
+        case OutputEndpointKind::kUdpListener:
+            return "udp";
+        case OutputEndpointKind::kStdout:
+            return "stdout";
+    }
+    return "unknown";
+}
+
+const char* InputModeName(InputEndpointKind kind) {
+    switch (kind) {
+        case InputEndpointKind::kSrtListener:
+        case InputEndpointKind::kUdpListener:
+            return "listener";
+        case InputEndpointKind::kSrtCaller:
+        case InputEndpointKind::kUdpCaller:
+            return "caller";
+        case InputEndpointKind::kStdin:
+            return "stream";
+    }
+    return "unknown";
+}
+
+const char* OutputModeName(OutputEndpointKind kind) {
+    switch (kind) {
+        case OutputEndpointKind::kSrtCaller:
+        case OutputEndpointKind::kUdpCaller:
+            return "caller";
+        case OutputEndpointKind::kSrtListener:
+        case OutputEndpointKind::kUdpListener:
+            return "listener";
+        case OutputEndpointKind::kStdout:
+            return "stream";
+    }
+    return "unknown";
+}
+
+const char* GroupTypeName(SRT_GROUP_TYPE group_type) {
+    if (group_type == SRT_GTYPE_BROADCAST) return "broadcast";
+    if (group_type == SRT_GTYPE_BACKUP) return "backup";
+    return "undefined";
+}
+
+const char* SockStateName(int state) {
+    if (state == SRTS_INIT) return "init";
+    if (state == SRTS_OPENED) return "opened";
+    if (state == SRTS_LISTENING) return "listening";
+    if (state == SRTS_CONNECTING) return "connecting";
+    if (state == SRTS_CONNECTED) return "connected";
+    if (state == SRTS_BROKEN) return "broken";
+    if (state == SRTS_CLOSING) return "closing";
+    if (state == SRTS_CLOSED) return "closed";
+    if (state == SRTS_NONEXIST) return "nonexist";
+    return "unknown";
+}
+
+const char* GroupMemberStateName(int state) {
+    if (state == SRT_GST_IDLE) return "idle";
+    if (state == SRT_GST_RUNNING) return "running";
+    if (state == SRT_GST_BROKEN) return "broken";
+    return "unknown";
+}
+
+bool TryReadSockOptInt(SRTSOCKET sock, SRT_SOCKOPT opt, int* out_value) {
+    if (sock == SRT_INVALID_SOCK || out_value == nullptr) {
+        return false;
+    }
+    int value = 0;
+    int len = sizeof(value);
+    if (srt_getsockflag(sock, opt, &value, &len) == SRT_ERROR) {
+        return false;
+    }
+    *out_value = value;
+    return true;
+}
+
+struct RuntimeLatencySnapshot {
+    bool has_latency = false;
+    int latency_ms = 0;
+    bool has_rcvlatency = false;
+    int rcvlatency_ms = 0;
+    bool has_peerlatency = false;
+    int peerlatency_ms = 0;
+    bool has_negotiated_latency = false;
+    int negotiated_latency_ms = 0;
+};
+
+RuntimeLatencySnapshot ReadRuntimeLatencySnapshot(SRTSOCKET sock) {
+    RuntimeLatencySnapshot snapshot {};
+    if (sock == SRT_INVALID_SOCK) {
+        return snapshot;
+    }
+    snapshot.has_latency = TryReadSockOptInt(sock, SRTO_LATENCY, &snapshot.latency_ms);
+    snapshot.has_rcvlatency = TryReadSockOptInt(sock, SRTO_RCVLATENCY, &snapshot.rcvlatency_ms);
+    snapshot.has_peerlatency = TryReadSockOptInt(sock, SRTO_PEERLATENCY, &snapshot.peerlatency_ms);
+    snapshot.has_negotiated_latency = snapshot.has_rcvlatency || snapshot.has_peerlatency;
+    if (snapshot.has_rcvlatency && snapshot.has_peerlatency) {
+        snapshot.negotiated_latency_ms = std::max(snapshot.rcvlatency_ms, snapshot.peerlatency_ms);
+    } else if (snapshot.has_rcvlatency) {
+        snapshot.negotiated_latency_ms = snapshot.rcvlatency_ms;
+    } else if (snapshot.has_peerlatency) {
+        snapshot.negotiated_latency_ms = snapshot.peerlatency_ms;
+    }
+    return snapshot;
+}
+
+int EffectiveLatencyMsOrMinusOne(const RuntimeLatencySnapshot& snapshot) {
+    if (snapshot.has_negotiated_latency) {
+        return snapshot.negotiated_latency_ms;
+    }
+    if (snapshot.has_latency) {
+        return snapshot.latency_ms;
+    }
+    return -1;
+}
+
+SRT_GROUP_TYPE ReadRuntimeGroupType(SRTSOCKET sock) {
+    if (sock == SRT_INVALID_SOCK) {
+        return SRT_GTYPE_UNDEFINED;
+    }
+    int group_type = 0;
+    if (TryReadSockOptInt(sock, SRTO_GROUPTYPE, &group_type)) {
+        return static_cast<SRT_GROUP_TYPE>(group_type);
+    }
+    const SRTSOCKET group_sock = srt_groupof(sock);
+    if (group_sock == SRT_INVALID_SOCK) {
+        return SRT_GTYPE_UNDEFINED;
+    }
+    if (TryReadSockOptInt(group_sock, SRTO_GROUPTYPE, &group_type)) {
+        return static_cast<SRT_GROUP_TYPE>(group_type);
+    }
+    return SRT_GTYPE_UNDEFINED;
+}
+
+json BuildQueryMapJson(const std::map<std::string, std::string>& query) {
+    json query_json = json::object();
+    for (const auto& [key, value] : query) {
+        query_json[key] = value;
+    }
+    return query_json;
+}
+
+json BuildSrtMembersJson(const std::vector<SrtUri>& uris) {
+    json members = json::array();
+    for (const auto& uri : uris) {
+        members.push_back({
+            {"host", uri.host},
+            {"port", uri.port},
+            {"query", BuildQueryMapJson(uri.query)},
+        });
+    }
+    return members;
+}
+
+json BuildUdpEndpointJson(const UdpUri& uri) {
+    return json{
+        {"host", uri.host},
+        {"port", uri.port},
+        {"query", BuildQueryMapJson(uri.query)},
+    };
+}
+
+json BuildRuntimeSrtOptionsJson(SRTSOCKET sock) {
+    if (sock == SRT_INVALID_SOCK) {
+        return nullptr;
+    }
+    const RuntimeLatencySnapshot latency = ReadRuntimeLatencySnapshot(sock);
+    int oheadbw = 0;
+    int peeridletimeo = 0;
+    int conntimeo = 0;
+    int rcvbuf = 0;
+    int sndbuf = 0;
+    int pbkeylen = 0;
+    int transtype = 0;
+    int grouptype = 0;
+    const bool has_oheadbw = TryReadSockOptInt(sock, SRTO_OHEADBW, &oheadbw);
+    const bool has_peeridletimeo = TryReadSockOptInt(sock, SRTO_PEERIDLETIMEO, &peeridletimeo);
+    const bool has_conntimeo = TryReadSockOptInt(sock, SRTO_CONNTIMEO, &conntimeo);
+    const bool has_rcvbuf = TryReadSockOptInt(sock, SRTO_RCVBUF, &rcvbuf);
+    const bool has_sndbuf = TryReadSockOptInt(sock, SRTO_SNDBUF, &sndbuf);
+    const bool has_pbkeylen = TryReadSockOptInt(sock, SRTO_PBKEYLEN, &pbkeylen);
+    const bool has_transtype = TryReadSockOptInt(sock, SRTO_TRANSTYPE, &transtype);
+    const bool has_grouptype = TryReadSockOptInt(sock, SRTO_GROUPTYPE, &grouptype);
+    std::string transtype_name = "unknown";
+    if (transtype == SRTT_LIVE) {
+        transtype_name = "live";
+    } else if (transtype == SRTT_FILE) {
+        transtype_name = "file";
+    }
+    json out = {
+        {"latency_ms", latency.has_latency ? json(latency.latency_ms) : json(nullptr)},
+        {"rcvlatency_ms", latency.has_rcvlatency ? json(latency.rcvlatency_ms) : json(nullptr)},
+        {"peerlatency_ms", latency.has_peerlatency ? json(latency.peerlatency_ms) : json(nullptr)},
+        {"negotiated_latency_ms", latency.has_negotiated_latency ? json(latency.negotiated_latency_ms) : json(nullptr)},
+        {"oheadbw_pct", has_oheadbw ? json(oheadbw) : json(nullptr)},
+        {"peeridletimeo_ms", has_peeridletimeo ? json(peeridletimeo) : json(nullptr)},
+        {"conntimeo_ms", has_conntimeo ? json(conntimeo) : json(nullptr)},
+        {"rcvbuf_bytes", has_rcvbuf ? json(rcvbuf) : json(nullptr)},
+        {"sndbuf_bytes", has_sndbuf ? json(sndbuf) : json(nullptr)},
+        {"pbkeylen", has_pbkeylen ? json(pbkeylen) : json(nullptr)},
+        {"group_type", has_grouptype ? json(GroupTypeName(static_cast<SRT_GROUP_TYPE>(grouptype))) : json(nullptr)},
+        {"transtype", has_transtype ? json(transtype_name) : json(nullptr)},
+    };
+    return out;
+}
+
+bool TryExtractEndpoint(const sockaddr_storage& addr, std::string* out_host, int* out_port) {
+    if (out_host == nullptr || out_port == nullptr) {
+        return false;
+    }
+    char host_buf[INET6_ADDRSTRLEN] = {};
+    if (addr.ss_family == AF_INET) {
+        const auto* v4 = reinterpret_cast<const sockaddr_in*>(&addr);
+        if (::inet_ntop(AF_INET, &(v4->sin_addr), host_buf, sizeof(host_buf)) == nullptr) {
+            return false;
+        }
+        *out_host = host_buf;
+        *out_port = static_cast<int>(ntohs(v4->sin_port));
+        return true;
+    }
+    if (addr.ss_family == AF_INET6) {
+        const auto* v6 = reinterpret_cast<const sockaddr_in6*>(&addr);
+        if (::inet_ntop(AF_INET6, &(v6->sin6_addr), host_buf, sizeof(host_buf)) == nullptr) {
+            return false;
+        }
+        *out_host = host_buf;
+        *out_port = static_cast<int>(ntohs(v6->sin6_port));
+        return true;
+    }
+    return false;
+}
+
+json BuildConnectedMembersJson(SRTSOCKET session_sock);
+
+json BuildInputSessionSpecJson(const InputEndpointSpec& spec, const MetricsState& metrics) {
+    const auto connected = metrics.input_connected.load(std::memory_order_relaxed) == 1;
+    const auto listening = metrics.input_listening.load(std::memory_order_relaxed) == 1;
+    const SRTSOCKET socket_id =
+        static_cast<SRTSOCKET>(metrics.input_session_socket_id.load(std::memory_order_relaxed));
+    const SRTSOCKET group_socket_id = (socket_id != SRT_INVALID_SOCK) ? srt_groupof(socket_id) : SRT_INVALID_SOCK;
+    json configured = {
+        {"bonded", spec.bonded},
+        {"group_type", GroupTypeName(spec.group_type)},
+    };
+    if (spec.kind == InputEndpointKind::kSrtListener || spec.kind == InputEndpointKind::kSrtCaller) {
+        configured["members"] = BuildSrtMembersJson(spec.uris);
+    } else if (spec.kind == InputEndpointKind::kUdpListener || spec.kind == InputEndpointKind::kUdpCaller) {
+        configured["endpoint"] = BuildUdpEndpointJson(spec.udp_uri);
+    }
+    json effective_srt = nullptr;
+    if (spec.kind == InputEndpointKind::kSrtListener || spec.kind == InputEndpointKind::kSrtCaller) {
+        effective_srt = BuildRuntimeSrtOptionsJson(socket_id);
+    }
+    json connected_members = json::array();
+    if (spec.kind == InputEndpointKind::kSrtListener || spec.kind == InputEndpointKind::kSrtCaller) {
+        connected_members = BuildConnectedMembersJson(socket_id);
+    }
+    const SRT_GROUP_TYPE runtime_group_type = ReadRuntimeGroupType(socket_id);
+    const bool runtime_bonded = (runtime_group_type == SRT_GTYPE_BROADCAST ||
+                                 runtime_group_type == SRT_GTYPE_BACKUP ||
+                                 connected_members.size() > 1);
+    return json{
+        {"protocol", InputProtocolName(spec.kind)},
+        {"mode", InputModeName(spec.kind)},
+        {"connected", connected},
+        {"listening", listening},
+        {"socket_id", socket_id == SRT_INVALID_SOCK ? json(nullptr) : json(socket_id)},
+        {"group_socket_id", group_socket_id == SRT_INVALID_SOCK ? json(nullptr) : json(group_socket_id)},
+        {"configured", configured},
+        {"runtime", json{
+            {"bonded", runtime_bonded},
+            {"group_type", GroupTypeName(runtime_group_type)},
+        }},
+        {"effective_srt", effective_srt},
+        {"connected_members", connected_members},
+    };
+}
+
+json BuildOutputSessionSpecJson(const OutputEndpointSpec& spec, const MetricsState& metrics) {
+    const auto connected = metrics.output_connected.load(std::memory_order_relaxed) == 1;
+    const SRTSOCKET socket_id =
+        static_cast<SRTSOCKET>(metrics.output_transport_socket_id.load(std::memory_order_relaxed));
+    const SRTSOCKET group_socket_id = (socket_id != SRT_INVALID_SOCK) ? srt_groupof(socket_id) : SRT_INVALID_SOCK;
+    json configured = {
+        {"bonded", spec.bonded},
+        {"group_type", GroupTypeName(spec.group_type)},
+    };
+    if (spec.kind == OutputEndpointKind::kSrtListener || spec.kind == OutputEndpointKind::kSrtCaller) {
+        configured["members"] = BuildSrtMembersJson(spec.uris);
+    } else if (spec.kind == OutputEndpointKind::kUdpListener || spec.kind == OutputEndpointKind::kUdpCaller) {
+        configured["endpoint"] = BuildUdpEndpointJson(spec.udp_uri);
+    }
+    json effective_srt = nullptr;
+    if (spec.kind == OutputEndpointKind::kSrtListener || spec.kind == OutputEndpointKind::kSrtCaller) {
+        effective_srt = BuildRuntimeSrtOptionsJson(socket_id);
+    }
+    json connected_members = json::array();
+    if (spec.kind == OutputEndpointKind::kSrtListener || spec.kind == OutputEndpointKind::kSrtCaller) {
+        connected_members = BuildConnectedMembersJson(socket_id);
+    }
+    const SRT_GROUP_TYPE runtime_group_type = ReadRuntimeGroupType(socket_id);
+    const bool runtime_bonded = (runtime_group_type == SRT_GTYPE_BROADCAST ||
+                                 runtime_group_type == SRT_GTYPE_BACKUP ||
+                                 connected_members.size() > 1);
+    return json{
+        {"protocol", OutputProtocolName(spec.kind)},
+        {"mode", OutputModeName(spec.kind)},
+        {"connected", connected},
+        {"socket_id", socket_id == SRT_INVALID_SOCK ? json(nullptr) : json(socket_id)},
+        {"group_socket_id", group_socket_id == SRT_INVALID_SOCK ? json(nullptr) : json(group_socket_id)},
+        {"configured", configured},
+        {"runtime", json{
+            {"bonded", runtime_bonded},
+            {"group_type", GroupTypeName(runtime_group_type)},
+        }},
+        {"effective_srt", effective_srt},
+        {"connected_members", connected_members},
+    };
+}
+
+std::string BuildSessionSpecsJson(const InputEndpointSpec& input_spec,
+                                  const OutputEndpointSpec& output_spec,
+                                  const MetricsState& metrics) {
+    json out = {
+        {"input", BuildInputSessionSpecJson(input_spec, metrics)},
+        {"output", BuildOutputSessionSpecJson(output_spec, metrics)},
+    };
+    return out.dump();
+}
 
 void MaybeUpdateRttMetric(SRTSOCKET sock, std::atomic<int64_t>* out_rtt_ms) {
     if (sock == SRT_INVALID_SOCK) {
@@ -219,6 +573,50 @@ bool TryReadGroupMembers(SRTSOCKET group_or_session_sock, std::vector<SRT_SOCKGR
         out_members->push_back(members[i]);
     }
     return !out_members->empty();
+}
+
+json BuildConnectedMembersJson(SRTSOCKET session_sock) {
+    json members_json = json::array();
+    if (session_sock == SRT_INVALID_SOCK) {
+        return members_json;
+    }
+
+    SRTSOCKET group_sock = srt_groupof(session_sock);
+    if (group_sock == SRT_INVALID_SOCK) {
+        group_sock = session_sock;
+    }
+
+    std::vector<SRT_SOCKGROUPDATA> members;
+    if (!TryReadGroupMembers(group_sock, &members)) {
+        if (!TryReadGroupMembers(session_sock, &members)) {
+            members = BuildSingleSocketFallbackSnapshot(session_sock);
+        }
+    }
+
+    for (const auto& member : members) {
+        if (!IsConnectedGroupMember(member)) {
+            continue;
+        }
+        const bool has_socket_id = member.id != SRT_INVALID_SOCK && member.id != 0;
+        std::string peer_host;
+        int peer_port = 0;
+        const bool has_peer_endpoint = TryExtractEndpoint(member.peeraddr, &peer_host, &peer_port);
+
+        json member_json = {
+            {"socket_id", has_socket_id ? json(member.id) : json(nullptr)},
+            {"token", member.token != 0 ? json(member.token) : json(nullptr)},
+            {"sock_state", SockStateName(member.sockstate)},
+            {"sock_state_code", static_cast<int>(member.sockstate)},
+            {"member_state", GroupMemberStateName(member.memberstate)},
+            {"member_state_code", static_cast<int>(member.memberstate)},
+            {"peer_host", has_peer_endpoint ? json(peer_host) : json(nullptr)},
+            {"peer_port", has_peer_endpoint ? json(peer_port) : json(nullptr)},
+            {"effective_srt", has_socket_id ? BuildRuntimeSrtOptionsJson(member.id) : json(nullptr)},
+        };
+        members_json.push_back(std::move(member_json));
+    }
+
+    return members_json;
 }
 
 void UpdateInputLinkHealthFromGroupMembers(const std::vector<SRT_SOCKGROUPDATA>& group_members,
@@ -719,23 +1117,23 @@ CompactResult CompactOutputSlotsLocked(MetricsState* metrics) {
 
 std::string BuildCompactResponseJson(const CompactResponse& response) {
     auto emit = [](const CompactResult& result) {
-        std::ostringstream out;
-        out << "{\"before_slots\":" << result.before_slots
-            << ",\"after_slots\":" << result.after_slots
-            << ",\"moved\":" << result.moved
-            << ",\"dropped\":" << result.dropped << "}";
-        return out.str();
+        return json{
+            {"before_slots", result.before_slots},
+            {"after_slots", result.after_slots},
+            {"moved", result.moved},
+            {"dropped", result.dropped},
+        };
     };
-    std::ostringstream out;
-    out << "{\"direction\":\"" << response.direction << "\"";
+    json out = {
+        {"direction", response.direction},
+    };
     if (response.include_input) {
-        out << ",\"input\":" << emit(response.input);
+        out["input"] = emit(response.input);
     }
     if (response.include_output) {
-        out << ",\"output\":" << emit(response.output);
+        out["output"] = emit(response.output);
     }
-    out << "}";
-    return out.str();
+    return out.dump();
 }
 
 }  // namespace
@@ -1525,8 +1923,12 @@ std::string RenderPrometheusMetrics(const MetricsState& metrics) {
     return out.str();
 }
 
-MetricsServer::MetricsServer(const Config& cfg, const Logger& logger, MetricsState& metrics)
-    : cfg_(cfg), logger_(logger), metrics_(metrics) {}
+MetricsServer::MetricsServer(const Config& cfg,
+                             const Logger& logger,
+                             MetricsState& metrics,
+                             const InputEndpointSpec& input_spec,
+                             const OutputEndpointSpec& output_spec)
+    : cfg_(cfg), logger_(logger), metrics_(metrics), input_spec_(&input_spec), output_spec_(&output_spec) {}
 
 MetricsServer::~MetricsServer() { Stop(); }
 
@@ -1540,6 +1942,16 @@ void MetricsServer::Start() {
     });
     server_.Get("/healthz", [&](const httplib::Request&, httplib::Response& res) {
         res.set_content("ok\n", "text/plain");
+    });
+    server_.Get("/session/specs", [&](const httplib::Request&, httplib::Response& res) {
+        if (input_spec_ == nullptr || output_spec_ == nullptr) {
+            res.status = 500;
+            res.set_content("{\"error\":\"session specs unavailable\"}\n",
+                            "application/json; charset=utf-8");
+            return;
+        }
+        res.set_content(BuildSessionSpecsJson(*input_spec_, *output_spec_, metrics_) + "\n",
+                        "application/json; charset=utf-8");
     });
     server_.Post("/metrics/links/compact", [&](const httplib::Request& req, httplib::Response& res) {
         CompactDirection direction = CompactDirection::kBoth;
@@ -1678,6 +2090,11 @@ void MaybeLogStats(const Config& cfg,
     }
     const auto input_link_status = BuildInputLinkStatusCompact(*metrics);
     const auto output_link_status = BuildOutputLinkStatusCompact(*metrics);
+    const RuntimeLatencySnapshot input_latency_snapshot = ReadRuntimeLatencySnapshot(input_session_sock);
+    const RuntimeLatencySnapshot output_latency_snapshot =
+        ReadRuntimeLatencySnapshot(output_metrics_mode == OutputMetricsMode::kSrtSocket ? output_sock : SRT_INVALID_SOCK);
+    const int input_effective_latency_ms = EffectiveLatencyMsOrMinusOne(input_latency_snapshot);
+    const int output_effective_latency_ms = EffectiveLatencyMsOrMinusOne(output_latency_snapshot);
 
     metrics->rx_bytes_per_sec.store(rx_bps, std::memory_order_relaxed);
     metrics->tx_bytes_per_sec.store(tx_bps, std::memory_order_relaxed);
@@ -1705,6 +2122,8 @@ void MaybeLogStats(const Config& cfg,
                "output_link_status=" + output_link_status,
                "input_transport_byte_recv_total=" + std::to_string(input_transport_byte_recv_total),
                "output_transport_byte_sent_total=" + std::to_string(output_transport_byte_sent_total),
+               "input_effective_latency_ms=" + std::to_string(input_effective_latency_ms),
+               "output_effective_latency_ms=" + std::to_string(output_effective_latency_ms),
                std::string("input_bond_mode=") + input_bond_mode_name,
                std::string("output_bond_mode=") + output_bond_mode_name,
                std::string("input_state=") + (state.input_connected ? "connected" : (state.input_listening ? "listening" : "down")),

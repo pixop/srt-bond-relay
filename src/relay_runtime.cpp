@@ -92,7 +92,7 @@ int RelayMain(const Config& cfg, const Logger& logger) {
                    "chunk_size=" + std::to_string(stdin_chunk_size),
                    "max_message_size=" + std::to_string(cfg.max_message_size));
     }
-    MetricsServer metrics_server(cfg, logger, metrics);
+    MetricsServer metrics_server(cfg, logger, metrics, input_spec, output_spec);
     metrics_server.Start();
 
     logger.Log(LogLevel::kInfo, "startup",
@@ -114,6 +114,14 @@ int RelayMain(const Config& cfg, const Logger& logger) {
         state.input_listening = input_source->IsListening();
         state.input_connected = input_source->IsConnected();
         state.output_connected = output_sink->IsConnected();
+        metrics.input_session_socket_id.store(static_cast<int64_t>(input_source->SessionSocket()),
+                                              std::memory_order_relaxed);
+        const SRTSOCKET output_transport_sock =
+            (output_sink->MetricsMode() == OutputMetricsMode::kSrtSocket)
+                ? output_sink->TransportSocket()
+                : SRT_INVALID_SOCK;
+        metrics.output_transport_socket_id.store(static_cast<int64_t>(output_transport_sock),
+                                                 std::memory_order_relaxed);
         MaybeLogStats(cfg, logger, &stats, state, &metrics,
                       input_source->SessionSocket(), output_sink->TransportSocket(),
                       output_sink->MetricsMode(), &last_stats_at);
