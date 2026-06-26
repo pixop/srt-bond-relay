@@ -207,7 +207,7 @@ Metrics server:
 
 - `GET /healthz` returns `ok`
 - `GET /metrics` on `http://<metrics-host>:<metrics-port>`
-- `GET /session/specs` returns JSON with configured input/output endpoint specs, live runtime session shape (`runtime.bonded`, `runtime.group_type`), connected SRT member details (`connected_members`), and effective live SRT socket options for the active session (when connected), including directional and negotiated latency fields (`rcvlatency_ms`, `peerlatency_ms`, `negotiated_latency_ms`)
+- `GET /session/specs` returns JSON with configured input/output endpoint specs, live runtime session shape (`runtime.bonded`, `runtime.group_type`), runtime and resolved session transtype (`runtime_transtype`, `session_transtype` with source), connected SRT member details (`connected_members`, including per-member state/peer and `rtt_ms`), and effective live SRT socket options for the active session (when connected), including directional and negotiated latency fields (`rcvlatency_ms`, `peerlatency_ms`, `negotiated_latency_ms`)
 - `POST /metrics/links/compact?direction=input|output|both` compacts active per-link slot indexes and drops disconnected slots from exported stable-slot series (when `direction` is omitted, default is `both`)
 - Controlled by `--metrics-enabled`, `--metrics-host`, `--metrics-port`
 

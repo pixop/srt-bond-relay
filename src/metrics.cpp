@@ -145,6 +145,18 @@ bool TryReadSockOptInt(SRTSOCKET sock, SRT_SOCKOPT opt, int* out_value) {
     return true;
 }
 
+bool TryReadSocketRttMs(SRTSOCKET sock, int64_t* out_rtt_ms) {
+    if (sock == SRT_INVALID_SOCK || out_rtt_ms == nullptr) {
+        return false;
+    }
+    SRT_TRACEBSTATS sock_stats {};
+    if (srt_bstats(sock, &sock_stats, 0) == SRT_ERROR) {
+        return false;
+    }
+    *out_rtt_ms = static_cast<int64_t>(sock_stats.msRTT);
+    return true;
+}
+
 struct RuntimeLatencySnapshot {
     bool has_latency = false;
     int latency_ms = 0;
@@ -183,6 +195,52 @@ int EffectiveLatencyMsOrMinusOne(const RuntimeLatencySnapshot& snapshot) {
         return snapshot.latency_ms;
     }
     return -1;
+}
+
+bool TryReadRuntimeTranstype(SRTSOCKET sock, std::string* out_transtype) {
+    if (sock == SRT_INVALID_SOCK || out_transtype == nullptr) {
+        return false;
+    }
+    int transtype = 0;
+    if (!TryReadSockOptInt(sock, SRTO_TRANSTYPE, &transtype)) {
+        return false;
+    }
+    if (transtype == SRTT_LIVE) {
+        *out_transtype = "live";
+        return true;
+    }
+    if (transtype == SRTT_FILE) {
+        *out_transtype = "file";
+        return true;
+    }
+    *out_transtype = "unknown";
+    return true;
+}
+
+bool TryResolveConfiguredTranstype(const std::vector<SrtUri>& uris, std::string* out_transtype) {
+    if (out_transtype == nullptr) {
+        return false;
+    }
+    for (const auto& uri : uris) {
+        const auto it = uri.query.find("transtype");
+        if (it == uri.query.end() || it->second.empty()) {
+            continue;
+        }
+        *out_transtype = it->second;
+        return true;
+    }
+    return false;
+}
+
+json BuildSessionTranstypeJson(SRTSOCKET sock, const std::vector<SrtUri>& uris) {
+    std::string value;
+    if (TryReadRuntimeTranstype(sock, &value)) {
+        return json{{"value", value}, {"source", "runtime"}};
+    }
+    if (TryResolveConfiguredTranstype(uris, &value)) {
+        return json{{"value", value}, {"source", "configured"}};
+    }
+    return json{{"value", "live"}, {"source", "default"}};
 }
 
 SRT_GROUP_TYPE ReadRuntimeGroupType(SRTSOCKET sock) {
@@ -242,7 +300,6 @@ json BuildRuntimeSrtOptionsJson(SRTSOCKET sock) {
     int rcvbuf = 0;
     int sndbuf = 0;
     int pbkeylen = 0;
-    int transtype = 0;
     int grouptype = 0;
     const bool has_oheadbw = TryReadSockOptInt(sock, SRTO_OHEADBW, &oheadbw);
     const bool has_peeridletimeo = TryReadSockOptInt(sock, SRTO_PEERIDLETIMEO, &peeridletimeo);
@@ -250,14 +307,9 @@ json BuildRuntimeSrtOptionsJson(SRTSOCKET sock) {
     const bool has_rcvbuf = TryReadSockOptInt(sock, SRTO_RCVBUF, &rcvbuf);
     const bool has_sndbuf = TryReadSockOptInt(sock, SRTO_SNDBUF, &sndbuf);
     const bool has_pbkeylen = TryReadSockOptInt(sock, SRTO_PBKEYLEN, &pbkeylen);
-    const bool has_transtype = TryReadSockOptInt(sock, SRTO_TRANSTYPE, &transtype);
+    std::string runtime_transtype;
+    const bool has_transtype = TryReadRuntimeTranstype(sock, &runtime_transtype);
     const bool has_grouptype = TryReadSockOptInt(sock, SRTO_GROUPTYPE, &grouptype);
-    std::string transtype_name = "unknown";
-    if (transtype == SRTT_LIVE) {
-        transtype_name = "live";
-    } else if (transtype == SRTT_FILE) {
-        transtype_name = "file";
-    }
     json out = {
         {"latency_ms", latency.has_latency ? json(latency.latency_ms) : json(nullptr)},
         {"rcvlatency_ms", latency.has_rcvlatency ? json(latency.rcvlatency_ms) : json(nullptr)},
@@ -270,7 +322,7 @@ json BuildRuntimeSrtOptionsJson(SRTSOCKET sock) {
         {"sndbuf_bytes", has_sndbuf ? json(sndbuf) : json(nullptr)},
         {"pbkeylen", has_pbkeylen ? json(pbkeylen) : json(nullptr)},
         {"group_type", has_grouptype ? json(GroupTypeName(static_cast<SRT_GROUP_TYPE>(grouptype))) : json(nullptr)},
-        {"transtype", has_transtype ? json(transtype_name) : json(nullptr)},
+        {"transtype", has_transtype ? json(runtime_transtype) : json(nullptr)},
     };
     return out;
 }
@@ -319,8 +371,15 @@ json BuildInputSessionSpecJson(const InputEndpointSpec& spec, const MetricsState
         configured["endpoint"] = BuildUdpEndpointJson(spec.udp_uri);
     }
     json effective_srt = nullptr;
+    json runtime_transtype = nullptr;
+    json session_transtype = nullptr;
     if (spec.kind == InputEndpointKind::kSrtListener || spec.kind == InputEndpointKind::kSrtCaller) {
         effective_srt = BuildRuntimeSrtOptionsJson(socket_id);
+        std::string runtime_value;
+        if (TryReadRuntimeTranstype(socket_id, &runtime_value)) {
+            runtime_transtype = runtime_value;
+        }
+        session_transtype = BuildSessionTranstypeJson(socket_id, spec.uris);
     }
     json connected_members = json::array();
     if (spec.kind == InputEndpointKind::kSrtListener || spec.kind == InputEndpointKind::kSrtCaller) {
@@ -343,6 +402,8 @@ json BuildInputSessionSpecJson(const InputEndpointSpec& spec, const MetricsState
             {"group_type", GroupTypeName(runtime_group_type)},
         }},
         {"effective_srt", effective_srt},
+        {"runtime_transtype", runtime_transtype},
+        {"session_transtype", session_transtype},
         {"connected_members", connected_members},
     };
 }
@@ -362,8 +423,15 @@ json BuildOutputSessionSpecJson(const OutputEndpointSpec& spec, const MetricsSta
         configured["endpoint"] = BuildUdpEndpointJson(spec.udp_uri);
     }
     json effective_srt = nullptr;
+    json runtime_transtype = nullptr;
+    json session_transtype = nullptr;
     if (spec.kind == OutputEndpointKind::kSrtListener || spec.kind == OutputEndpointKind::kSrtCaller) {
         effective_srt = BuildRuntimeSrtOptionsJson(socket_id);
+        std::string runtime_value;
+        if (TryReadRuntimeTranstype(socket_id, &runtime_value)) {
+            runtime_transtype = runtime_value;
+        }
+        session_transtype = BuildSessionTranstypeJson(socket_id, spec.uris);
     }
     json connected_members = json::array();
     if (spec.kind == OutputEndpointKind::kSrtListener || spec.kind == OutputEndpointKind::kSrtCaller) {
@@ -385,6 +453,8 @@ json BuildOutputSessionSpecJson(const OutputEndpointSpec& spec, const MetricsSta
             {"group_type", GroupTypeName(runtime_group_type)},
         }},
         {"effective_srt", effective_srt},
+        {"runtime_transtype", runtime_transtype},
+        {"session_transtype", session_transtype},
         {"connected_members", connected_members},
     };
 }
@@ -598,6 +668,8 @@ json BuildConnectedMembersJson(SRTSOCKET session_sock) {
             continue;
         }
         const bool has_socket_id = member.id != SRT_INVALID_SOCK && member.id != 0;
+        int64_t member_rtt_ms = -1;
+        const bool has_member_rtt = has_socket_id && TryReadSocketRttMs(member.id, &member_rtt_ms);
         std::string peer_host;
         int peer_port = 0;
         const bool has_peer_endpoint = TryExtractEndpoint(member.peeraddr, &peer_host, &peer_port);
@@ -611,7 +683,7 @@ json BuildConnectedMembersJson(SRTSOCKET session_sock) {
             {"member_state_code", static_cast<int>(member.memberstate)},
             {"peer_host", has_peer_endpoint ? json(peer_host) : json(nullptr)},
             {"peer_port", has_peer_endpoint ? json(peer_port) : json(nullptr)},
-            {"effective_srt", has_socket_id ? BuildRuntimeSrtOptionsJson(member.id) : json(nullptr)},
+            {"rtt_ms", has_member_rtt ? json(member_rtt_ms) : json(nullptr)},
         };
         members_json.push_back(std::move(member_json));
     }
