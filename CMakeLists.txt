@@ -12,7 +12,13 @@ FetchContent_Declare(
     URL https://github.com/yhirose/cpp-httplib/archive/refs/tags/v0.48.0.tar.gz
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
+FetchContent_Declare(
+    nlohmann_json
+    URL https://github.com/nlohmann/json/archive/refs/tags/v3.12.0.tar.gz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+)
 FetchContent_MakeAvailable(cpp_httplib)
+FetchContent_MakeAvailable(nlohmann_json)
 
 find_package(SRT QUIET)
 
@@ -110,6 +116,7 @@ target_link_libraries(srt-bond-relay PRIVATE
     ${PIXOP_SRT_LINK_TARGET}
     ${PIXOP_SRT_LIBRARIES}
     httplib::httplib
+    nlohmann_json::nlohmann_json
     dl
 )
 if (PIXOP_SRT_LINK_OPTIONS)
