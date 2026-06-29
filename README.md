@@ -3,6 +3,8 @@
 `srt-bond-relay` is a production-focused relay for MPEG-TS workflows.  
 It supports SRT listener/caller on both input and output, bonded SRT on both sides, UDP listener/caller endpoints, and stdin/stdout endpoints, with reconnect/failover logic and Prometheus metrics.
 
+<img width="4636" height="2294" alt="Screenshot 2026-06-29 at 09 51 59" src="https://github.com/user-attachments/assets/c3e95d26-24be-4a50-ac04-559cbd7df18c" />
+
 ## Build Images
 
 Build relay image:
