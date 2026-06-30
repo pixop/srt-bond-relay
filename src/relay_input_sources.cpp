@@ -576,6 +576,9 @@ public:
         return sources_.at(active_index_)->IsTerminalEof();
     }
     bool NeedsEnsurePoll() const override {
+        if (pending_stop_index_.has_value()) {
+            return true;
+        }
         if (!sources_.at(active_index_)->IsConnected()) {
             return true;
         }

@@ -68,6 +68,7 @@ struct SideCausalityState {
     uint64_t next_attempt_id = 1;
     uint64_t active_attempt_id = 0;
     bool attempt_active = false;
+    uint64_t consecutive_receive_timeouts = 0;
 };
 
 struct IncidentState {
@@ -76,6 +77,7 @@ struct IncidentState {
     std::string id;
     int64_t opened_unix_ms = 0;
     FailureSide first_side = FailureSide::kInput;
+    ReasonClass first_reason_class = ReasonClass::kInternal;
     ReasonCode first_reason_code = ReasonCode::kInternalError;
     uint64_t input_failures = 0;
     uint64_t output_failures = 0;
@@ -86,6 +88,7 @@ struct IncidentState {
 class CausalityTracker {
 public:
     explicit CausalityTracker(MetricsState* metrics) : metrics_(metrics) {}
+    static constexpr uint64_t kReceiveTimeoutIncidentThreshold = 3;
 
     uint64_t EnsureAttemptStarted(FailureSide side) {
         auto& state = SideState(side);
@@ -101,6 +104,11 @@ public:
 
     uint64_t ActiveAttemptId(FailureSide side) const {
         return side == FailureSide::kInput ? input_.active_attempt_id : output_.active_attempt_id;
+    }
+
+    void NoteDataSuccess(FailureSide side) {
+        auto& state = SideState(side);
+        state.consecutive_receive_timeouts = 0;
     }
 
     void CompleteAttempt(FailureSide side) {
@@ -126,11 +134,22 @@ public:
             ClassifyReason(operation, is_timeout, is_disconnected, listener_mode, reason_detail);
         const int64_t now_ms = UnixNowMs();
         const int64_t now_seconds = now_ms / 1000;
-        if (!incident_.active) {
+        auto& side_state = SideState(side);
+        bool suppress_incident_open = false;
+        if (operation == FailureOperation::kReceive && reason.reason_class == ReasonClass::kTimeout) {
+            side_state.consecutive_receive_timeouts += 1;
+            suppress_incident_open =
+                !incident_.active &&
+                side_state.consecutive_receive_timeouts < kReceiveTimeoutIncidentThreshold;
+        } else {
+            side_state.consecutive_receive_timeouts = 0;
+        }
+        if (!incident_.active && !suppress_incident_open) {
             incident_.active = true;
             incident_.id = "inc-" + std::to_string(incident_.next_incident_seq++);
             incident_.opened_unix_ms = now_ms;
             incident_.first_side = side;
+            incident_.first_reason_class = reason.reason_class;
             incident_.first_reason_code = reason.code;
             incident_.input_failures = 0;
             incident_.output_failures = 0;
@@ -197,12 +216,26 @@ public:
         if (!incident_.active || !input_connected || !output_connected) {
             return;
         }
+        if (incident_.first_reason_class == ReasonClass::kTimeout) {
+            if (incident_.first_side == FailureSide::kInput) {
+                const int64_t last_rx_ms = metrics_->last_rx_unix_ms.load(std::memory_order_relaxed);
+                if (last_rx_ms <= incident_.opened_unix_ms) {
+                    return;
+                }
+            } else {
+                const int64_t last_tx_ms = metrics_->last_tx_unix_ms.load(std::memory_order_relaxed);
+                if (last_tx_ms <= incident_.opened_unix_ms) {
+                    return;
+                }
+            }
+        }
         const int64_t now_ms = UnixNowMs();
         logger.Log(LogLevel::kInfo,
                    "incident-close",
                    "incident_id=" + incident_.id,
                    "duration_ms=" + std::to_string(std::max<int64_t>(0, now_ms - incident_.opened_unix_ms)),
                    std::string("first_fault_side=") + FailureSideName(incident_.first_side),
+                   std::string("first_reason_class=") + ReasonClassName(incident_.first_reason_class),
                    std::string("first_reason_code=") + ReasonCodeName(incident_.first_reason_code),
                    "input_failures=" + std::to_string(incident_.input_failures),
                    "output_failures=" + std::to_string(incident_.output_failures),
@@ -557,6 +590,7 @@ int RelayMain(const Config& cfg, const Logger& logger) {
         stats.total_rx_msgs += 1;
         stats.interval_rx_bytes += static_cast<uint64_t>(recv_size);
         stats.interval_rx_msgs += 1;
+        causality.NoteDataSuccess(FailureSide::kInput);
         if (IsSrtInputKind(active_input_kind())) {
             UpdateInputLinkHealthFromMsgCtrl(rx_ctrl, &metrics);
         }
@@ -613,6 +647,7 @@ int RelayMain(const Config& cfg, const Logger& logger) {
             stats.total_tx_msgs += 1;
             stats.interval_tx_bytes += static_cast<uint64_t>(sent_size);
             stats.interval_tx_msgs += 1;
+            causality.NoteDataSuccess(FailureSide::kOutput);
             metrics.total_tx_bytes.store(stats.total_tx_bytes, std::memory_order_relaxed);
             metrics.total_tx_msgs.store(stats.total_tx_msgs, std::memory_order_relaxed);
             metrics.last_tx_unix_ms.store(UnixNowMs(), std::memory_order_relaxed);
