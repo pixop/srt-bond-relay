@@ -1,16 +1,25 @@
 #include "srtrelay/config.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 
 namespace srtrelay {
 
+namespace {
+
+bool IsStdinInputSpec(const std::string& input_uri) {
+    return input_uri == "stdin" || input_uri == "-" || input_uri == "fd://stdin";
+}
+
+}  // namespace
+
 void PrintUsage() {
     std::cout
         << "Usage:\n"
         << "  srt-bond-relay \\\n"
-        << "    --input '<srt://...|stdin|group-list>' \\\n"
+        << "    --input '<srt://...|udp://...|stdin|group-list>' [--input '...'] \\\n"
         << "    --output '<srt://...|stdout|group-list>' \\\n"
         << "    --stats-interval-ms 1000 \\\n"
         << "    --reconnect-delay-ms 1000\n\n"
@@ -24,11 +33,15 @@ void PrintUsage() {
         << "  --metrics-enabled true|false\n"
         << "  --metrics-host 127.0.0.1\n"
         << "  --metrics-port 9464\n"
+        << "  --primary-input-index <1..N>\n"
+        << "  --switch-mode serial|delayed\n"
         << "\nI/O mode notes:\n"
         << "  Input:  srt:// mode=listener|caller, udp:// mode=listener (caller unsupported), stdin aliases: stdin|-|fd://stdin\n"
         << "  Output: srt:// mode=caller|listener, udp:// mode=caller (listener unsupported), stdout aliases: stdout|-|fd://stdout\n"
         << "  Group list for bonded SRT: separate endpoints with ';' or ','\n"
         << "  Group lists and bond options are only supported for SRT URIs\n"
+        << "  Repeat --input to configure independent switched input sources\n"
+        << "  Multi-input mode supports max one stdin source\n"
         << "  Bond mode query options: grouptype|group_type|bond|bond_mode\n"
         << "  Bonded per-path source IP options: srcip|sourceip|localip|adapterip|adapter_ip\n"
         << "  UDP query options: rcvbuf|sndbuf|reuseaddr|ttl|localip|localport\n"
@@ -39,6 +52,26 @@ bool ParseBool(const std::string& value) {
     if (value == "true" || value == "1" || value == "yes") return true;
     if (value == "false" || value == "0" || value == "no") return false;
     throw std::runtime_error("invalid boolean value: " + value);
+}
+
+SwitchMode ParseSwitchMode(const std::string& value) {
+    if (value == "serial") {
+        return SwitchMode::kSerial;
+    }
+    if (value == "delayed") {
+        return SwitchMode::kDelayed;
+    }
+    throw std::runtime_error("invalid --switch-mode value: " + value + " (expected serial or delayed)");
+}
+
+const char* SwitchModeName(SwitchMode mode) {
+    switch (mode) {
+        case SwitchMode::kSerial:
+            return "serial";
+        case SwitchMode::kDelayed:
+            return "delayed";
+    }
+    return "unknown";
 }
 
 Config ParseArgs(int argc, char** argv) {
@@ -56,7 +89,7 @@ Config ParseArgs(int argc, char** argv) {
             PrintUsage();
             std::exit(0);
         } else if (arg == "--input") {
-            cfg.input_uri = require_value("--input");
+            cfg.input_uris.push_back(require_value("--input"));
         } else if (arg == "--output") {
             cfg.output_uri = require_value("--output");
         } else if (arg == "--stats-interval-ms") {
@@ -81,14 +114,38 @@ Config ParseArgs(int argc, char** argv) {
             cfg.metrics_host = require_value("--metrics-host");
         } else if (arg == "--metrics-port") {
             cfg.metrics_port = std::stoi(require_value("--metrics-port"));
+        } else if (arg == "--primary-input-index") {
+            const int index = std::stoi(require_value("--primary-input-index"));
+            if (index <= 0) {
+                throw std::runtime_error("--primary-input-index must be in range 1..N");
+            }
+            cfg.primary_input_index = static_cast<size_t>(index - 1);
+        } else if (arg == "--switch-mode") {
+            cfg.switch_mode = ParseSwitchMode(require_value("--switch-mode"));
         } else {
             throw std::runtime_error("unknown argument: " + arg);
         }
     }
 
     if (!cfg.verify_linkage) {
-        if (cfg.input_uri.empty()) throw std::runtime_error("--input is required");
+        if (cfg.input_uris.empty()) throw std::runtime_error("--input is required");
+        if (cfg.input_uris.size() > 16) {
+            throw std::runtime_error("at most 16 --input values are supported");
+        }
         if (cfg.output_uri.empty()) throw std::runtime_error("--output is required");
+        size_t stdin_count = 0;
+        for (const auto& input_uri : cfg.input_uris) {
+            if (IsStdinInputSpec(input_uri)) {
+                ++stdin_count;
+            }
+        }
+        if (stdin_count > 1) {
+            throw std::runtime_error("multi-input mode supports at most one stdin source");
+        }
+        if (cfg.primary_input_index.has_value() && *cfg.primary_input_index >= cfg.input_uris.size()) {
+            throw std::runtime_error("--primary-input-index must be in range 1.." +
+                                     std::to_string(cfg.input_uris.size()));
+        }
     }
 
     if (cfg.stats_interval_ms <= 0) throw std::runtime_error("--stats-interval-ms must be > 0");

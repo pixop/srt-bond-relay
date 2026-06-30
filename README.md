@@ -164,6 +164,8 @@ Common optional flags:
 - `--metrics-enabled`
 - `--metrics-host`
 - `--metrics-port`
+- `--primary-input-index` (optional, 1-based)
+- `--switch-mode` (`serial` or `delayed`; default `serial`)
 - `--verify-linkage`
 
 `--input` accepted values:
@@ -171,6 +173,16 @@ Common optional flags:
 - `srt://...` with `mode=listener|caller` (default `listener` when omitted)
 - `udp://...` with `mode=listener` (input `mode=caller` is rejected in first pass)
 - `stdin`, `-`, or `fd://stdin`
+
+Independent multi-input switching:
+
+- Repeat `--input` to configure independent switched sources in declared order.
+- Optional `--primary-input-index` enables preferred-primary preempt behavior.
+- Without `--primary-input-index`, source selection is round-robin on failures.
+- `--switch-mode serial`: stop current source, then start next source.
+- `--switch-mode delayed`: start next source first, then cut over when it receives data.
+- Multi-input mode supports at most one stdin source.
+- Fast switch mode and FIFO inputs are deferred to future work.
 
 `--output` accepted values:
 
@@ -253,6 +265,7 @@ Use causality to separate first fault from recovery noise:
 - Local single-host bonded lab: `LOCAL_BOND_COOKBOOK.md`
 - Multi-host LAN testing (Docker + MPEG-TS): `LAN_TESTING_COOKBOOK.md`
 - Multi-NIC sender/receiver routing (AWS + local adapters): `MULTI_NIC_ROUTING_GUIDE.md`
+- Local switched-input lab: `scripts/local-switched-lab.sh`
 
 For quick local runs:
 
@@ -261,6 +274,17 @@ bash scripts/local-bond-lab.sh up
 bash scripts/local-bond-lab.sh status
 bash scripts/local-bond-lab.sh logs-relay
 ```
+
+```bash
+bash scripts/local-switched-lab.sh up
+bash scripts/local-switched-lab.sh status
+bash scripts/local-switched-lab.sh logs-relay
+```
+
+Dashboards:
+
+- Bonded input: `dashboards/srt-relay-bonded-input-single-output.json`
+- Switched input: `dashboards/srt-relay-switched-input-single-output.json`
 
 ## Supported URI Query Options
 

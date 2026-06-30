@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -132,7 +133,7 @@ public:
         }
     }
 
-    int Receive(const Config& cfg, std::vector<char>* buffer, SRT_MSGCTRL* rx_ctrl) override {
+    InputReceiveResult Receive(const Config& cfg, std::vector<char>* buffer, SRT_MSGCTRL* rx_ctrl) override {
         const int rc = srt_recvmsg2(session_.Get(), buffer->data(), cfg.max_message_size, rx_ctrl);
         if (rc == SRT_ERROR) {
             if (IsSrtTimeoutError()) {
@@ -142,11 +143,11 @@ public:
                 receive_error_kind_ = IoErrorKind::kDisconnected;
                 receive_error_message_ = SrtLastErrorString();
             }
-            return SRT_ERROR;
+            return {InputReceiveStatus::kError, 0};
         }
         receive_error_kind_ = IoErrorKind::kNone;
         receive_error_message_.clear();
-        return rc;
+        return {InputReceiveStatus::kData, rc};
     }
 
     void HandleReceiveError(const Config&, const Logger&, MetricsState* metrics) override {
@@ -218,7 +219,7 @@ public:
         }
     }
 
-    int Receive(const Config& cfg, std::vector<char>* buffer, SRT_MSGCTRL* rx_ctrl) override {
+    InputReceiveResult Receive(const Config& cfg, std::vector<char>* buffer, SRT_MSGCTRL* rx_ctrl) override {
         const int rc = srt_recvmsg2(session_.Get(), buffer->data(), cfg.max_message_size, rx_ctrl);
         if (rc == SRT_ERROR) {
             if (IsSrtTimeoutError()) {
@@ -228,11 +229,11 @@ public:
                 receive_error_kind_ = IoErrorKind::kDisconnected;
                 receive_error_message_ = SrtLastErrorString();
             }
-            return SRT_ERROR;
+            return {InputReceiveStatus::kError, 0};
         }
         receive_error_kind_ = IoErrorKind::kNone;
         receive_error_message_.clear();
-        return rc;
+        return {InputReceiveStatus::kData, rc};
     }
 
     void HandleReceiveError(const Config&, const Logger&, MetricsState* metrics) override {
@@ -309,18 +310,18 @@ public:
         metrics->input_listening.store(listener_ ? 1 : 0, std::memory_order_relaxed);
     }
 
-    int Receive(const Config& cfg, std::vector<char>* buffer, SRT_MSGCTRL* rx_ctrl) override {
+    InputReceiveResult Receive(const Config& cfg, std::vector<char>* buffer, SRT_MSGCTRL* rx_ctrl) override {
         (void)cfg;
         (void)rx_ctrl;
         const ssize_t n = ::recv(socket_fd_, buffer->data(), buffer->size(), 0);
         if (n < 0) {
             receive_error_kind_ = IsUdpTimeoutErrno(errno) ? IoErrorKind::kTimeout : IoErrorKind::kError;
             receive_error_message_ = std::strerror(errno);
-            return SRT_ERROR;
+            return {InputReceiveStatus::kError, 0};
         }
         receive_error_kind_ = IoErrorKind::kNone;
         receive_error_message_.clear();
-        return static_cast<int>(n);
+        return {InputReceiveStatus::kData, static_cast<int>(n)};
     }
 
     void HandleReceiveError(const Config&, const Logger&, MetricsState* metrics) override {
@@ -373,23 +374,23 @@ public:
         metrics->input_connected.store(1, std::memory_order_relaxed);
     }
 
-    int Receive(const Config& cfg, std::vector<char>* buffer, SRT_MSGCTRL* rx_ctrl) override {
+    InputReceiveResult Receive(const Config& cfg, std::vector<char>* buffer, SRT_MSGCTRL* rx_ctrl) override {
         (void)rx_ctrl;
         const ssize_t n = ::read(STDIN_FILENO, buffer->data(), static_cast<size_t>(cfg.max_message_size));
         if (n > 0) {
             receive_error_kind_ = IoErrorKind::kNone;
             receive_error_message_.clear();
-            return static_cast<int>(n);
+            return {InputReceiveStatus::kData, static_cast<int>(n)};
         }
         if (n == 0) {
             eof_ = true;
             receive_error_kind_ = IoErrorKind::kDisconnected;
             receive_error_message_ = "stdin EOF";
-            return SRT_ERROR;
+            return {InputReceiveStatus::kError, 0};
         }
         receive_error_kind_ = (errno == EAGAIN || errno == EWOULDBLOCK) ? IoErrorKind::kTimeout : IoErrorKind::kError;
         receive_error_message_ = std::strerror(errno);
-        return SRT_ERROR;
+        return {InputReceiveStatus::kError, 0};
     }
 
     void HandleReceiveError(const Config&, const Logger&, MetricsState* metrics) override {
@@ -415,7 +416,214 @@ private:
     std::string ensure_error_message_;
 };
 
+class InputSwitcher : public InputSource {
+public:
+    InputSwitcher(const Config& cfg, std::vector<InputEndpointSpec> specs)
+        : specs_(std::move(specs)),
+          policy_(cfg.primary_input_index.has_value() ? InputSwitchPolicy::kPreferredPrimary
+                                                      : InputSwitchPolicy::kRoundRobin),
+          primary_index_(cfg.primary_input_index),
+          switch_mode_(cfg.switch_mode) {
+        sources_.reserve(specs_.size());
+        for (const auto& spec : specs_) {
+            sources_.push_back(BuildInputSource(spec));
+        }
+    }
+
+    void EnsureReady(const Config& cfg,
+                     const Logger& logger,
+                     MetricsState* metrics,
+                     const EnsureAttemptContext& attempt_ctx) override {
+        ensure_error_kind_ = IoErrorKind::kNone;
+        ensure_error_message_.clear();
+        ApplyPendingStop(cfg, logger, metrics);
+        InputSource* active = sources_.at(active_index_).get();
+        try {
+            active->EnsureReady(cfg, logger, metrics, attempt_ctx);
+        } catch (...) {
+            ensure_error_kind_ = active->LastEnsureErrorKind();
+            ensure_error_message_ = active->LastEnsureErrorMessage();
+            if (sources_.size() > 1) {
+                const size_t previous = active_index_;
+                for (size_t offset = 1; offset < sources_.size(); ++offset) {
+                    const size_t candidate_index = (previous + offset) % sources_.size();
+                    InputSource* candidate = sources_.at(candidate_index).get();
+                    try {
+                        candidate->EnsureReady(cfg, logger, metrics, attempt_ctx);
+                        sources_.at(previous)->HandleReceiveError(cfg, logger, metrics);
+                        active_index_ = candidate_index;
+                        delayed_candidate_index_.reset();
+                        ++switch_count_;
+                        logger.Log(LogLevel::kWarn,
+                                   "input-switch",
+                                   "mode=" + std::string(SwitchModeName(switch_mode_)),
+                                   "reason=active-ensure-failed-fallback-ready",
+                                   "from_index=" + std::to_string(previous + 1),
+                                   "to_index=" + std::to_string(active_index_ + 1),
+                                   "switch_count=" + std::to_string(switch_count_));
+                        ensure_error_kind_ = IoErrorKind::kNone;
+                        ensure_error_message_.clear();
+                        return;
+                    } catch (...) {
+                        // Keep probing alternate inputs. The active failure context remains primary.
+                    }
+                }
+            }
+            throw;
+        }
+        if (policy_ != InputSwitchPolicy::kPreferredPrimary || !primary_index_.has_value()) {
+            return;
+        }
+        const size_t primary = *primary_index_;
+        if (primary >= sources_.size() || primary == active_index_) {
+            delayed_candidate_index_.reset();
+            return;
+        }
+        InputSource* primary_source = sources_.at(primary).get();
+        try {
+            primary_source->EnsureReady(cfg, logger, metrics, attempt_ctx);
+        } catch (...) {
+            return;
+        }
+        if (switch_mode_ == SwitchMode::kSerial) {
+            const size_t previous = active_index_;
+            sources_.at(previous)->HandleReceiveError(cfg, logger, metrics);
+            active_index_ = primary;
+            delayed_candidate_index_.reset();
+            ++switch_count_;
+            logger.Log(LogLevel::kInfo,
+                       "input-switch",
+                       "mode=serial",
+                       "reason=primary-restored",
+                       "from_index=" + std::to_string(previous + 1),
+                       "to_index=" + std::to_string(active_index_ + 1),
+                       "switch_count=" + std::to_string(switch_count_));
+        } else {
+            delayed_candidate_index_ = primary;
+        }
+    }
+
+    InputReceiveResult Receive(const Config& cfg, std::vector<char>* buffer, SRT_MSGCTRL* rx_ctrl) override {
+        receive_error_kind_ = IoErrorKind::kNone;
+        receive_error_message_.clear();
+        if (switch_mode_ == SwitchMode::kDelayed && delayed_candidate_index_.has_value()) {
+            const size_t delayed_index = *delayed_candidate_index_;
+            if (delayed_index < sources_.size() &&
+                delayed_index != active_index_ &&
+                specs_.at(delayed_index).kind != InputEndpointKind::kStdin) {
+                Config probe_cfg = cfg;
+                probe_cfg.io_timeout_ms = 1;
+                InputSource* delayed_source = sources_.at(delayed_index).get();
+                const InputReceiveResult delayed_result = delayed_source->Receive(probe_cfg, buffer, rx_ctrl);
+                if (delayed_result.status == InputReceiveStatus::kData) {
+                    pending_stop_index_ = active_index_;
+                    active_index_ = delayed_index;
+                    delayed_candidate_index_.reset();
+                    ++switch_count_;
+                    receive_error_kind_ = IoErrorKind::kNone;
+                    receive_error_message_.clear();
+                    return delayed_result;
+                }
+                if (delayed_source->LastReceiveErrorKind() != IoErrorKind::kTimeout) {
+                    delayed_candidate_index_.reset();
+                }
+            } else {
+                delayed_candidate_index_.reset();
+            }
+        }
+
+        InputSource* active = sources_.at(active_index_).get();
+        const InputReceiveResult result = active->Receive(cfg, buffer, rx_ctrl);
+        if (result.status == InputReceiveStatus::kError) {
+            receive_error_kind_ = active->LastReceiveErrorKind();
+            receive_error_message_ = active->LastReceiveErrorMessage();
+        } else {
+            receive_error_kind_ = IoErrorKind::kNone;
+            receive_error_message_.clear();
+        }
+        return result;
+    }
+
+    void HandleReceiveError(const Config& cfg, const Logger& logger, MetricsState* metrics) override {
+        sources_.at(active_index_)->HandleReceiveError(cfg, logger, metrics);
+        delayed_candidate_index_.reset();
+        if (sources_.size() <= 1) {
+            return;
+        }
+        const size_t previous = active_index_;
+        active_index_ = NextIndex(active_index_);
+        ++switch_count_;
+        logger.Log(LogLevel::kWarn,
+                   "input-switch",
+                   "mode=" + std::string(SwitchModeName(switch_mode_)),
+                   "reason=source-failure",
+                   "from_index=" + std::to_string(previous + 1),
+                   "to_index=" + std::to_string(active_index_ + 1),
+                   "switch_count=" + std::to_string(switch_count_));
+    }
+
+    SRTSOCKET SessionSocket() const override { return sources_.at(active_index_)->SessionSocket(); }
+    bool IsListening() const override { return sources_.at(active_index_)->IsListening(); }
+    bool IsConnected() const override { return sources_.at(active_index_)->IsConnected(); }
+    bool IsTerminalEof() const override {
+        if (sources_.size() > 1) {
+            return false;
+        }
+        return sources_.at(active_index_)->IsTerminalEof();
+    }
+    IoErrorKind LastReceiveErrorKind() const override { return receive_error_kind_; }
+    std::string LastReceiveErrorMessage() const override { return receive_error_message_; }
+    IoErrorKind LastEnsureErrorKind() const override { return ensure_error_kind_; }
+    std::string LastEnsureErrorMessage() const override { return ensure_error_message_; }
+    size_t ActiveInputIndex() const override { return active_index_; }
+    uint64_t InputSwitchCount() const override { return switch_count_; }
+
+private:
+    size_t NextIndex(size_t current) const {
+        if (sources_.empty()) {
+            return 0;
+        }
+        return (current + 1) % sources_.size();
+    }
+
+    void ApplyPendingStop(const Config& cfg, const Logger& logger, MetricsState* metrics) {
+        if (!pending_stop_index_.has_value()) {
+            return;
+        }
+        const size_t index = *pending_stop_index_;
+        pending_stop_index_.reset();
+        if (index >= sources_.size()) {
+            return;
+        }
+        sources_.at(index)->HandleReceiveError(cfg, logger, metrics);
+    }
+
+    std::vector<InputEndpointSpec> specs_;
+    std::vector<std::unique_ptr<InputSource>> sources_;
+    InputSwitchPolicy policy_ = InputSwitchPolicy::kRoundRobin;
+    std::optional<size_t> primary_index_;
+    SwitchMode switch_mode_ = SwitchMode::kSerial;
+    size_t active_index_ = 0;
+    std::optional<size_t> delayed_candidate_index_;
+    std::optional<size_t> pending_stop_index_;
+    uint64_t switch_count_ = 0;
+    IoErrorKind receive_error_kind_ = IoErrorKind::kNone;
+    std::string receive_error_message_;
+    IoErrorKind ensure_error_kind_ = IoErrorKind::kNone;
+    std::string ensure_error_message_;
+};
+
 }  // namespace
+
+const char* InputSwitchPolicyName(InputSwitchPolicy policy) {
+    switch (policy) {
+        case InputSwitchPolicy::kRoundRobin:
+            return "round_robin";
+        case InputSwitchPolicy::kPreferredPrimary:
+            return "preferred_primary";
+    }
+    return "unknown";
+}
 
 std::unique_ptr<InputSource> BuildInputSource(const InputEndpointSpec& spec) {
     if (spec.kind == InputEndpointKind::kStdin) {
@@ -431,6 +639,16 @@ std::unique_ptr<InputSource> BuildInputSource(const InputEndpointSpec& spec) {
         return std::make_unique<SrtInputCallerSource>(spec.uris, spec.bonded, spec.group_type);
     }
     return std::make_unique<SrtInputListenerSource>(spec.uris);
+}
+
+std::unique_ptr<InputSource> BuildInputSource(const Config& cfg, std::vector<InputEndpointSpec> specs) {
+    if (specs.empty()) {
+        throw std::runtime_error("no input specs configured");
+    }
+    if (specs.size() == 1) {
+        return BuildInputSource(specs.front());
+    }
+    return std::make_unique<InputSwitcher>(cfg, std::move(specs));
 }
 
 }  // namespace srtrelay

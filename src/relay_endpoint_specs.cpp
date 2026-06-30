@@ -123,17 +123,17 @@ std::vector<std::string> ParseRawUriList(const std::string& spec, EndpointScheme
 
 }  // namespace
 
-InputEndpointSpec ParseInputEndpointSpec(const Config& cfg) {
+InputEndpointSpec ParseInputEndpointSpecFromUri(const std::string& input_uri) {
     InputEndpointSpec out;
-    if (IsStdinInputSpec(cfg.input_uri)) {
+    if (IsStdinInputSpec(input_uri)) {
         out.kind = InputEndpointKind::kStdin;
         return out;
     }
 
     EndpointScheme scheme = EndpointScheme::kSrt;
-    const auto raw = ParseRawUriList(cfg.input_uri, &scheme);
+    const auto raw = ParseRawUriList(input_uri, &scheme);
     if (scheme == EndpointScheme::kSrt) {
-        out.uris = ParseSrtUriList(cfg.input_uri);
+        out.uris = ParseSrtUriList(input_uri);
         const std::string mode = QueryString(out.uris.front().query, "mode");
         const std::string resolved_mode = mode.empty() ? "listener" : mode;
         for (const auto& uri : out.uris) {
@@ -179,6 +179,31 @@ InputEndpointSpec ParseInputEndpointSpec(const Config& cfg) {
         throw std::runtime_error("input UDP URI mode must be listener or caller");
     }
     return out;
+}
+
+std::vector<InputEndpointSpec> ParseInputEndpointSpecs(const Config& cfg) {
+    std::vector<InputEndpointSpec> out;
+    out.reserve(cfg.input_uris.size());
+    size_t stdin_count = 0;
+    for (const auto& input_uri : cfg.input_uris) {
+        InputEndpointSpec spec = ParseInputEndpointSpecFromUri(input_uri);
+        if (spec.kind == InputEndpointKind::kStdin) {
+            ++stdin_count;
+            if (stdin_count > 1) {
+                throw std::runtime_error("multi-input mode supports at most one stdin source");
+            }
+        }
+        out.push_back(std::move(spec));
+    }
+    if (out.empty()) {
+        throw std::runtime_error("--input is required");
+    }
+    return out;
+}
+
+InputEndpointSpec ParseInputEndpointSpec(const Config& cfg) {
+    const std::vector<InputEndpointSpec> specs = ParseInputEndpointSpecs(cfg);
+    return specs.front();
 }
 
 OutputEndpointSpec ParseOutputEndpointSpec(const Config& cfg) {

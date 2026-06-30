@@ -54,6 +54,11 @@ MetricsState::MetricsState() {
         input_member_connected_last_logged[i] = -1;
         output_member_connected_last_logged[i] = -1;
     }
+    for (size_t i = 0; i < kMaxInputSources; ++i) {
+        input_source_connected[i].store(0, std::memory_order_relaxed);
+        input_source_listening[i].store(0, std::memory_order_relaxed);
+        input_source_bond_mode[i].store(0, std::memory_order_relaxed);
+    }
     for (size_t side = 0; side < kFailureSides; ++side) {
         for (size_t i = 0; i < kTimeoutTypes; ++i) {
             timeouts_total[side][i].store(0, std::memory_order_relaxed);
@@ -390,12 +395,24 @@ json BuildLastFailureJson(const LastFailureSnapshot& snapshot) {
     };
 }
 
-json BuildInputSessionSpecJson(const InputEndpointSpec& spec, const MetricsState& metrics) {
-    const auto connected = metrics.input_connected.load(std::memory_order_relaxed) == 1;
-    const auto listening = metrics.input_listening.load(std::memory_order_relaxed) == 1;
-    const SRTSOCKET socket_id =
-        static_cast<SRTSOCKET>(metrics.input_session_socket_id.load(std::memory_order_relaxed));
-    const SRTSOCKET group_socket_id = (socket_id != SRT_INVALID_SOCK) ? srt_groupof(socket_id) : SRT_INVALID_SOCK;
+json BuildInputSessionSpecJson(const InputEndpointSpec& spec,
+                               const MetricsState& metrics,
+                               size_t input_index,
+                               bool runtime_active) {
+    bool connected = false;
+    bool listening = false;
+    if (input_index < MetricsState::kMaxInputSources) {
+        connected = metrics.input_source_connected[input_index].load(std::memory_order_relaxed) == 1;
+        listening = metrics.input_source_listening[input_index].load(std::memory_order_relaxed) == 1;
+    } else {
+        connected = metrics.input_connected.load(std::memory_order_relaxed) == 1;
+        listening = metrics.input_listening.load(std::memory_order_relaxed) == 1;
+    }
+    const SRTSOCKET socket_id = runtime_active
+        ? static_cast<SRTSOCKET>(metrics.input_session_socket_id.load(std::memory_order_relaxed))
+        : SRT_INVALID_SOCK;
+    const SRTSOCKET group_socket_id =
+        (runtime_active && socket_id != SRT_INVALID_SOCK) ? srt_groupof(socket_id) : SRT_INVALID_SOCK;
     json configured = {
         {"bonded", spec.bonded},
         {"group_type", GroupTypeName(spec.group_type)},
@@ -408,7 +425,8 @@ json BuildInputSessionSpecJson(const InputEndpointSpec& spec, const MetricsState
     json effective_srt = nullptr;
     json runtime_transtype = nullptr;
     json session_transtype = nullptr;
-    if (spec.kind == InputEndpointKind::kSrtListener || spec.kind == InputEndpointKind::kSrtCaller) {
+    if (runtime_active &&
+        (spec.kind == InputEndpointKind::kSrtListener || spec.kind == InputEndpointKind::kSrtCaller)) {
         effective_srt = BuildRuntimeSrtOptionsJson(socket_id);
         std::string runtime_value;
         if (TryReadRuntimeTranstype(socket_id, &runtime_value)) {
@@ -417,15 +435,18 @@ json BuildInputSessionSpecJson(const InputEndpointSpec& spec, const MetricsState
         session_transtype = BuildSessionTranstypeJson(socket_id, spec.uris);
     }
     json connected_members = json::array();
-    if (spec.kind == InputEndpointKind::kSrtListener || spec.kind == InputEndpointKind::kSrtCaller) {
+    if (runtime_active &&
+        (spec.kind == InputEndpointKind::kSrtListener || spec.kind == InputEndpointKind::kSrtCaller)) {
         connected_members = BuildConnectedMembersJson(socket_id);
     }
-    const SRT_GROUP_TYPE runtime_group_type = ReadRuntimeGroupType(socket_id);
-    const bool runtime_bonded = (runtime_group_type == SRT_GTYPE_BROADCAST ||
-                                 runtime_group_type == SRT_GTYPE_BACKUP ||
-                                 connected_members.size() > 1);
+    const SRT_GROUP_TYPE runtime_group_type = runtime_active ? ReadRuntimeGroupType(socket_id) : spec.group_type;
+    const bool runtime_bonded = runtime_active
+        ? (runtime_group_type == SRT_GTYPE_BROADCAST ||
+           runtime_group_type == SRT_GTYPE_BACKUP ||
+           connected_members.size() > 1)
+        : spec.bonded;
     LastFailureSnapshot last_failure;
-    {
+    if (runtime_active) {
         std::lock_guard<std::mutex> causality_lock(metrics.causality_mutex);
         last_failure = metrics.input_last_failure;
     }
@@ -506,11 +527,34 @@ json BuildOutputSessionSpecJson(const OutputEndpointSpec& spec, const MetricsSta
     };
 }
 
-std::string BuildSessionSpecsJson(const InputEndpointSpec& input_spec,
+std::string BuildSessionSpecsJson(const std::vector<InputEndpointSpec>& input_specs,
                                   const OutputEndpointSpec& output_spec,
+                                  const Config& cfg,
                                   const MetricsState& metrics) {
+    json inputs = json::array();
+    int64_t active_input_index = metrics.active_input_index.load(std::memory_order_relaxed);
+    if (active_input_index <= 0) {
+        active_input_index = 1;
+    }
+    for (size_t i = 0; i < input_specs.size(); ++i) {
+        const bool runtime_active = static_cast<int64_t>(i + 1) == active_input_index;
+        json input_json = BuildInputSessionSpecJson(input_specs[i], metrics, i, runtime_active);
+        input_json["input_index"] = static_cast<int64_t>(i + 1);
+        input_json["active"] = runtime_active;
+        inputs.push_back(std::move(input_json));
+    }
+    const int64_t primary_input_index = cfg.primary_input_index.has_value()
+        ? static_cast<int64_t>(*cfg.primary_input_index + 1)
+        : 0;
+    const char* switch_policy = cfg.primary_input_index.has_value()
+        ? InputSwitchPolicyName(InputSwitchPolicy::kPreferredPrimary)
+        : InputSwitchPolicyName(InputSwitchPolicy::kRoundRobin);
     json out = {
-        {"input", BuildInputSessionSpecJson(input_spec, metrics)},
+        {"inputs", inputs},
+        {"active_input_index", active_input_index},
+        {"primary_input_index", primary_input_index == 0 ? json(nullptr) : json(primary_input_index)},
+        {"switch_policy", switch_policy},
+        {"switch_mode", SwitchModeName(cfg.switch_mode)},
         {"output", BuildOutputSessionSpecJson(output_spec, metrics)},
     };
     return out.dump();
@@ -2018,6 +2062,12 @@ std::string RenderPrometheusMetrics(const MetricsState& metrics) {
     const auto output_transport_byte_retrans_current = metrics.output_transport_byte_retrans_current.load(std::memory_order_relaxed);
     const auto output_transport_byte_drop_current = metrics.output_transport_byte_drop_current.load(std::memory_order_relaxed);
     const auto path_ready = (input_connected == 1 && output_connected == 1) ? 1 : 0;
+    const auto input_sources_total = metrics.input_sources_total.load(std::memory_order_relaxed);
+    const auto active_input_index = metrics.active_input_index.load(std::memory_order_relaxed);
+    const auto input_switches_total = metrics.input_switches_total.load(std::memory_order_relaxed);
+    const auto primary_input_index = metrics.primary_input_index.load(std::memory_order_relaxed);
+    const auto switch_policy = metrics.switch_policy.load(std::memory_order_relaxed);
+    const auto switch_mode = metrics.switch_mode.load(std::memory_order_relaxed);
     const auto input_bond_mode = metrics.input_bond_mode.load(std::memory_order_relaxed);
     const auto output_bond_mode = metrics.output_bond_mode.load(std::memory_order_relaxed);
 
@@ -2065,6 +2115,10 @@ std::string RenderPrometheusMetrics(const MetricsState& metrics) {
     emit_i64("srt_relay_input_connected", "gauge", "Relay input session is connected (1/0).", input_connected);
     emit_i64("srt_relay_output_connected", "gauge", "Relay output session is connected (1/0).", output_connected);
     emit_i64("srt_relay_path_ready", "gauge", "Relay data path input+output connected (1/0).", path_ready);
+    emit_i64("srt_relay_input_sources_total", "gauge", "Configured independent input source count.", input_sources_total);
+    emit_i64("srt_relay_active_input_index", "gauge", "1-based active input source index.", active_input_index);
+    emit_u64("srt_relay_input_switches_total", "counter", "Total input source switch events.", input_switches_total);
+    emit_i64("srt_relay_primary_input_index", "gauge", "Configured primary input index (1-based, 0 when unset).", primary_input_index);
     emit_i64("srt_relay_input_links_total", "gauge", "Total number of input links in the active SRT group.", input_links_total);
     emit_i64("srt_relay_input_links_healthy", "gauge", "Number of healthy input links in the active SRT group.", input_links_healthy);
     emit_i64("srt_relay_input_links_running", "gauge", "Number of currently running/active input links in the active SRT group.", input_links_running);
@@ -2252,6 +2306,35 @@ std::string RenderPrometheusMetrics(const MetricsState& metrics) {
     out << "srt_relay_output_bond_mode{mode=\"unknown\"} " << (output_bond_mode == 0 ? 1 : 0) << "\n";
     out << "srt_relay_output_bond_mode{mode=\"broadcast\"} " << (output_bond_mode == 1 ? 1 : 0) << "\n";
     out << "srt_relay_output_bond_mode{mode=\"backup\"} " << (output_bond_mode == 2 ? 1 : 0) << "\n";
+    out << "# HELP srt_relay_switch_policy Active input switch policy mode.\n";
+    out << "# TYPE srt_relay_switch_policy gauge\n";
+    out << "srt_relay_switch_policy{policy=\"round_robin\"} " << (switch_policy == 0 ? 1 : 0) << "\n";
+    out << "srt_relay_switch_policy{policy=\"preferred_primary\"} " << (switch_policy == 1 ? 1 : 0) << "\n";
+    out << "# HELP srt_relay_switch_mode Active input switch execution mode.\n";
+    out << "# TYPE srt_relay_switch_mode gauge\n";
+    out << "srt_relay_switch_mode{mode=\"serial\"} " << (switch_mode == 0 ? 1 : 0) << "\n";
+    out << "srt_relay_switch_mode{mode=\"delayed\"} " << (switch_mode == 1 ? 1 : 0) << "\n";
+    out << "# HELP srt_relay_input_source_connected Input source connection state by index.\n";
+    out << "# TYPE srt_relay_input_source_connected gauge\n";
+    out << "# HELP srt_relay_input_source_listening Input source listening state by index.\n";
+    out << "# TYPE srt_relay_input_source_listening gauge\n";
+    out << "# HELP srt_relay_input_source_bond_mode Configured bond mode by input index.\n";
+    out << "# TYPE srt_relay_input_source_bond_mode gauge\n";
+    const size_t source_count_capped = std::min(static_cast<size_t>(std::max<int64_t>(0, input_sources_total)),
+                                                MetricsState::kMaxInputSources);
+    for (size_t i = 0; i < source_count_capped; ++i) {
+        const int connected_state = metrics.input_source_connected[i].load(std::memory_order_relaxed);
+        const int listening_state = metrics.input_source_listening[i].load(std::memory_order_relaxed);
+        const int bond_mode = metrics.input_source_bond_mode[i].load(std::memory_order_relaxed);
+        out << "srt_relay_input_source_connected{input_index=\"" << (i + 1) << "\"} " << connected_state << "\n";
+        out << "srt_relay_input_source_listening{input_index=\"" << (i + 1) << "\"} " << listening_state << "\n";
+        out << "srt_relay_input_source_bond_mode{input_index=\"" << (i + 1)
+            << "\",mode=\"unknown\"} " << (bond_mode == 0 ? 1 : 0) << "\n";
+        out << "srt_relay_input_source_bond_mode{input_index=\"" << (i + 1)
+            << "\",mode=\"broadcast\"} " << (bond_mode == 1 ? 1 : 0) << "\n";
+        out << "srt_relay_input_source_bond_mode{input_index=\"" << (i + 1)
+            << "\",mode=\"backup\"} " << (bond_mode == 2 ? 1 : 0) << "\n";
+    }
     emit_i64("srt_relay_last_rx_unix_seconds", "gauge", "Unix timestamp of last received packet.", last_rx_unix_seconds);
     emit_i64("srt_relay_last_tx_unix_seconds", "gauge", "Unix timestamp of last forwarded packet.", last_tx_unix_seconds);
     emit_i64("srt_relay_last_input_failure_unix_seconds", "gauge", "Unix timestamp of last input-side failure.", last_input_failure_unix_seconds);
@@ -2294,9 +2377,9 @@ std::string RenderPrometheusMetrics(const MetricsState& metrics) {
 MetricsServer::MetricsServer(const Config& cfg,
                              const Logger& logger,
                              MetricsState& metrics,
-                             const InputEndpointSpec& input_spec,
+                             const std::vector<InputEndpointSpec>& input_specs,
                              const OutputEndpointSpec& output_spec)
-    : cfg_(cfg), logger_(logger), metrics_(metrics), input_spec_(&input_spec), output_spec_(&output_spec) {}
+    : cfg_(cfg), logger_(logger), metrics_(metrics), input_specs_(&input_specs), output_spec_(&output_spec) {}
 
 MetricsServer::~MetricsServer() { Stop(); }
 
@@ -2312,13 +2395,13 @@ void MetricsServer::Start() {
         res.set_content("ok\n", "text/plain");
     });
     server_.Get("/session/specs", [&](const httplib::Request&, httplib::Response& res) {
-        if (input_spec_ == nullptr || output_spec_ == nullptr) {
+        if (input_specs_ == nullptr || output_spec_ == nullptr) {
             res.status = 500;
             res.set_content("{\"error\":\"session specs unavailable\"}\n",
                             "application/json; charset=utf-8");
             return;
         }
-        res.set_content(BuildSessionSpecsJson(*input_spec_, *output_spec_, metrics_) + "\n",
+        res.set_content(BuildSessionSpecsJson(*input_specs_, *output_spec_, cfg_, metrics_) + "\n",
                         "application/json; charset=utf-8");
     });
     server_.Post("/metrics/links/compact", [&](const httplib::Request& req, httplib::Response& res) {

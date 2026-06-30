@@ -1,6 +1,7 @@
 #include "srtrelay/relay.hpp"
 
 #include <chrono>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -230,7 +231,8 @@ private:
 };
 
 int RelayMain(const Config& cfg, const Logger& logger) {
-    const InputEndpointSpec input_spec = ParseInputEndpointSpec(cfg);
+    const std::vector<InputEndpointSpec> input_specs = ParseInputEndpointSpecs(cfg);
+    const InputEndpointSpec& input_spec = input_specs.front();
     const OutputEndpointSpec output_spec = ParseOutputEndpointSpec(cfg);
 
     RelayStats stats;
@@ -243,10 +245,28 @@ int RelayMain(const Config& cfg, const Logger& logger) {
     const auto startup_ms = UnixNowMs();
     metrics.last_rx_unix_ms.store(startup_ms, std::memory_order_relaxed);
     metrics.last_tx_unix_ms.store(startup_ms, std::memory_order_relaxed);
+    metrics.input_sources_total.store(static_cast<int64_t>(input_specs.size()), std::memory_order_relaxed);
+    metrics.primary_input_index.store(
+        cfg.primary_input_index.has_value() ? static_cast<int64_t>(*cfg.primary_input_index + 1) : 0,
+        std::memory_order_relaxed);
+    metrics.switch_policy.store(cfg.primary_input_index.has_value() ? 1 : 0, std::memory_order_relaxed);
+    metrics.switch_mode.store(cfg.switch_mode == SwitchMode::kDelayed ? 1 : 0, std::memory_order_relaxed);
+    for (size_t i = 0; i < MetricsState::kMaxInputSources; ++i) {
+        metrics.input_source_connected[i].store(0, std::memory_order_relaxed);
+        metrics.input_source_listening[i].store(0, std::memory_order_relaxed);
+        metrics.input_source_bond_mode[i].store(0, std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < input_specs.size() && i < MetricsState::kMaxInputSources; ++i) {
+        const auto group_type = input_specs[i].group_type;
+        const int bond_mode = group_type == SRT_GTYPE_BROADCAST ? 1 :
+                              (group_type == SRT_GTYPE_BACKUP ? 2 : 0);
+        metrics.input_source_bond_mode[i].store(bond_mode, std::memory_order_relaxed);
+    }
 
-    std::unique_ptr<InputSource> input_source = BuildInputSource(input_spec);
+    std::unique_ptr<InputSource> input_source = BuildInputSource(cfg, input_specs);
     std::unique_ptr<OutputSink> output_sink = BuildOutputSink(output_spec);
-    const bool stdin_repacketize_enabled = (input_spec.kind == InputEndpointKind::kStdin);
+    const bool stdin_repacketize_enabled = (input_specs.size() == 1 &&
+                                            input_spec.kind == InputEndpointKind::kStdin);
     int stdin_chunk_size = cfg.max_message_size;
     if (stdin_repacketize_enabled) {
         constexpr int kTsPacketSize = 188;
@@ -259,11 +279,19 @@ int RelayMain(const Config& cfg, const Logger& logger) {
                    "chunk_size=" + std::to_string(stdin_chunk_size),
                    "max_message_size=" + std::to_string(cfg.max_message_size));
     }
-    MetricsServer metrics_server(cfg, logger, metrics, input_spec, output_spec);
+    MetricsServer metrics_server(cfg, logger, metrics, input_specs, output_spec);
     metrics_server.Start();
 
+    std::ostringstream input_uris_stream;
+    for (size_t i = 0; i < cfg.input_uris.size(); ++i) {
+        if (i > 0) {
+            input_uris_stream << ",";
+        }
+        input_uris_stream << cfg.input_uris[i];
+    }
+
     logger.Log(LogLevel::kInfo, "startup",
-               "input_uri=" + cfg.input_uri,
+               "input_uris=" + input_uris_stream.str(),
                "output_uri=" + cfg.output_uri,
                "input_mode=" + std::string(InputModeLabel(input_spec.kind)),
                "output_mode=" + std::string(OutputModeLabel(output_spec.kind)),
@@ -275,13 +303,38 @@ int RelayMain(const Config& cfg, const Logger& logger) {
                "io_timeout_ms=" + std::to_string(cfg.io_timeout_ms),
                "metrics_enabled=" + std::string(cfg.metrics_enabled ? "true" : "false"),
                "metrics_host=" + cfg.metrics_host,
-               "metrics_port=" + std::to_string(cfg.metrics_port));
+               "metrics_port=" + std::to_string(cfg.metrics_port),
+               "switch_policy=" + std::string(InputSwitchPolicyName(
+                   cfg.primary_input_index.has_value() ? InputSwitchPolicy::kPreferredPrimary
+                                                       : InputSwitchPolicy::kRoundRobin)),
+               "switch_mode=" + std::string(SwitchModeName(cfg.switch_mode)));
 
     CausalityTracker causality(&metrics);
+    auto active_input_kind = [&]() -> InputEndpointKind {
+        const size_t active_index = input_source->ActiveInputIndex();
+        if (active_index < input_specs.size()) {
+            return input_specs[active_index].kind;
+        }
+        return input_specs.front().kind;
+    };
     while (!g_shutdown_requested.load()) {
+        for (size_t i = 0; i < MetricsState::kMaxInputSources; ++i) {
+            metrics.input_source_connected[i].store(0, std::memory_order_relaxed);
+            metrics.input_source_listening[i].store(0, std::memory_order_relaxed);
+        }
+        const size_t active_index_for_state = input_source->ActiveInputIndex();
+        if (active_index_for_state < MetricsState::kMaxInputSources) {
+            metrics.input_source_connected[active_index_for_state].store(
+                input_source->IsConnected() ? 1 : 0, std::memory_order_relaxed);
+            metrics.input_source_listening[active_index_for_state].store(
+                input_source->IsListening() ? 1 : 0, std::memory_order_relaxed);
+        }
         state.input_listening = input_source->IsListening();
         state.input_connected = input_source->IsConnected();
         state.output_connected = output_sink->IsConnected();
+        metrics.input_listening.store(state.input_listening ? 1 : 0, std::memory_order_relaxed);
+        metrics.input_connected.store(state.input_connected ? 1 : 0, std::memory_order_relaxed);
+        metrics.output_connected.store(state.output_connected ? 1 : 0, std::memory_order_relaxed);
         metrics.input_session_socket_id.store(static_cast<int64_t>(input_source->SessionSocket()),
                                               std::memory_order_relaxed);
         const SRTSOCKET output_transport_sock =
@@ -293,6 +346,9 @@ int RelayMain(const Config& cfg, const Logger& logger) {
         MaybeLogStats(cfg, logger, &stats, state, &metrics,
                       input_source->SessionSocket(), output_sink->TransportSocket(),
                       output_sink->MetricsMode(), causality.ActiveIncidentId(), &last_stats_at);
+        metrics.active_input_index.store(static_cast<int64_t>(input_source->ActiveInputIndex() + 1),
+                                         std::memory_order_relaxed);
+        metrics.input_switches_total.store(input_source->InputSwitchCount(), std::memory_order_relaxed);
         causality.MaybeCloseIncident(logger, input_source->IsConnected(), output_sink->IsConnected());
 
         if (!input_source->IsConnected()) {
@@ -316,8 +372,8 @@ int RelayMain(const Config& cfg, const Logger& logger) {
                                                                         FailureOperation::kEnsure,
                                                                         is_timeout,
                                                                         false,
-                                                                        input_spec.kind == InputEndpointKind::kSrtListener ||
-                                                                            input_spec.kind == InputEndpointKind::kUdpListener,
+                                                                        active_input_kind() == InputEndpointKind::kSrtListener ||
+                                                                            active_input_kind() == InputEndpointKind::kUdpListener,
                                                                         message,
                                                                         "input.ensure",
                                                                         attempt_id,
@@ -417,8 +473,8 @@ int RelayMain(const Config& cfg, const Logger& logger) {
         SRT_SOCKGROUPDATA rx_group_data[16] {};
         rx_ctrl.grpdata = rx_group_data;
         rx_ctrl.grpdata_size = sizeof(rx_group_data) / sizeof(rx_group_data[0]);
-        const int recv_size = input_source->Receive(cfg, &buffer, &rx_ctrl);
-        if (recv_size == SRT_ERROR) {
+        const InputReceiveResult receive_result = input_source->Receive(cfg, &buffer, &rx_ctrl);
+        if (receive_result.status == InputReceiveStatus::kError) {
             if (input_source->IsTerminalEof()) {
                 const uint64_t attempt_id = causality.EnsureAttemptStarted(FailureSide::kInput);
                 const ReasonDescriptor reason = causality.RecordFailure(logger,
@@ -486,19 +542,20 @@ int RelayMain(const Config& cfg, const Logger& logger) {
             continue;
         }
 
+        const int recv_size = receive_result.bytes;
         stats.total_rx_bytes += static_cast<uint64_t>(recv_size);
         stats.total_rx_msgs += 1;
         stats.interval_rx_bytes += static_cast<uint64_t>(recv_size);
         stats.interval_rx_msgs += 1;
-        if (IsSrtInputKind(input_spec.kind)) {
+        if (IsSrtInputKind(active_input_kind())) {
             UpdateInputLinkHealthFromMsgCtrl(rx_ctrl, &metrics);
         }
         metrics.total_rx_bytes.store(stats.total_rx_bytes, std::memory_order_relaxed);
         metrics.total_rx_msgs.store(stats.total_rx_msgs, std::memory_order_relaxed);
         metrics.last_rx_unix_ms.store(UnixNowMs(), std::memory_order_relaxed);
         auto send_chunk = [&](const char* data, int size) -> bool {
-            const int sent_size = output_sink->Send(data, size);
-            if (sent_size == SRT_ERROR) {
+            const OutputSendResult send_result = output_sink->Send(data, size);
+            if (send_result.status == OutputSendStatus::kError) {
                 stats.total_send_failures += 1;
                 stats.interval_send_failures += 1;
                 stats.reconnect_count += 1;
@@ -541,6 +598,7 @@ int RelayMain(const Config& cfg, const Logger& logger) {
                 return false;
             }
 
+            const int sent_size = send_result.bytes;
             stats.total_tx_bytes += static_cast<uint64_t>(sent_size);
             stats.total_tx_msgs += 1;
             stats.interval_tx_bytes += static_cast<uint64_t>(sent_size);

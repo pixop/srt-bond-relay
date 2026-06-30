@@ -1,6 +1,8 @@
 #pragma once
 
 #include <memory>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include <srt.h>
@@ -35,6 +37,31 @@ enum class IoErrorKind {
     kError,
 };
 
+enum class InputReceiveStatus {
+    kData,
+    kError,
+};
+
+struct InputReceiveResult {
+    InputReceiveStatus status = InputReceiveStatus::kError;
+    int bytes = 0;
+};
+
+enum class OutputSendStatus {
+    kSent,
+    kError,
+};
+
+struct OutputSendResult {
+    OutputSendStatus status = OutputSendStatus::kError;
+    int bytes = 0;
+};
+
+enum class InputSwitchPolicy {
+    kRoundRobin,
+    kPreferredPrimary,
+};
+
 struct InputEndpointSpec {
     InputEndpointKind kind = InputEndpointKind::kSrtListener;
     std::vector<SrtUri> uris;
@@ -63,7 +90,7 @@ public:
                              const Logger& logger,
                              MetricsState* metrics,
                              const EnsureAttemptContext& attempt_ctx) = 0;
-    virtual int Receive(const Config& cfg, std::vector<char>* buffer, SRT_MSGCTRL* rx_ctrl) = 0;
+    virtual InputReceiveResult Receive(const Config& cfg, std::vector<char>* buffer, SRT_MSGCTRL* rx_ctrl) = 0;
     virtual void HandleReceiveError(const Config& cfg, const Logger& logger, MetricsState* metrics) = 0;
     virtual SRTSOCKET SessionSocket() const = 0;
     virtual bool IsListening() const = 0;
@@ -73,6 +100,8 @@ public:
     virtual std::string LastReceiveErrorMessage() const = 0;
     virtual IoErrorKind LastEnsureErrorKind() const = 0;
     virtual std::string LastEnsureErrorMessage() const = 0;
+    virtual size_t ActiveInputIndex() const { return 0; }  // zero-based
+    virtual uint64_t InputSwitchCount() const { return 0; }
 };
 
 class OutputSink {
@@ -83,7 +112,7 @@ public:
                              RelayStats* stats,
                              MetricsState* metrics,
                              const EnsureAttemptContext& attempt_ctx) = 0;
-    virtual int Send(const char* data, int size) = 0;
+    virtual OutputSendResult Send(const char* data, int size) = 0;
     virtual void MarkDisconnected(MetricsState* metrics) = 0;
     virtual SRTSOCKET TransportSocket() const = 0;
     virtual OutputMetricsMode MetricsMode() const = 0;
@@ -95,8 +124,11 @@ public:
 };
 
 InputEndpointSpec ParseInputEndpointSpec(const Config& cfg);
+std::vector<InputEndpointSpec> ParseInputEndpointSpecs(const Config& cfg);
 OutputEndpointSpec ParseOutputEndpointSpec(const Config& cfg);
 std::unique_ptr<InputSource> BuildInputSource(const InputEndpointSpec& spec);
+std::unique_ptr<InputSource> BuildInputSource(const Config& cfg, std::vector<InputEndpointSpec> specs);
+const char* InputSwitchPolicyName(InputSwitchPolicy policy);
 std::unique_ptr<OutputSink> BuildOutputSink(const OutputEndpointSpec& spec);
 
 }  // namespace srtrelay

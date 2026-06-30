@@ -138,7 +138,7 @@ public:
         }
     }
 
-    int Send(const char* data, int size) override {
+    OutputSendResult Send(const char* data, int size) override {
         SRT_MSGCTRL tx_ctrl = srt_msgctrl_default;
         SRT_SOCKGROUPDATA tx_group_data[MetricsState::kMaxTrackedMembers] {};
         tx_ctrl.grpdata = tx_group_data;
@@ -147,14 +147,14 @@ public:
         if (rc == SRT_ERROR) {
             send_error_kind_ = IsSrtTimeoutError() ? IoErrorKind::kTimeout : IoErrorKind::kDisconnected;
             send_error_message_ = SrtLastErrorString();
-            return SRT_ERROR;
+            return {OutputSendStatus::kError, 0};
         }
         if (metrics_ != nullptr) {
             UpdateOutputLinkHealthFromMsgCtrl(tx_ctrl, metrics_);
         }
         send_error_kind_ = IoErrorKind::kNone;
         send_error_message_.clear();
-        return rc;
+        return {OutputSendStatus::kSent, rc};
     }
 
     void MarkDisconnected(MetricsState* metrics) override {
@@ -224,7 +224,7 @@ public:
         }
     }
 
-    int Send(const char* data, int size) override {
+    OutputSendResult Send(const char* data, int size) override {
         SRT_MSGCTRL tx_ctrl = srt_msgctrl_default;
         SRT_SOCKGROUPDATA tx_group_data[MetricsState::kMaxTrackedMembers] {};
         tx_ctrl.grpdata = tx_group_data;
@@ -233,14 +233,14 @@ public:
         if (rc == SRT_ERROR) {
             send_error_kind_ = IsSrtTimeoutError() ? IoErrorKind::kTimeout : IoErrorKind::kDisconnected;
             send_error_message_ = SrtLastErrorString();
-            return SRT_ERROR;
+            return {OutputSendStatus::kError, 0};
         }
         if (metrics_ != nullptr) {
             UpdateOutputLinkHealthFromMsgCtrl(tx_ctrl, metrics_);
         }
         send_error_kind_ = IoErrorKind::kNone;
         send_error_message_.clear();
-        return rc;
+        return {OutputSendStatus::kSent, rc};
     }
 
     void MarkDisconnected(MetricsState* metrics) override {
@@ -321,16 +321,16 @@ public:
         metrics->output_connected.store(1, std::memory_order_relaxed);
     }
 
-    int Send(const char* data, int size) override {
+    OutputSendResult Send(const char* data, int size) override {
         const ssize_t sent = ::send(socket_fd_, data, static_cast<size_t>(size), 0);
         if (sent < 0) {
             send_error_kind_ = IsUdpTimeoutErrno(errno) ? IoErrorKind::kTimeout : IoErrorKind::kError;
             send_error_message_ = std::strerror(errno);
-            return SRT_ERROR;
+            return {OutputSendStatus::kError, 0};
         }
         send_error_kind_ = IoErrorKind::kNone;
         send_error_message_.clear();
-        return static_cast<int>(sent);
+        return {OutputSendStatus::kSent, static_cast<int>(sent)};
     }
 
     void MarkDisconnected(MetricsState* metrics) override {
@@ -381,20 +381,20 @@ public:
         metrics->output_connected.store(1, std::memory_order_relaxed);
     }
 
-    int Send(const char* data, int size) override {
+    OutputSendResult Send(const char* data, int size) override {
         int total = 0;
         while (total < size) {
             const ssize_t written = ::write(STDOUT_FILENO, data + total, static_cast<size_t>(size - total));
             if (written < 0) {
                 send_error_kind_ = IsUdpTimeoutErrno(errno) ? IoErrorKind::kTimeout : IoErrorKind::kError;
                 send_error_message_ = std::strerror(errno);
-                return SRT_ERROR;
+                return {OutputSendStatus::kError, 0};
             }
             total += static_cast<int>(written);
         }
         send_error_kind_ = IoErrorKind::kNone;
         send_error_message_.clear();
-        return total;
+        return {OutputSendStatus::kSent, total};
     }
 
     void MarkDisconnected(MetricsState* metrics) override {
