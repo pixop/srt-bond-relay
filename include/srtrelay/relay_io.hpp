@@ -96,6 +96,7 @@ public:
     virtual bool IsListening() const = 0;
     virtual bool IsConnected() const = 0;
     virtual bool IsTerminalEof() const = 0;
+    virtual bool NeedsEnsurePoll() const { return !IsConnected(); }
     virtual IoErrorKind LastReceiveErrorKind() const = 0;
     virtual std::string LastReceiveErrorMessage() const = 0;
     virtual IoErrorKind LastEnsureErrorKind() const = 0;

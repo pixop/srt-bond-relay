@@ -351,18 +351,28 @@ int RelayMain(const Config& cfg, const Logger& logger) {
         metrics.input_switches_total.store(input_source->InputSwitchCount(), std::memory_order_relaxed);
         causality.MaybeCloseIncident(logger, input_source->IsConnected(), output_sink->IsConnected());
 
-        if (!input_source->IsConnected()) {
-            const uint64_t attempt_id = causality.EnsureAttemptStarted(FailureSide::kInput);
-            logger.Log(LogLevel::kInfo,
-                       "input-ensure-attempt",
-                       "side=input",
-                       "attempt_id=" + std::to_string(attempt_id),
-                       "incident_id=" + (causality.ActiveIncidentId().empty() ? std::string("none") : causality.ActiveIncidentId()));
+        const bool input_reconnect_needed = !input_source->IsConnected();
+        if (input_source->NeedsEnsurePoll()) {
+            const uint64_t attempt_id = input_reconnect_needed
+                ? causality.EnsureAttemptStarted(FailureSide::kInput)
+                : 0;
+            if (input_reconnect_needed) {
+                logger.Log(LogLevel::kInfo,
+                           "input-ensure-attempt",
+                           "side=input",
+                           "attempt_id=" + std::to_string(attempt_id),
+                           "incident_id=" + (causality.ActiveIncidentId().empty() ? std::string("none") : causality.ActiveIncidentId()));
+            }
             try {
                 input_source->EnsureReady(
                     cfg, logger, &metrics, EnsureAttemptContext{attempt_id, causality.ActiveIncidentId()});
-                causality.CompleteAttempt(FailureSide::kInput);
+                if (input_reconnect_needed) {
+                    causality.CompleteAttempt(FailureSide::kInput);
+                }
             } catch (const std::exception& ex) {
+                if (!input_reconnect_needed && input_source->IsConnected()) {
+                    continue;
+                }
                 const bool is_timeout = input_source->LastEnsureErrorKind() == IoErrorKind::kTimeout;
                 const std::string message = input_source->LastEnsureErrorMessage().empty()
                                                 ? std::string(ex.what())

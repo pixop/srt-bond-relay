@@ -480,8 +480,12 @@ public:
             return;
         }
         InputSource* primary_source = sources_.at(primary).get();
+        Config primary_probe_cfg = cfg;
+        if (attempt_ctx.attempt_id == 0) {
+            primary_probe_cfg.io_timeout_ms = 1;
+        }
         try {
-            primary_source->EnsureReady(cfg, logger, metrics, attempt_ctx);
+            primary_source->EnsureReady(primary_probe_cfg, logger, metrics, attempt_ctx);
         } catch (...) {
             return;
         }
@@ -570,6 +574,16 @@ public:
             return false;
         }
         return sources_.at(active_index_)->IsTerminalEof();
+    }
+    bool NeedsEnsurePoll() const override {
+        if (!sources_.at(active_index_)->IsConnected()) {
+            return true;
+        }
+        if (policy_ == InputSwitchPolicy::kPreferredPrimary && primary_index_.has_value()) {
+            const size_t primary = *primary_index_;
+            return primary < sources_.size() && primary != active_index_;
+        }
+        return false;
     }
     IoErrorKind LastReceiveErrorKind() const override { return receive_error_kind_; }
     std::string LastReceiveErrorMessage() const override { return receive_error_message_; }
