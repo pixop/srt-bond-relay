@@ -9,6 +9,10 @@ namespace srtrelay {
 
 namespace {
 
+#ifndef SRT_BOND_RELAY_VERSION
+#define SRT_BOND_RELAY_VERSION "dev"
+#endif
+
 bool IsStdinInputSpec(const std::string& input_uri) {
     return input_uri == "stdin" || input_uri == "-" || input_uri == "fd://stdin";
 }
@@ -35,6 +39,7 @@ void PrintUsage() {
         << "  --metrics-port 9464\n"
         << "  --primary-input-index <1..N>\n"
         << "  --switch-mode serial|delayed\n"
+        << "  --version\n"
         << "\nI/O mode notes:\n"
         << "  Input:  srt:// mode=listener|caller, udp:// mode=listener (caller unsupported), stdin aliases: stdin|-|fd://stdin\n"
         << "  Output: srt:// mode=caller|listener, udp:// mode=caller (listener unsupported), stdout aliases: stdout|-|fd://stdout\n"
@@ -47,6 +52,10 @@ void PrintUsage() {
         << "  UDP query options: rcvbuf|sndbuf|reuseaddr|ttl|localip|localport\n"
         << "  --help\n";
 }
+
+const char* SoftwareVersion() { return SRT_BOND_RELAY_VERSION; }
+
+void PrintVersion() { std::cout << "srt-bond-relay " << SoftwareVersion() << '\n'; }
 
 bool ParseBool(const std::string& value) {
     if (value == "true" || value == "1" || value == "yes") return true;
@@ -87,6 +96,9 @@ Config ParseArgs(int argc, char** argv) {
 
         if (arg == "--help" || arg == "-h") {
             PrintUsage();
+            std::exit(0);
+        } else if (arg == "--version" || arg == "-V") {
+            PrintVersion();
             std::exit(0);
         } else if (arg == "--input") {
             cfg.input_uris.push_back(require_value("--input"));

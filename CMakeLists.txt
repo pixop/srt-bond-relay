@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(srt-bond-relay LANGUAGES CXX)
+project(srt-bond-relay VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -96,6 +96,7 @@ add_executable(srt-bond-relay
 )
 
 target_compile_definitions(srt-bond-relay PRIVATE SRT_LINKAGE_MODE="${SRT_LINKAGE}")
+target_compile_definitions(srt-bond-relay PRIVATE SRT_BOND_RELAY_VERSION="${PROJECT_VERSION}")
 
 target_compile_options(srt-bond-relay PRIVATE
     -Wall

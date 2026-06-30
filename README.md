@@ -167,6 +167,7 @@ Common optional flags:
 - `--primary-input-index` (optional, 1-based)
 - `--switch-mode` (`serial` or `delayed`; default `serial`)
 - `--verify-linkage`
+- `--version` (prints relay version and exits)
 
 `--input` accepted values:
 

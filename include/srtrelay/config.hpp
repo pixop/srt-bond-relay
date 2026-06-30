@@ -32,6 +32,8 @@ struct Config {
 };
 
 void PrintUsage();
+const char* SoftwareVersion();
+void PrintVersion();
 bool ParseBool(const std::string& value);
 SwitchMode ParseSwitchMode(const std::string& value);
 const char* SwitchModeName(SwitchMode mode);
