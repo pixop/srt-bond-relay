@@ -18,7 +18,7 @@ docker build \
   -t srt-bond-relay:dev .
 ```
 
-Build static-SRT artifact and copy executable to host (after compile finishes):
+Build static-SRT artifact and copy executable to host (after compile finishes and tests have run successfully):
 
 ```bash
 mkdir -p artifacts/static-srt
@@ -26,6 +26,7 @@ docker build \
   --build-arg SRT_TAG=v1.5.5 \
   --build-arg SRT_LINKAGE=static \
   --build-arg BUILD_TYPE=Release \
+  --build-arg RUN_TESTS=ON \
   --target static-artifact \
   --output type=local,dest=./artifacts/static-srt \
   .

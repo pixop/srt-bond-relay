@@ -4,6 +4,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG SRT_TAG=v1.5.5
 ARG SRT_LINKAGE=dynamic
 ARG BUILD_TYPE=Release
+ARG RUN_TESTS=OFF
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -43,13 +44,20 @@ COPY . /src/srt-bond-relay
 
 ENV PKG_CONFIG_PATH=/opt/pixop-srt/lib/pkgconfig:/opt/pixop-srt/lib64/pkgconfig
 
-RUN cmake -S /src/srt-bond-relay -B /src/srt-bond-relay/build \
-    -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
-    -DCMAKE_PREFIX_PATH=/opt/pixop-srt \
-    -DSRT_LINKAGE="${SRT_LINKAGE}" \
-    -DCMAKE_INSTALL_PREFIX=/usr/local \
-    && cmake --build /src/srt-bond-relay/build --parallel \
-    && cmake --install /src/srt-bond-relay/build
+RUN set -eux; \
+    cmake -S /src/srt-bond-relay -B /src/srt-bond-relay/build \
+      -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+      -DCMAKE_PREFIX_PATH=/opt/pixop-srt \
+      -DSRT_LINKAGE="${SRT_LINKAGE}" \
+      -DCMAKE_INSTALL_PREFIX=/usr/local; \
+    cmake --build /src/srt-bond-relay/build --parallel; \
+    if [ "${RUN_TESTS}" = "ON" ]; then \
+      ctest --test-dir /src/srt-bond-relay/build --output-on-failure; \
+    elif [ "${RUN_TESTS}" != "OFF" ]; then \
+      echo "RUN_TESTS must be ON or OFF (got: ${RUN_TESTS})" >&2; \
+      exit 1; \
+    fi; \
+    cmake --install /src/srt-bond-relay/build
 
 FROM ubuntu:24.04 AS runtime
 
