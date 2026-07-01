@@ -241,16 +241,12 @@ Metrics are refreshed on each stats tick (`--stats-interval-ms`) and include:
 
 ### Metrics Maintainer Workflow
 
-The metrics module is intentionally structured so new metrics can be added without threading logic through multiple duplicated paths.
+Use this simple checklist when adding or changing metrics:
 
-- Stage shared link-slot behavior through side-parameterized helpers (`LinkSide`) so input/output updates stay symmetric.
-- Link-slot storage (`input_tracked.slots` / `output_tracked.slots`) is mutex-protected state. Use `MetricsState::LinkMetricsGuard` before reading or writing slots.
-- Locked-only helpers now enforce this contract in debug builds via `MetricsState::AssertLinkMetricsLocked(...)` (for example, `CompactSlotsLocked` and slot reset helpers).
-- Functions ending in `Locked` require the caller to hold the link-slot lock; functions without that suffix should lock internally when touching slots.
-- Keep scalar Prometheus series in descriptor-style lists inside `RenderPrometheusMetrics` and add new scalar entries there first.
-- Preserve existing `srt_relay_*` metric names and labels for compatibility with dashboards and scripts.
-- For link-slot lifecycle behavior (`snapshot`, `compact`, `status`), use the shared helpers in `src/metrics_link_slots.cpp` instead of side-specific copy/paste.
-- Add or extend `tests/metrics_compat_test.cpp` for deterministic coverage of new metrics and slot-compaction behavior.
+- Keep existing metric names and labels as-is so dashboards do not break.
+- Add new metrics in one place, and mirror input/output behavior consistently.
+- Update `tests/metrics_compat_test.cpp` when metric output or compaction behavior changes.
+- Run a build and check `/metrics` output before merging.
 
 When input mode is `stdin` or `udp://...`:
 
