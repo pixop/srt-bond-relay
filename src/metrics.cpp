@@ -1980,8 +1980,12 @@ std::string RenderPrometheusMetrics(const MetricsState& metrics) {
     emit_u64("srt_relay_output_transport_byte_retrans_current", "gauge", "Current byteRetransTotal on relay output SRT socket.", output_transport_byte_retrans_current);
     emit_u64("srt_relay_output_transport_byte_drop_current", "gauge", "Current byteSndDropTotal on relay output SRT socket.", output_transport_byte_drop_current);
 
-    emit_i64("srt_relay_input_rtt_ms", "gauge", "Input socket RTT in milliseconds.", input_rtt_ms);
-    emit_i64("srt_relay_output_rtt_ms", "gauge", "Output socket RTT in milliseconds.", output_rtt_ms);
+    emit_i64("srt_relay_input_rtt_ms", "gauge",
+             "Input RTT in milliseconds; in bonded mode this is the maximum RTT among connected member links.",
+             input_rtt_ms);
+    emit_i64("srt_relay_output_rtt_ms", "gauge",
+             "Output RTT in milliseconds; in bonded mode this is the maximum RTT among connected member links.",
+             output_rtt_ms);
     emit_i64("srt_relay_input_effective_latency_ms",
              "gauge",
              "Input effective latency in milliseconds (negotiated latency when available, otherwise socket latency, else -1).",

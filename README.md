@@ -252,6 +252,7 @@ Metrics are refreshed on each stats tick (`--stats-interval-ms`) and include:
 - Input bonded group drop counters at group/session level (`srt_relay_input_group_packet_drop_*`, `srt_relay_input_group_byte_drop_*`)
 - Input belated counters at member/transport level (`srt_relay_input_transport_packet_belated_*`, `srt_relay_input_link_packet_belated_*`)
 - Session RTT/effective latency and last-activity timestamps (`srt_relay_input_rtt_ms`, `srt_relay_output_rtt_ms`, `srt_relay_input_effective_latency_ms`, `srt_relay_output_effective_latency_ms`, `srt_relay_last_*_unix_seconds`)
+  - In bonded SRT mode, `srt_relay_*_rtt_ms` reflects the maximum RTT among connected member links (worst connected-link RTT), not the minimum or average.
 
 ### Metrics Maintainer Workflow
 
