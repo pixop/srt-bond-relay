@@ -676,7 +676,7 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 8,
         "x": 0,
         "y": 20
       },
@@ -692,14 +692,19 @@
           "refId": "B"
         },
         {
+          "expr": "sum(rate(srt_relay_input_group_byte_drop_total{instance=~\"$relay_instance\"}[1m])) * 8",
+          "legendFormat": "Input Group Drop bps",
+          "refId": "C"
+        },
+        {
           "expr": "sum(rate(srt_relay_output_transport_byte_retrans_total{instance=~\"$relay_instance\"}[1m])) * 8",
           "legendFormat": "Output Retransmit bps",
-          "refId": "C"
+          "refId": "D"
         },
         {
           "expr": "sum(rate(srt_relay_output_transport_byte_drop_total{instance=~\"$relay_instance\"}[1m])) * 8",
           "legendFormat": "Output Drop bps",
-          "refId": "D"
+          "refId": "E"
         }
       ],
       "options": {
@@ -746,6 +751,73 @@
     },
     {
       "type": "timeseries",
+      "title": "Input Drop & Belated (pkt/s)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 20
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(srt_relay_input_group_packet_drop_total{instance=~\"$relay_instance\"}[1m]))",
+          "legendFormat": "Input Group Drop pkt/s",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(srt_relay_input_transport_packet_belated_total{instance=~\"$relay_instance\"}[1m]))",
+          "legendFormat": "Input Member Belated pkt/s",
+          "refId": "B"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "drawStyle": "line",
+          "lineWidth": 2,
+          "fillOpacity": 8,
+          "showPoints": "never",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "green"
+              },
+              {
+                "value": 1,
+                "color": "yellow"
+              },
+              {
+                "value": 50,
+                "color": "red"
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
       "title": "Input vs Output RTT",
       "datasource": {
         "type": "prometheus",
@@ -753,8 +825,8 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 12,
+        "w": 8,
+        "x": 16,
         "y": 20
       },
       "targets": [

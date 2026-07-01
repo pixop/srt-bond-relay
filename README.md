@@ -233,6 +233,8 @@ Metrics are refreshed on each stats tick (`--stats-interval-ms`) and include:
 - Bond mode gauges for both directions (`srt_relay_input_bond_mode{mode=...}`, `srt_relay_output_bond_mode{mode=...}`)
 - Input and output link health (`*_links_total|healthy|running`) plus per-link stable-slot metrics (`*_link_connected`, `*_link_*_bytes_*`, `*_link_rtt_ms` with `link_index`/`socket_id` labels)
 - Transport-level SRT counters for both directions (total/current recv or sent bytes, unique bytes, retrans, loss/drop, tracked member count)
+- Input bonded group drop counters at group/session level (`srt_relay_input_group_packet_drop_*`, `srt_relay_input_group_byte_drop_*`)
+- Input belated counters at member/transport level (`srt_relay_input_transport_packet_belated_*`, `srt_relay_input_link_packet_belated_*`)
 - Session RTT/effective latency and last-activity timestamps (`srt_relay_input_rtt_ms`, `srt_relay_output_rtt_ms`, `srt_relay_input_effective_latency_ms`, `srt_relay_output_effective_latency_ms`, `srt_relay_last_*_unix_seconds`)
 
 When input mode is `stdin` or `udp://...`:

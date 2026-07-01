@@ -32,6 +32,9 @@ MetricsState::MetricsState() {
         input_link_tx_bytes_current[i].store(0, std::memory_order_relaxed);
         input_link_rx_bytes_last[i].store(0, std::memory_order_relaxed);
         input_link_tx_bytes_last[i].store(0, std::memory_order_relaxed);
+        input_link_packet_belated_total[i].store(0, std::memory_order_relaxed);
+        input_link_packet_belated_current[i].store(0, std::memory_order_relaxed);
+        input_link_packet_belated_last[i].store(0, std::memory_order_relaxed);
         input_link_rtt_ms[i].store(-1, std::memory_order_relaxed);
         output_member_ids[i].store(static_cast<int64_t>(SRT_INVALID_SOCK), std::memory_order_relaxed);
         output_member_connected[i].store(0, std::memory_order_relaxed);
@@ -960,6 +963,9 @@ void UpdateInputLinkHealthFallbackSingleSocket(SRTSOCKET input_session_sock, Met
             metrics->input_link_tx_bytes_last[i].store(0, std::memory_order_relaxed);
             metrics->input_link_rx_bytes_total[i].store(0, std::memory_order_relaxed);
             metrics->input_link_tx_bytes_total[i].store(0, std::memory_order_relaxed);
+            metrics->input_link_packet_belated_current[i].store(0, std::memory_order_relaxed);
+            metrics->input_link_packet_belated_last[i].store(0, std::memory_order_relaxed);
+            metrics->input_link_packet_belated_total[i].store(0, std::memory_order_relaxed);
         }
         metrics->input_links_snapshot_count.store(0, std::memory_order_relaxed);
         return;
@@ -1036,6 +1042,9 @@ void SaveInputMemberSnapshot(const std::vector<SRT_SOCKGROUPDATA>& group_members
             metrics->input_link_tx_bytes_last[slot].store(0, std::memory_order_relaxed);
             metrics->input_link_rx_bytes_total[slot].store(0, std::memory_order_relaxed);
             metrics->input_link_tx_bytes_total[slot].store(0, std::memory_order_relaxed);
+            metrics->input_link_packet_belated_current[slot].store(0, std::memory_order_relaxed);
+            metrics->input_link_packet_belated_last[slot].store(0, std::memory_order_relaxed);
+            metrics->input_link_packet_belated_total[slot].store(0, std::memory_order_relaxed);
             break;
         }
     }
@@ -1333,6 +1342,9 @@ CompactResult CompactInputSlotsLocked(MetricsState* metrics) {
     std::array<uint64_t, MetricsState::kMaxTrackedMembers> tx_current {};
     std::array<uint64_t, MetricsState::kMaxTrackedMembers> rx_last {};
     std::array<uint64_t, MetricsState::kMaxTrackedMembers> tx_last {};
+    std::array<uint64_t, MetricsState::kMaxTrackedMembers> belated_total {};
+    std::array<uint64_t, MetricsState::kMaxTrackedMembers> belated_current {};
+    std::array<uint64_t, MetricsState::kMaxTrackedMembers> belated_last {};
     std::array<int64_t, MetricsState::kMaxTrackedMembers> rtt_ms {};
 
     std::array<size_t, MetricsState::kMaxTrackedMembers> keep_slots {};
@@ -1367,6 +1379,9 @@ CompactResult CompactInputSlotsLocked(MetricsState* metrics) {
         tx_current[dst] = metrics->input_link_tx_bytes_current[src].load(std::memory_order_relaxed);
         rx_last[dst] = metrics->input_link_rx_bytes_last[src].load(std::memory_order_relaxed);
         tx_last[dst] = metrics->input_link_tx_bytes_last[src].load(std::memory_order_relaxed);
+        belated_total[dst] = metrics->input_link_packet_belated_total[src].load(std::memory_order_relaxed);
+        belated_current[dst] = metrics->input_link_packet_belated_current[src].load(std::memory_order_relaxed);
+        belated_last[dst] = metrics->input_link_packet_belated_last[src].load(std::memory_order_relaxed);
         rtt_ms[dst] = metrics->input_link_rtt_ms[src].load(std::memory_order_relaxed);
     }
 
@@ -1380,6 +1395,9 @@ CompactResult CompactInputSlotsLocked(MetricsState* metrics) {
         tx_current[i] = 0;
         rx_last[i] = 0;
         tx_last[i] = 0;
+        belated_total[i] = 0;
+        belated_current[i] = 0;
+        belated_last[i] = 0;
         rtt_ms[i] = -1;
     }
 
@@ -1393,6 +1411,9 @@ CompactResult CompactInputSlotsLocked(MetricsState* metrics) {
         metrics->input_link_tx_bytes_current[i].store(tx_current[i], std::memory_order_relaxed);
         metrics->input_link_rx_bytes_last[i].store(rx_last[i], std::memory_order_relaxed);
         metrics->input_link_tx_bytes_last[i].store(tx_last[i], std::memory_order_relaxed);
+        metrics->input_link_packet_belated_total[i].store(belated_total[i], std::memory_order_relaxed);
+        metrics->input_link_packet_belated_current[i].store(belated_current[i], std::memory_order_relaxed);
+        metrics->input_link_packet_belated_last[i].store(belated_last[i], std::memory_order_relaxed);
         metrics->input_link_rtt_ms[i].store(rtt_ms[i], std::memory_order_relaxed);
     }
     metrics->input_links_snapshot_count.store(static_cast<int64_t>(keep_count), std::memory_order_relaxed);
@@ -1768,6 +1789,7 @@ void UpdateInputLinkTrafficPerSlot(MetricsState* metrics, const SocketStatsSnaps
         if (identity_key == 0) {
             metrics->input_link_rx_bytes_current[i].store(0, std::memory_order_relaxed);
             metrics->input_link_tx_bytes_current[i].store(0, std::memory_order_relaxed);
+            metrics->input_link_packet_belated_current[i].store(0, std::memory_order_relaxed);
             metrics->input_link_rtt_ms[i].store(-1, std::memory_order_relaxed);
             continue;
         }
@@ -1777,6 +1799,7 @@ void UpdateInputLinkTrafficPerSlot(MetricsState* metrics, const SocketStatsSnaps
         if (!member_connected || member_sock == SRT_INVALID_SOCK || member_sock == 0) {
             metrics->input_link_rx_bytes_current[i].store(0, std::memory_order_relaxed);
             metrics->input_link_tx_bytes_current[i].store(0, std::memory_order_relaxed);
+            metrics->input_link_packet_belated_current[i].store(0, std::memory_order_relaxed);
             metrics->input_link_rtt_ms[i].store(-1, std::memory_order_relaxed);
             continue;
         }
@@ -1789,19 +1812,26 @@ void UpdateInputLinkTrafficPerSlot(MetricsState* metrics, const SocketStatsSnaps
 
         const auto rx_current = static_cast<uint64_t>(stats.byteRecvTotal);
         const auto tx_current = static_cast<uint64_t>(stats.byteSentTotal);
+        const auto belated_current = static_cast<uint64_t>(stats.pktRcvBelated);
         const auto rx_last = metrics->input_link_rx_bytes_last[i].load(std::memory_order_relaxed);
         const auto tx_last = metrics->input_link_tx_bytes_last[i].load(std::memory_order_relaxed);
+        const auto belated_last = metrics->input_link_packet_belated_last[i].load(std::memory_order_relaxed);
         const auto rx_total = metrics->input_link_rx_bytes_total[i].load(std::memory_order_relaxed) +
                               CounterDeltaWithReset(rx_last, rx_current);
         const auto tx_total = metrics->input_link_tx_bytes_total[i].load(std::memory_order_relaxed) +
                               CounterDeltaWithReset(tx_last, tx_current);
+        const auto belated_total = metrics->input_link_packet_belated_total[i].load(std::memory_order_relaxed) +
+                                   CounterDeltaWithReset(belated_last, belated_current);
         const auto rtt_ms = static_cast<int64_t>(stats.msRTT);
         metrics->input_link_rx_bytes_total[i].store(rx_total, std::memory_order_relaxed);
         metrics->input_link_tx_bytes_total[i].store(tx_total, std::memory_order_relaxed);
+        metrics->input_link_packet_belated_total[i].store(belated_total, std::memory_order_relaxed);
         metrics->input_link_rx_bytes_current[i].store(rx_current, std::memory_order_relaxed);
         metrics->input_link_tx_bytes_current[i].store(tx_current, std::memory_order_relaxed);
+        metrics->input_link_packet_belated_current[i].store(belated_current, std::memory_order_relaxed);
         metrics->input_link_rx_bytes_last[i].store(rx_current, std::memory_order_relaxed);
         metrics->input_link_tx_bytes_last[i].store(tx_current, std::memory_order_relaxed);
+        metrics->input_link_packet_belated_last[i].store(belated_current, std::memory_order_relaxed);
         metrics->input_link_rtt_ms[i].store(rtt_ms, std::memory_order_relaxed);
     }
 }
@@ -1855,7 +1885,51 @@ void UpdateOutputLinkTrafficPerSlot(MetricsState* metrics, const SocketStatsSnap
     }
 }
 
-void UpdateTransportTrafficMetrics(SRTSOCKET output_sock, MetricsState* metrics) {
+void UpdateTransportTrafficMetrics(SRTSOCKET input_session_sock, SRTSOCKET output_sock, MetricsState* metrics) {
+    uint64_t input_group_packet_drop_total = metrics->input_group_packet_drop_total.load(std::memory_order_relaxed);
+    uint64_t input_group_byte_drop_total = metrics->input_group_byte_drop_total.load(std::memory_order_relaxed);
+    int64_t input_group_drop_sockets_tracked = 0;
+    uint64_t input_group_packet_drop_current = 0;
+    uint64_t input_group_byte_drop_current = 0;
+    std::unordered_set<SRTSOCKET> input_group_sockets_with_stats;
+    input_group_sockets_with_stats.reserve(1);
+    if (input_session_sock != SRT_INVALID_SOCK && input_session_sock != 0) {
+        SRTSOCKET input_group_sock = srt_groupof(input_session_sock);
+        if (input_group_sock == SRT_INVALID_SOCK || input_group_sock == 0) {
+            input_group_sock = input_session_sock;
+        }
+        SRT_TRACEBSTATS input_group_stats {};
+        bool has_input_group_stats = (srt_bstats(input_group_sock, &input_group_stats, 0) == 0);
+        if (!has_input_group_stats && input_group_sock != input_session_sock) {
+            has_input_group_stats = (srt_bstats(input_session_sock, &input_group_stats, 0) == 0);
+            if (has_input_group_stats) {
+                input_group_sock = input_session_sock;
+            }
+        }
+        if (has_input_group_stats) {
+            input_group_sockets_with_stats.insert(input_group_sock);
+            input_group_drop_sockets_tracked = 1;
+            input_group_packet_drop_current = static_cast<uint64_t>(input_group_stats.pktRcvDropTotal);
+            input_group_byte_drop_current = static_cast<uint64_t>(input_group_stats.byteRcvDropTotal);
+            auto& prev = metrics->input_group_drop_last_by_socket[input_group_sock];
+            input_group_packet_drop_total += CounterDeltaWithReset(prev.packet_drop_total, input_group_packet_drop_current);
+            input_group_byte_drop_total += CounterDeltaWithReset(prev.byte_drop_total, input_group_byte_drop_current);
+            prev.packet_drop_total = input_group_packet_drop_current;
+            prev.byte_drop_total = input_group_byte_drop_current;
+        }
+    }
+    std::unordered_map<SRTSOCKET, GroupDropCounterSnapshot> next_input_group_last;
+    next_input_group_last.reserve(input_group_sockets_with_stats.size());
+    for (const auto sock : input_group_sockets_with_stats) {
+        next_input_group_last.emplace(sock, metrics->input_group_drop_last_by_socket[sock]);
+    }
+    metrics->input_group_drop_last_by_socket.swap(next_input_group_last);
+    metrics->input_group_packet_drop_total.store(input_group_packet_drop_total, std::memory_order_relaxed);
+    metrics->input_group_byte_drop_total.store(input_group_byte_drop_total, std::memory_order_relaxed);
+    metrics->input_group_drop_sockets_tracked.store(input_group_drop_sockets_tracked, std::memory_order_relaxed);
+    metrics->input_group_packet_drop_current.store(input_group_packet_drop_current, std::memory_order_relaxed);
+    metrics->input_group_byte_drop_current.store(input_group_byte_drop_current, std::memory_order_relaxed);
+
     const auto member_sockets = GetInputMemberSocketsSnapshot(*metrics);
     const auto input_stats_by_socket = CollectSocketStatsSnapshot(member_sockets);
     UpdateInputLinkTrafficPerSlot(metrics, input_stats_by_socket);
@@ -1865,10 +1939,12 @@ void UpdateTransportTrafficMetrics(SRTSOCKET output_sock, MetricsState* metrics)
     uint64_t input_byte_recv_unique_total = metrics->input_transport_byte_recv_unique_total.load(std::memory_order_relaxed);
     uint64_t input_byte_retrans_total = metrics->input_transport_byte_retrans_total.load(std::memory_order_relaxed);
     uint64_t input_byte_loss_total = metrics->input_transport_byte_loss_total.load(std::memory_order_relaxed);
+    uint64_t input_packet_belated_total = metrics->input_transport_packet_belated_total.load(std::memory_order_relaxed);
     uint64_t input_byte_recv_current = 0;
     uint64_t input_byte_recv_unique_current = 0;
     uint64_t input_byte_retrans_current = 0;
     uint64_t input_byte_loss_current = 0;
+    uint64_t input_packet_belated_current = 0;
 
     for (const auto& [member_sock, in_stats] : input_stats_by_socket) {
         sockets_with_stats.insert(member_sock);
@@ -1877,16 +1953,19 @@ void UpdateTransportTrafficMetrics(SRTSOCKET output_sock, MetricsState* metrics)
         input_byte_recv_unique_current += static_cast<uint64_t>(in_stats.byteRecvUniqueTotal);
         input_byte_retrans_current += static_cast<uint64_t>(in_stats.byteRetransTotal);
         input_byte_loss_current += static_cast<uint64_t>(in_stats.byteRcvLossTotal);
+        input_packet_belated_current += static_cast<uint64_t>(in_stats.pktRcvBelated);
 
         auto& prev = metrics->input_transport_last_by_socket[member_sock];
         input_byte_recv_total += CounterDeltaWithReset(prev.byte_recv_total, static_cast<uint64_t>(in_stats.byteRecvTotal));
         input_byte_recv_unique_total += CounterDeltaWithReset(prev.byte_recv_unique_total, static_cast<uint64_t>(in_stats.byteRecvUniqueTotal));
         input_byte_retrans_total += CounterDeltaWithReset(prev.byte_retrans_total, static_cast<uint64_t>(in_stats.byteRetransTotal));
         input_byte_loss_total += CounterDeltaWithReset(prev.byte_loss_total, static_cast<uint64_t>(in_stats.byteRcvLossTotal));
+        input_packet_belated_total += CounterDeltaWithReset(prev.packet_belated_total, static_cast<uint64_t>(in_stats.pktRcvBelated));
         prev.byte_recv_total = static_cast<uint64_t>(in_stats.byteRecvTotal);
         prev.byte_recv_unique_total = static_cast<uint64_t>(in_stats.byteRecvUniqueTotal);
         prev.byte_retrans_total = static_cast<uint64_t>(in_stats.byteRetransTotal);
         prev.byte_loss_total = static_cast<uint64_t>(in_stats.byteRcvLossTotal);
+        prev.packet_belated_total = static_cast<uint64_t>(in_stats.pktRcvBelated);
     }
 
     std::unordered_map<SRTSOCKET, TransportCounterSnapshot> next_last;
@@ -1901,10 +1980,17 @@ void UpdateTransportTrafficMetrics(SRTSOCKET output_sock, MetricsState* metrics)
     metrics->input_transport_byte_recv_unique_total.store(input_byte_recv_unique_total, std::memory_order_relaxed);
     metrics->input_transport_byte_retrans_total.store(input_byte_retrans_total, std::memory_order_relaxed);
     metrics->input_transport_byte_loss_total.store(input_byte_loss_total, std::memory_order_relaxed);
+    metrics->input_transport_packet_belated_total.store(input_packet_belated_total, std::memory_order_relaxed);
     metrics->input_transport_byte_recv_current.store(input_byte_recv_current, std::memory_order_relaxed);
     metrics->input_transport_byte_recv_unique_current.store(input_byte_recv_unique_current, std::memory_order_relaxed);
     metrics->input_transport_byte_retrans_current.store(input_byte_retrans_current, std::memory_order_relaxed);
     metrics->input_transport_byte_loss_current.store(input_byte_loss_current, std::memory_order_relaxed);
+    metrics->input_transport_packet_belated_current.store(input_packet_belated_current, std::memory_order_relaxed);
+    metrics->input_group_packet_drop_total.store(input_group_packet_drop_total, std::memory_order_relaxed);
+    metrics->input_group_byte_drop_total.store(input_group_byte_drop_total, std::memory_order_relaxed);
+    metrics->input_group_drop_sockets_tracked.store(input_group_drop_sockets_tracked, std::memory_order_relaxed);
+    metrics->input_group_packet_drop_current.store(input_group_packet_drop_current, std::memory_order_relaxed);
+    metrics->input_group_byte_drop_current.store(input_group_byte_drop_current, std::memory_order_relaxed);
 
     std::vector<SRTSOCKET> output_member_sockets = GetOutputMemberSocketsSnapshot(*metrics);
     if (output_member_sockets.empty() && output_sock != SRT_INVALID_SOCK) {
@@ -2047,11 +2133,18 @@ std::string RenderPrometheusMetrics(const MetricsState& metrics) {
     const auto input_transport_byte_recv_unique_total = metrics.input_transport_byte_recv_unique_total.load(std::memory_order_relaxed);
     const auto input_transport_byte_retrans_total = metrics.input_transport_byte_retrans_total.load(std::memory_order_relaxed);
     const auto input_transport_byte_loss_total = metrics.input_transport_byte_loss_total.load(std::memory_order_relaxed);
+    const auto input_transport_packet_belated_total = metrics.input_transport_packet_belated_total.load(std::memory_order_relaxed);
     const auto input_transport_members_total = metrics.input_transport_members_total.load(std::memory_order_relaxed);
     const auto input_transport_byte_recv_current = metrics.input_transport_byte_recv_current.load(std::memory_order_relaxed);
     const auto input_transport_byte_recv_unique_current = metrics.input_transport_byte_recv_unique_current.load(std::memory_order_relaxed);
     const auto input_transport_byte_retrans_current = metrics.input_transport_byte_retrans_current.load(std::memory_order_relaxed);
     const auto input_transport_byte_loss_current = metrics.input_transport_byte_loss_current.load(std::memory_order_relaxed);
+    const auto input_transport_packet_belated_current = metrics.input_transport_packet_belated_current.load(std::memory_order_relaxed);
+    const auto input_group_packet_drop_total = metrics.input_group_packet_drop_total.load(std::memory_order_relaxed);
+    const auto input_group_byte_drop_total = metrics.input_group_byte_drop_total.load(std::memory_order_relaxed);
+    const auto input_group_drop_sockets_tracked = metrics.input_group_drop_sockets_tracked.load(std::memory_order_relaxed);
+    const auto input_group_packet_drop_current = metrics.input_group_packet_drop_current.load(std::memory_order_relaxed);
+    const auto input_group_byte_drop_current = metrics.input_group_byte_drop_current.load(std::memory_order_relaxed);
     const auto output_transport_byte_sent_total = metrics.output_transport_byte_sent_total.load(std::memory_order_relaxed);
     const auto output_transport_byte_sent_unique_total = metrics.output_transport_byte_sent_unique_total.load(std::memory_order_relaxed);
     const auto output_transport_byte_retrans_total = metrics.output_transport_byte_retrans_total.load(std::memory_order_relaxed);
@@ -2244,6 +2337,12 @@ std::string RenderPrometheusMetrics(const MetricsState& metrics) {
     emit_input_link_metric_u64("srt_relay_input_link_tx_bytes_current", "gauge",
                                "Current per-link byteSentTotal for each stable input link slot.",
                                metrics.input_link_tx_bytes_current);
+    emit_input_link_metric_u64("srt_relay_input_link_packet_belated_total", "counter",
+                               "Monotonic per-link belated packets ignored for playout for each stable input link slot.",
+                               metrics.input_link_packet_belated_total);
+    emit_input_link_metric_u64("srt_relay_input_link_packet_belated_current", "gauge",
+                               "Current per-link pktRcvBelated for each stable input link slot.",
+                               metrics.input_link_packet_belated_current);
     emit_input_link_metric_i64("srt_relay_input_link_rtt_ms", "gauge",
                                "Per-link RTT in milliseconds for each stable input link slot.",
                                metrics.input_link_rtt_ms);
@@ -2270,11 +2369,18 @@ std::string RenderPrometheusMetrics(const MetricsState& metrics) {
     emit_u64("srt_relay_input_transport_byte_recv_unique_total", "counter", "Monotonic input transport unique bytes received across tracked SRT member sockets.", input_transport_byte_recv_unique_total);
     emit_u64("srt_relay_input_transport_byte_retrans_total", "counter", "Monotonic input transport retransmitted bytes across tracked SRT member sockets.", input_transport_byte_retrans_total);
     emit_u64("srt_relay_input_transport_byte_loss_total", "counter", "Monotonic input transport reported lost bytes across tracked SRT member sockets.", input_transport_byte_loss_total);
+    emit_u64("srt_relay_input_transport_packet_belated_total", "counter", "Monotonic input transport belated packets (sum of pktRcvBelated) across tracked SRT member sockets.", input_transport_packet_belated_total);
     emit_i64("srt_relay_input_transport_members_tracked", "gauge", "Number of input SRT member sockets tracked for transport metrics.", input_transport_members_total);
     emit_u64("srt_relay_input_transport_byte_recv_current", "gauge", "Current summed byteRecvTotal across tracked SRT member sockets.", input_transport_byte_recv_current);
     emit_u64("srt_relay_input_transport_byte_recv_unique_current", "gauge", "Current summed byteRecvUniqueTotal across tracked SRT member sockets.", input_transport_byte_recv_unique_current);
     emit_u64("srt_relay_input_transport_byte_retrans_current", "gauge", "Current summed byteRetransTotal across tracked SRT member sockets.", input_transport_byte_retrans_current);
     emit_u64("srt_relay_input_transport_byte_loss_current", "gauge", "Current summed byteRcvLossTotal across tracked SRT member sockets.", input_transport_byte_loss_current);
+    emit_u64("srt_relay_input_transport_packet_belated_current", "gauge", "Current summed pktRcvBelated across tracked SRT member sockets.", input_transport_packet_belated_current);
+    emit_u64("srt_relay_input_group_packet_drop_total", "counter", "Monotonic input bonded group too-late packet drops (pktRcvDropTotal) on the active input group/session socket.", input_group_packet_drop_total);
+    emit_u64("srt_relay_input_group_byte_drop_total", "counter", "Monotonic input bonded group too-late byte drops (byteRcvDropTotal) on the active input group/session socket.", input_group_byte_drop_total);
+    emit_i64("srt_relay_input_group_drop_sockets_tracked", "gauge", "Number of input group/session sockets tracked for group-drop metrics.", input_group_drop_sockets_tracked);
+    emit_u64("srt_relay_input_group_packet_drop_current", "gauge", "Current pktRcvDropTotal on the active input group/session socket.", input_group_packet_drop_current);
+    emit_u64("srt_relay_input_group_byte_drop_current", "gauge", "Current byteRcvDropTotal on the active input group/session socket.", input_group_byte_drop_current);
 
     emit_u64("srt_relay_output_transport_byte_sent_total", "counter", "Monotonic output transport bytes sent on relay output SRT socket (includes retransmissions).", output_transport_byte_sent_total);
     emit_u64("srt_relay_output_transport_byte_sent_unique_total", "counter", "Monotonic output transport unique bytes sent on relay output SRT socket.", output_transport_byte_sent_unique_total);
@@ -2506,7 +2612,8 @@ void MaybeLogStats(const Config& cfg,
     UpdateOutputBondModeMetric(output_metrics_mode == OutputMetricsMode::kSrtSocket ? output_sock : SRT_INVALID_SOCK, metrics);
     UpdateInputLinkHealthMetrics(input_session_sock, metrics);
     UpdateOutputLinkHealthMetrics(output_metrics_mode == OutputMetricsMode::kSrtSocket ? output_sock : SRT_INVALID_SOCK, metrics);
-    UpdateTransportTrafficMetrics(output_metrics_mode == OutputMetricsMode::kSrtSocket ? output_sock : SRT_INVALID_SOCK,
+    UpdateTransportTrafficMetrics(input_session_sock,
+                                  output_metrics_mode == OutputMetricsMode::kSrtSocket ? output_sock : SRT_INVALID_SOCK,
                                   metrics);
     EmitMemberTransitionEvents(logger, metrics, active_incident_id);
     int64_t max_input_link_rtt_ms = -1;
@@ -2526,6 +2633,9 @@ void MaybeLogStats(const Config& cfg,
     const auto output_links_healthy = metrics->output_links_healthy.load(std::memory_order_relaxed);
     const auto output_links_running = metrics->output_links_running.load(std::memory_order_relaxed);
     const auto input_transport_byte_recv_total = metrics->input_transport_byte_recv_total.load(std::memory_order_relaxed);
+    const auto input_group_packet_drop_total = metrics->input_group_packet_drop_total.load(std::memory_order_relaxed);
+    const auto input_group_byte_drop_total = metrics->input_group_byte_drop_total.load(std::memory_order_relaxed);
+    const auto input_transport_packet_belated_total = metrics->input_transport_packet_belated_total.load(std::memory_order_relaxed);
     const auto output_transport_byte_sent_total = metrics->output_transport_byte_sent_total.load(std::memory_order_relaxed);
     const auto input_bond_mode = metrics->input_bond_mode.load(std::memory_order_relaxed);
     const auto output_bond_mode = metrics->output_bond_mode.load(std::memory_order_relaxed);
@@ -2576,6 +2686,9 @@ void MaybeLogStats(const Config& cfg,
                "input_link_status=" + input_link_status,
                "output_link_status=" + output_link_status,
                "input_transport_byte_recv_total=" + std::to_string(input_transport_byte_recv_total),
+               "input_group_packet_drop_total=" + std::to_string(input_group_packet_drop_total),
+               "input_group_byte_drop_total=" + std::to_string(input_group_byte_drop_total),
+               "input_transport_packet_belated_total=" + std::to_string(input_transport_packet_belated_total),
                "output_transport_byte_sent_total=" + std::to_string(output_transport_byte_sent_total),
                "input_effective_latency_ms=" + std::to_string(input_effective_latency_ms),
                "output_effective_latency_ms=" + std::to_string(output_effective_latency_ms),

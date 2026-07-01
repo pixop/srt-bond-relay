@@ -27,12 +27,28 @@ bash scripts/local-bond-lab.sh fail-a
 bash scripts/local-bond-lab.sh restore-a
 bash scripts/local-bond-lab.sh fail-b
 bash scripts/local-bond-lab.sh restore-b
+bash scripts/local-bond-lab.sh impair
+bash scripts/local-bond-lab.sh impair-belated
+bash scripts/local-bond-lab.sh impair-drop
+bash scripts/local-bond-lab.sh netem-status
+bash scripts/local-bond-lab.sh restore-impair
 bash scripts/local-bond-lab.sh down
 ```
 
 `fail-a/fail-b` now simulate link loss by packet-drop rules in sender namespace
 instead of disconnecting Docker networks, which makes rejoin behavior more
 deterministic.
+
+`impair` applies `tc netem` on both sender relay-path interfaces to inject
+delay/jitter/loss/reorder without hard-disconnecting sessions. This is useful
+for triggering group-level `drop` / `belated` receiver counters.
+
+`impair-belated` applies a low-drop profile (delay constrained below relay
+input latency budget) to avoid forcing regular group drops.
+
+`impair-drop` applies a deadline-violation profile (delay above relay input
+latency on both legs) to force visible group-level drop counters in bonded
+broadcast tests.
 
 The sender service is started under a restart loop. If both links fail and
 `srt-test-live` exits with `Connection was broken`, it automatically restarts

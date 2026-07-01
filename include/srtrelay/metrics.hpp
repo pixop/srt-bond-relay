@@ -50,8 +50,14 @@ struct TransportCounterSnapshot {
     uint64_t byte_recv_unique_total = 0;
     uint64_t byte_retrans_total = 0;
     uint64_t byte_loss_total = 0;
+    uint64_t packet_belated_total = 0;
     uint64_t byte_sent_total = 0;
     uint64_t byte_sent_unique_total = 0;
+    uint64_t byte_drop_total = 0;
+};
+
+struct GroupDropCounterSnapshot {
+    uint64_t packet_drop_total = 0;
     uint64_t byte_drop_total = 0;
 };
 
@@ -88,17 +94,27 @@ struct MetricsState {
     std::atomic<uint64_t> input_transport_byte_recv_unique_total{0};
     std::atomic<uint64_t> input_transport_byte_retrans_total{0};
     std::atomic<uint64_t> input_transport_byte_loss_total{0};
+    std::atomic<uint64_t> input_transport_packet_belated_total{0};
     std::atomic<int64_t> input_transport_members_total{0};
     std::atomic<uint64_t> input_transport_byte_recv_current{0};
     std::atomic<uint64_t> input_transport_byte_recv_unique_current{0};
     std::atomic<uint64_t> input_transport_byte_retrans_current{0};
     std::atomic<uint64_t> input_transport_byte_loss_current{0};
+    std::atomic<uint64_t> input_transport_packet_belated_current{0};
+    std::atomic<uint64_t> input_group_packet_drop_total{0};
+    std::atomic<uint64_t> input_group_byte_drop_total{0};
+    std::atomic<int64_t> input_group_drop_sockets_tracked{0};
+    std::atomic<uint64_t> input_group_packet_drop_current{0};
+    std::atomic<uint64_t> input_group_byte_drop_current{0};
     std::array<std::atomic<uint64_t>, kMaxTrackedMembers> input_link_rx_bytes_total {};
     std::array<std::atomic<uint64_t>, kMaxTrackedMembers> input_link_tx_bytes_total {};
     std::array<std::atomic<uint64_t>, kMaxTrackedMembers> input_link_rx_bytes_current {};
     std::array<std::atomic<uint64_t>, kMaxTrackedMembers> input_link_tx_bytes_current {};
     std::array<std::atomic<uint64_t>, kMaxTrackedMembers> input_link_rx_bytes_last {};
     std::array<std::atomic<uint64_t>, kMaxTrackedMembers> input_link_tx_bytes_last {};
+    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> input_link_packet_belated_total {};
+    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> input_link_packet_belated_current {};
+    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> input_link_packet_belated_last {};
     std::array<std::atomic<int64_t>, kMaxTrackedMembers> input_link_rtt_ms {};
 
     std::atomic<uint64_t> output_transport_byte_sent_total{0};
@@ -154,6 +170,7 @@ struct MetricsState {
 
     std::unordered_map<SRTSOCKET, TransportCounterSnapshot> input_transport_last_by_socket;
     std::unordered_map<SRTSOCKET, TransportCounterSnapshot> output_transport_last_by_socket;
+    std::unordered_map<SRTSOCKET, GroupDropCounterSnapshot> input_group_drop_last_by_socket;
 
     std::array<std::array<std::atomic<uint64_t>, kTimeoutTypes>, kFailureSides> timeouts_total {};
     std::array<std::array<std::atomic<uint64_t>, kReasonCodes>, kFailureSides> disconnects_total {};
