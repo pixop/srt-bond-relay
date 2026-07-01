@@ -1,7 +1,6 @@
 #include <arpa/inet.h>
 
 #include <cassert>
-#include <functional>
 #include <iostream>
 #include <string>
 #include <sstream>
@@ -11,28 +10,12 @@
 #include "srtrelay/config.hpp"
 #include "srtrelay/metrics.hpp"
 #include "srtrelay/relay_io.hpp"
+#include "test_expect.hpp"
 
 namespace {
 
-void ExpectContains(const std::string& haystack, const std::string& needle) {
-    if (haystack.find(needle) == std::string::npos) {
-        std::cerr << "missing expected snippet: " << needle << "\n";
-        std::abort();
-    }
-}
-
-void ExpectThrows(const std::function<void()>& fn) {
-    bool threw = false;
-    try {
-        fn();
-    } catch (...) {
-        threw = true;
-    }
-    if (!threw) {
-        std::cerr << "expected exception was not thrown\n";
-        std::abort();
-    }
-}
+using srtrelay::test::ExpectContains;
+using srtrelay::test::ExpectThrows;
 
 sockaddr_storage MakeIpv4Sockaddr(const std::string& host, int port) {
     sockaddr_storage storage {};

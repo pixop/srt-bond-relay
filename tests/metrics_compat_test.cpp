@@ -1,5 +1,4 @@
 #include <cassert>
-#include <functional>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -10,35 +9,13 @@
 #include "srtrelay/metrics.hpp"
 #include "srtrelay/relay_io.hpp"
 #include "metrics_link_slots.hpp"
+#include "test_expect.hpp"
 
 namespace {
 
-void ExpectContains(const std::string& haystack, const std::string& needle) {
-    if (haystack.find(needle) == std::string::npos) {
-        std::cerr << "missing expected snippet: " << needle << "\n";
-        std::abort();
-    }
-}
-
-void ExpectNotContains(const std::string& haystack, const std::string& needle) {
-    if (haystack.find(needle) != std::string::npos) {
-        std::cerr << "unexpected snippet present: " << needle << "\n";
-        std::abort();
-    }
-}
-
-void ExpectThrows(const std::function<void()>& fn) {
-    bool threw = false;
-    try {
-        fn();
-    } catch (...) {
-        threw = true;
-    }
-    if (!threw) {
-        std::cerr << "expected exception was not thrown\n";
-        std::abort();
-    }
-}
+using srtrelay::test::ExpectContains;
+using srtrelay::test::ExpectNotContains;
+using srtrelay::test::ExpectThrows;
 
 srtrelay::Config ParseConfig(std::vector<std::string> args) {
     std::vector<char*> argv;
