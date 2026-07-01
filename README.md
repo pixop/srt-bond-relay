@@ -31,9 +31,7 @@ docker build \
   .
 ```
 
-Host output path:
-
-- `./artifacts/static-srt/srt-bond-relay`
+Host output path: `./artifacts/static-srt/srt-bond-relay`
 
 Build `srt-test-live` image (from `Dockerfile.srt-test-live`):
 
