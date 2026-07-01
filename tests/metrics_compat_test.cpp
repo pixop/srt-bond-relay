@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "srtrelay/config.hpp"
 #include "srtrelay/metrics.hpp"
 #include "srtrelay/relay_io.hpp"
@@ -14,6 +16,13 @@ namespace {
 void ExpectContains(const std::string& haystack, const std::string& needle) {
     if (haystack.find(needle) == std::string::npos) {
         std::cerr << "missing expected snippet: " << needle << "\n";
+        std::abort();
+    }
+}
+
+void ExpectNotContains(const std::string& haystack, const std::string& needle) {
+    if (haystack.find(needle) != std::string::npos) {
+        std::cerr << "unexpected snippet present: " << needle << "\n";
         std::abort();
     }
 }
@@ -102,6 +111,91 @@ void TestInputCompactionBehavior() {
     assert(metrics.input_tracked.slots[1].link_rx_bytes_total == 400);
 }
 
+void TestPrometheusOutputLinkMetricCompatibility() {
+    srtrelay::MetricsState metrics;
+    metrics.output_links_snapshot_count.store(1, std::memory_order_relaxed);
+    metrics.output_tracked.slots[0].member_identity_key = 4321;
+    metrics.output_tracked.slots[0].member_id = 6001;
+    metrics.output_tracked.slots[0].member_connected = 1;
+    metrics.output_tracked.slots[0].link_tx_bytes_total = 12345;
+
+    const std::string rendered = srtrelay::RenderPrometheusMetrics(metrics);
+    ExpectContains(rendered,
+                   "srt_relay_output_link_tx_bytes_total{link_index=\"1\",socket_id=\"6001\"} 12345");
+}
+
+void TestPrometheusSnapshotCountClampingAndGaugeInvariants() {
+    srtrelay::MetricsState metrics;
+    metrics.input_links_snapshot_count.store(-9, std::memory_order_relaxed);
+    metrics.input_tracked.slots[0].member_identity_key = 1010;
+    metrics.input_tracked.slots[0].member_id = 7001;
+    metrics.input_tracked.slots[0].member_connected = 1;
+
+    metrics.output_links_snapshot_count.store(999, std::memory_order_relaxed);
+    metrics.output_tracked.slots[15].member_identity_key = 2020;
+    metrics.output_tracked.slots[15].member_id = 7016;
+    metrics.output_tracked.slots[15].member_connected = 1;
+    metrics.output_tracked.slots[15].link_tx_bytes_total = 16;
+
+    const std::string rendered = srtrelay::RenderPrometheusMetrics(metrics);
+
+    // Negative input snapshot count must clamp to zero and emit no per-link input entries.
+    ExpectNotContains(rendered, "srt_relay_input_link_connected{");
+    // Oversized output snapshot count must clamp to max tracked members (slot 16 allowed).
+    ExpectContains(rendered,
+                   "srt_relay_output_link_tx_bytes_total{link_index=\"16\",socket_id=\"7016\"} 16");
+    ExpectNotContains(rendered, "link_index=\"17\"");
+
+    // One-hot gauge defaults remain stable for dashboards.
+    ExpectContains(rendered, "srt_relay_input_bond_mode{mode=\"unknown\"} 1");
+    ExpectContains(rendered, "srt_relay_input_bond_mode{mode=\"broadcast\"} 0");
+    ExpectContains(rendered, "srt_relay_input_bond_mode{mode=\"backup\"} 0");
+    ExpectContains(rendered, "srt_relay_switch_policy{policy=\"round_robin\"} 1");
+    ExpectContains(rendered, "srt_relay_switch_mode{mode=\"serial\"} 1");
+}
+
+void TestBuildCompactResponseJsonIncludeFlagsAndFields() {
+    srtrelay::CompactResponse input_only;
+    input_only.direction = "input";
+    input_only.include_input = true;
+    input_only.include_output = false;
+    input_only.input.before_slots = 3;
+    input_only.input.after_slots = 2;
+    input_only.input.moved = 1;
+    input_only.input.dropped = 1;
+
+    const auto parsed_input = nlohmann::json::parse(srtrelay::BuildCompactResponseJson(input_only));
+    assert(parsed_input["direction"] == "input");
+    assert(parsed_input.contains("input"));
+    assert(!parsed_input.contains("output"));
+    assert(parsed_input["input"]["before_slots"] == 3);
+    assert(parsed_input["input"]["after_slots"] == 2);
+    assert(parsed_input["input"]["moved"] == 1);
+    assert(parsed_input["input"]["dropped"] == 1);
+
+    srtrelay::CompactResponse both;
+    both.direction = "both";
+    both.include_input = true;
+    both.include_output = true;
+    both.input.before_slots = 4;
+    both.input.after_slots = 3;
+    both.input.moved = 2;
+    both.input.dropped = 1;
+    both.output.before_slots = 6;
+    both.output.after_slots = 5;
+    both.output.moved = 1;
+    both.output.dropped = 1;
+
+    const auto parsed_both = nlohmann::json::parse(srtrelay::BuildCompactResponseJson(both));
+    assert(parsed_both["direction"] == "both");
+    assert(parsed_both.contains("input"));
+    assert(parsed_both.contains("output"));
+    assert(parsed_both["input"]["before_slots"] == 4);
+    assert(parsed_both["output"]["after_slots"] == 5);
+    assert(parsed_both["output"]["moved"] == 1);
+    assert(parsed_both["output"]["dropped"] == 1);
+}
+
 void TestParseArgsMultiOutput() {
     const srtrelay::Config cfg = ParseConfig({
         "srt-bond-relay",
@@ -144,6 +238,9 @@ void TestParseOutputEndpointSpecsPreservesBondedSingleFlag() {
 int main() {
     TestPrometheusCompatibility();
     TestInputCompactionBehavior();
+    TestPrometheusOutputLinkMetricCompatibility();
+    TestPrometheusSnapshotCountClampingAndGaugeInvariants();
+    TestBuildCompactResponseJsonIncludeFlagsAndFields();
     TestParseArgsMultiOutput();
     TestParseArgsRejectsMultipleStdoutOutputs();
     TestParseOutputEndpointSpecsPreservesBondedSingleFlag();
