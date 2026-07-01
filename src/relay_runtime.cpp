@@ -276,6 +276,7 @@ int RelayMain(const Config& cfg, const Logger& logger) {
     std::vector<char> stdin_pending;
     size_t stdin_pending_offset = 0;
     auto last_stats_at = std::chrono::steady_clock::now();
+    auto last_member_events_at = std::chrono::steady_clock::now();
     const auto startup_ms = UnixNowMs();
     metrics.last_rx_unix_ms.store(startup_ms, std::memory_order_relaxed);
     metrics.last_tx_unix_ms.store(startup_ms, std::memory_order_relaxed);
@@ -413,9 +414,13 @@ int RelayMain(const Config& cfg, const Logger& logger) {
                 : SRT_INVALID_SOCK;
         metrics.output_transport_socket_id.store(static_cast<int64_t>(output_transport_sock),
                                                  std::memory_order_relaxed);
+        MaybeEmitMemberConnectionEvents(logger, &metrics,
+                                        input_source->SessionSocket(), output_sink->TransportSocket(),
+                                        output_sink->MetricsMode(), causality.ActiveIncidentId(),
+                                        &last_member_events_at);
         MaybeLogStats(cfg, logger, &stats, state, &metrics,
                       input_source->SessionSocket(), output_sink->TransportSocket(),
-                      output_sink->MetricsMode(), causality.ActiveIncidentId(), &last_stats_at);
+                      output_sink->MetricsMode(), &last_stats_at);
         metrics.active_input_index.store(static_cast<int64_t>(input_source->ActiveInputIndex() + 1),
                                          std::memory_order_relaxed);
         metrics.input_switches_total.store(input_source->InputSwitchCount(), std::memory_order_relaxed);

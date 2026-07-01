@@ -2218,11 +2218,9 @@ SRTSOCKET ResolveOutputStatsSocket(SRTSOCKET output_sock, OutputMetricsMode outp
     return output_metrics_mode == OutputMetricsMode::kSrtSocket ? output_sock : SRT_INVALID_SOCK;
 }
 
-void CollectTickMetrics(const Logger& logger,
-                        MetricsState* metrics,
+void CollectTickMetrics(MetricsState* metrics,
                         SRTSOCKET input_session_sock,
-                        SRTSOCKET output_stats_sock,
-                        const std::string& active_incident_id) {
+                        SRTSOCKET output_stats_sock) {
     MaybeUpdateRttMetric(input_session_sock, &metrics->input_rtt_ms);
     if (output_stats_sock != SRT_INVALID_SOCK) {
         MaybeUpdateRttMetric(output_stats_sock, &metrics->output_rtt_ms);
@@ -2235,7 +2233,6 @@ void CollectTickMetrics(const Logger& logger,
     UpdateInputLinkHealthMetrics(input_session_sock, metrics);
     UpdateOutputLinkHealthMetrics(output_stats_sock, metrics);
     UpdateTransportTrafficMetrics(input_session_sock, output_stats_sock, metrics);
-    EmitMemberTransitionEvents(logger, metrics, active_incident_id);
 
     int64_t max_input_link_rtt_ms = -1;
     if (TryComputeMaxConnectedInputLinkRtt(*metrics, &max_input_link_rtt_ms)) {
@@ -2300,7 +2297,6 @@ void MaybeLogStats(const Config& cfg,
                    SRTSOCKET input_session_sock,
                    SRTSOCKET output_sock,
                    OutputMetricsMode output_metrics_mode,
-                   const std::string& active_incident_id,
                    std::chrono::steady_clock::time_point* last_stats_at) {
     const auto now = std::chrono::steady_clock::now();
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - *last_stats_at).count();
@@ -2311,7 +2307,7 @@ void MaybeLogStats(const Config& cfg,
     const IntervalRates rates = ComputeIntervalRates(*stats, elapsed_ms);
     const SRTSOCKET output_stats_sock = ResolveOutputStatsSocket(output_sock, output_metrics_mode);
 
-    CollectTickMetrics(logger, metrics, input_session_sock, output_stats_sock, active_incident_id);
+    CollectTickMetrics(metrics, input_session_sock, output_stats_sock);
     RefreshEffectiveLatencyMetrics(metrics, input_session_sock, output_stats_sock);
     PublishIntervalMetrics(rates, stats, metrics);
 
@@ -2428,6 +2424,28 @@ void MaybeLogStats(const Config& cfg,
     stats->interval_tx_msgs = 0;
     stats->interval_send_failures = 0;
     *last_stats_at = now;
+}
+
+void MaybeEmitMemberConnectionEvents(const Logger& logger,
+                                     MetricsState* metrics,
+                                     SRTSOCKET input_session_sock,
+                                     SRTSOCKET output_sock,
+                                     OutputMetricsMode output_metrics_mode,
+                                     const std::string& active_incident_id,
+                                     std::chrono::steady_clock::time_point* last_member_events_at) {
+    constexpr int64_t kMemberEventIntervalMs = 1000;
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - *last_member_events_at).count();
+    if (elapsed_ms < kMemberEventIntervalMs) {
+        return;
+    }
+
+    const SRTSOCKET output_stats_sock = ResolveOutputStatsSocket(output_sock, output_metrics_mode);
+    UpdateInputLinkHealthMetrics(input_session_sock, metrics);
+    UpdateOutputLinkHealthMetrics(output_stats_sock, metrics);
+    EmitMemberTransitionEvents(logger, metrics, active_incident_id);
+    *last_member_events_at = now;
 }
 
 }  // namespace srtrelay

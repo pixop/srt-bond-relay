@@ -317,7 +317,13 @@ void MaybeLogStats(const Config& cfg,
                    SRTSOCKET input_session_sock,
                    SRTSOCKET output_sock,
                    OutputMetricsMode output_metrics_mode,
-                   const std::string& active_incident_id,
                    std::chrono::steady_clock::time_point* last_stats_at);
+void MaybeEmitMemberConnectionEvents(const Logger& logger,
+                                     MetricsState* metrics,
+                                     SRTSOCKET input_session_sock,
+                                     SRTSOCKET output_sock,
+                                     OutputMetricsMode output_metrics_mode,
+                                     const std::string& active_incident_id,
+                                     std::chrono::steady_clock::time_point* last_member_events_at);
 
 }  // namespace srtrelay
