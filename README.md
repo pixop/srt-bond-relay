@@ -13,7 +13,7 @@ Build relay image:
 docker build \
   --build-arg SRT_TAG=v1.5.5 \
   --build-arg SRT_LINKAGE=dynamic \
-  --build-arg BUILD_TYPE=Release \
+  --build-arg BUILD_TYPE=Debug \
   --target runtime \
   -t srt-bond-relay:dev .
 ```
