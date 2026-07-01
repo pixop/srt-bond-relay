@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <iomanip>
 #include <sstream>
 #include <unordered_set>
 
@@ -2270,6 +2271,13 @@ std::string FormatSignedWithThousands(int64_t value) {
     return FormatWithThousands(static_cast<uint64_t>(value));
 }
 
+std::string FormatMbpsFromBytesPerSec(uint64_t bytes_per_sec) {
+    const double mbps = (static_cast<double>(bytes_per_sec) * 8.0) / 1'000'000.0;
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(3) << mbps;
+    return oss.str();
+}
+
 void PublishIntervalMetrics(const IntervalRates& rates, RelayStats* stats, MetricsState* metrics) {
     metrics->rx_bytes_per_sec.store(rates.rx_bps, std::memory_order_relaxed);
     metrics->tx_bytes_per_sec.store(rates.tx_bps, std::memory_order_relaxed);
@@ -2336,6 +2344,9 @@ void MaybeLogStats(const Config& cfg,
     const auto input_group_byte_drop_interval = CounterDeltaWithReset(
         stats->last_input_group_byte_drop_total,
         input_group_byte_drop_total);
+    const auto input_transport_packet_belated_interval = CounterDeltaWithReset(
+        stats->last_input_transport_packet_belated_total,
+        input_transport_packet_belated_total);
     const auto output_transport_byte_retrans_interval = CounterDeltaWithReset(
         stats->last_output_transport_byte_retrans_total,
         output_transport_byte_retrans_total);
@@ -2353,8 +2364,8 @@ void MaybeLogStats(const Config& cfg,
                    FormatWithThousands(stats->interval_tx_bytes) + " bytes, rx " +
                    FormatWithThousands(stats->interval_rx_msgs) + " packets, tx " +
                    FormatWithThousands(stats->interval_tx_msgs) + " packets",
-               "| Rates: rx " + FormatWithThousands(rates.rx_bps) + " Bps, tx " +
-                   FormatWithThousands(rates.tx_bps) + " Bps, rx " +
+               "| Rates: rx " + FormatMbpsFromBytesPerSec(rates.rx_bps) + " Mbps, tx " +
+                   FormatMbpsFromBytesPerSec(rates.tx_bps) + " Mbps, rx " +
                    FormatWithThousands(rates.rx_mps) + " pps, tx " +
                    FormatWithThousands(rates.tx_mps) + " pps",
                "| Failures: send: " + FormatWithThousands(stats->interval_send_failures) +
@@ -2366,12 +2377,13 @@ void MaybeLogStats(const Config& cfg,
                    " bytes, retransmit: " + FormatWithThousands(input_transport_byte_retrans_total) +
                    " bytes, lost: " + FormatWithThousands(input_transport_byte_loss_total) +
                    " bytes, dropped: " + FormatWithThousands(input_group_byte_drop_total) + " bytes (" +
-                   FormatWithThousands(input_group_packet_drop_total) + " packets)",
+                   FormatWithThousands(input_group_packet_drop_total) + " packets), belated: " +
+                   FormatWithThousands(input_transport_packet_belated_total) + " packets",
                "| Interval recv: " + FormatWithThousands(stats->interval_rx_bytes) +
                    " bytes, retransmit: " + FormatWithThousands(input_transport_byte_retrans_interval) +
                    " bytes, lost: " + FormatWithThousands(input_transport_byte_loss_interval) +
-                   " bytes, dropped: " + FormatWithThousands(input_group_byte_drop_interval) + " bytes",
-               "| Belated total: " + FormatWithThousands(input_transport_packet_belated_total) + " packets");
+                   " bytes, dropped: " + FormatWithThousands(input_group_byte_drop_interval) + " bytes, belated: " +
+                   FormatWithThousands(input_transport_packet_belated_interval) + " packets");
 
     logger.Log(LogLevel::kInfo,
                "stats-output-transport",
@@ -2402,6 +2414,7 @@ void MaybeLogStats(const Config& cfg,
     stats->last_input_transport_byte_retrans_total = input_transport_byte_retrans_total;
     stats->last_input_transport_byte_loss_total = input_transport_byte_loss_total;
     stats->last_input_group_byte_drop_total = input_group_byte_drop_total;
+    stats->last_input_transport_packet_belated_total = input_transport_packet_belated_total;
     stats->last_output_transport_byte_retrans_total = output_transport_byte_retrans_total;
     stats->last_output_transport_byte_drop_total = output_transport_byte_drop_total;
 

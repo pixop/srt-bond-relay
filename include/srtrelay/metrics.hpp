@@ -40,6 +40,7 @@ struct RelayStats {
     uint64_t last_input_transport_byte_retrans_total = 0;
     uint64_t last_input_transport_byte_loss_total = 0;
     uint64_t last_input_group_byte_drop_total = 0;
+    uint64_t last_input_transport_packet_belated_total = 0;
     uint64_t last_output_transport_byte_retrans_total = 0;
     uint64_t last_output_transport_byte_drop_total = 0;
 };
