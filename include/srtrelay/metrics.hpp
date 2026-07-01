@@ -35,6 +35,13 @@ struct RelayStats {
     uint64_t interval_rx_msgs = 0;
     uint64_t interval_tx_msgs = 0;
     uint64_t interval_send_failures = 0;
+
+    // Last-seen transport counters used to compute per-stats-tick interval deltas.
+    uint64_t last_input_transport_byte_retrans_total = 0;
+    uint64_t last_input_transport_byte_loss_total = 0;
+    uint64_t last_input_group_byte_drop_total = 0;
+    uint64_t last_output_transport_byte_retrans_total = 0;
+    uint64_t last_output_transport_byte_drop_total = 0;
 };
 
 struct RelayState {
@@ -87,6 +94,7 @@ struct MetricsState {
 
     static constexpr size_t kMaxTrackedMembers = 16;
     static constexpr size_t kMaxInputSources = 16;
+    static constexpr size_t kMaxOutputSources = 16;
 
     std::atomic<uint64_t> total_rx_bytes{0};
     std::atomic<uint64_t> total_tx_bytes{0};
@@ -148,6 +156,7 @@ struct MetricsState {
     std::atomic<int> input_bond_mode{0};  // 0=unknown, 1=broadcast, 2=backup
     std::atomic<int> output_bond_mode{0};  // 0=unknown, 1=broadcast, 2=backup
     std::atomic<int64_t> input_sources_total{1};
+    std::atomic<int64_t> output_sources_total{1};
     std::atomic<int64_t> active_input_index{1};  // 1-based
     std::atomic<uint64_t> input_switches_total{0};
     std::atomic<int64_t> primary_input_index{0};  // 0 means not set
@@ -157,6 +166,9 @@ struct MetricsState {
     std::array<std::atomic<int>, kMaxInputSources> input_source_connected {};
     std::array<std::atomic<int>, kMaxInputSources> input_source_listening {};
     std::array<std::atomic<int>, kMaxInputSources> input_source_bond_mode {};  // 0=unknown,1=broadcast,2=backup
+    std::array<std::atomic<int>, kMaxOutputSources> output_source_connected {};
+    std::array<std::atomic<int>, kMaxOutputSources> output_source_listening {};
+    std::array<std::atomic<int>, kMaxOutputSources> output_source_bond_mode {};  // 0=unknown,1=broadcast,2=backup
 
     std::atomic<int64_t> last_rx_unix_ms{0};
     std::atomic<int64_t> last_tx_unix_ms{0};
@@ -270,7 +282,7 @@ public:
                   const Logger& logger,
                   MetricsState& metrics,
                   const std::vector<InputEndpointSpec>& input_specs,
-                  const OutputEndpointSpec& output_spec);
+                  const std::vector<OutputEndpointSpec>& output_specs);
     ~MetricsServer();
 
     void Start();
@@ -281,7 +293,7 @@ private:
     const Logger& logger_;
     MetricsState& metrics_;
     const std::vector<InputEndpointSpec>* input_specs_ = nullptr;
-    const OutputEndpointSpec* output_spec_ = nullptr;
+    const std::vector<OutputEndpointSpec>* output_specs_ = nullptr;
     httplib::Server server_;
     std::thread thread_;
 };

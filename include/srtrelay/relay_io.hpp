@@ -81,6 +81,7 @@ struct OutputEndpointSpec {
 struct EnsureAttemptContext {
     uint64_t attempt_id = 0;
     std::string incident_id;
+    std::optional<size_t> source_index;  // 1-based input/output index for fan-out/switching contexts
 };
 
 class InputSource {
@@ -118,18 +119,25 @@ public:
     virtual SRTSOCKET TransportSocket() const = 0;
     virtual OutputMetricsMode MetricsMode() const = 0;
     virtual bool IsConnected() const = 0;
+    virtual bool IsListening() const { return false; }
+    virtual bool NeedsEnsurePoll() const { return !IsConnected(); }
     virtual IoErrorKind LastSendErrorKind() const = 0;
     virtual std::string LastSendErrorMessage() const = 0;
     virtual IoErrorKind LastEnsureErrorKind() const = 0;
     virtual std::string LastEnsureErrorMessage() const = 0;
+    virtual size_t OutputCount() const { return 1; }
+    virtual bool OutputConnected(size_t index) const { return index == 0 && IsConnected(); }
+    virtual bool OutputListening(size_t index) const { return index == 0 && IsListening(); }
 };
 
 InputEndpointSpec ParseInputEndpointSpec(const Config& cfg);
 std::vector<InputEndpointSpec> ParseInputEndpointSpecs(const Config& cfg);
 OutputEndpointSpec ParseOutputEndpointSpec(const Config& cfg);
+std::vector<OutputEndpointSpec> ParseOutputEndpointSpecs(const Config& cfg);
 std::unique_ptr<InputSource> BuildInputSource(const InputEndpointSpec& spec);
 std::unique_ptr<InputSource> BuildInputSource(const Config& cfg, std::vector<InputEndpointSpec> specs);
 const char* InputSwitchPolicyName(InputSwitchPolicy policy);
 std::unique_ptr<OutputSink> BuildOutputSink(const OutputEndpointSpec& spec);
+std::unique_ptr<OutputSink> BuildOutputSink(const Config& cfg, std::vector<OutputEndpointSpec> specs);
 
 }  // namespace srtrelay

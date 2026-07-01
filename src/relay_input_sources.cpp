@@ -1,6 +1,7 @@
 #include "srtrelay/relay_io.hpp"
 
 #include <errno.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -17,6 +18,111 @@ namespace srtrelay {
 namespace {
 
 constexpr int kDefaultUdpTtl = 64;
+
+std::string FormatSockaddr(const sockaddr* addr, socklen_t addr_len) {
+    if (addr == nullptr || addr_len == 0) {
+        return "unknown";
+    }
+    char host[NI_MAXHOST] {};
+    char service[NI_MAXSERV] {};
+    const int rc = getnameinfo(addr,
+                               addr_len,
+                               host,
+                               sizeof(host),
+                               service,
+                               sizeof(service),
+                               NI_NUMERICHOST | NI_NUMERICSERV);
+    if (rc != 0) {
+        return "unknown";
+    }
+    return std::string(host) + ":" + service;
+}
+
+bool TryFormatSockaddrStorage(const sockaddr_storage& addr, std::string* endpoint) {
+    if (endpoint == nullptr) {
+        return false;
+    }
+    if (addr.ss_family != AF_INET && addr.ss_family != AF_INET6) {
+        return false;
+    }
+    *endpoint = FormatSockaddr(reinterpret_cast<const sockaddr*>(&addr),
+                               addr.ss_family == AF_INET ? sizeof(sockaddr_in) : sizeof(sockaddr_in6));
+    return *endpoint != "unknown";
+}
+
+bool TryReadSrtGroupRemoteEndpoint(SRTSOCKET sock, std::string* remote_endpoint) {
+    if (remote_endpoint == nullptr || sock == SRT_INVALID_SOCK) {
+        return false;
+    }
+    size_t capacity = MetricsState::kMaxTrackedMembers;
+    SRT_SOCKGROUPDATA members[MetricsState::kMaxTrackedMembers] {};
+    if (srt_group_data(sock, members, &capacity) == SRT_ERROR || capacity == 0) {
+        return false;
+    }
+    for (size_t i = 0; i < capacity; ++i) {
+        const bool connected = members[i].memberstate == SRT_GST_RUNNING || members[i].sockstate == SRTS_CONNECTED;
+        if (!connected) {
+            continue;
+        }
+        if (TryFormatSockaddrStorage(members[i].peeraddr, remote_endpoint)) {
+            return true;
+        }
+    }
+    for (size_t i = 0; i < capacity; ++i) {
+        if (TryFormatSockaddrStorage(members[i].peeraddr, remote_endpoint)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void ReadFdEndpoints(int fd, std::string* local_endpoint, std::string* remote_endpoint) {
+    if (local_endpoint != nullptr) {
+        *local_endpoint = "unknown";
+    }
+    if (remote_endpoint != nullptr) {
+        *remote_endpoint = "unknown";
+    }
+    if (fd < 0) {
+        return;
+    }
+    sockaddr_storage local_addr {};
+    socklen_t local_len = sizeof(local_addr);
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&local_addr), &local_len) == 0 && local_endpoint != nullptr) {
+        *local_endpoint = FormatSockaddr(reinterpret_cast<sockaddr*>(&local_addr), local_len);
+    }
+    sockaddr_storage remote_addr {};
+    socklen_t remote_len = sizeof(remote_addr);
+    if (::getpeername(fd, reinterpret_cast<sockaddr*>(&remote_addr), &remote_len) == 0 && remote_endpoint != nullptr) {
+        *remote_endpoint = FormatSockaddr(reinterpret_cast<sockaddr*>(&remote_addr), remote_len);
+    }
+}
+
+void ReadSrtEndpoints(SRTSOCKET sock, std::string* local_endpoint, std::string* remote_endpoint) {
+    if (local_endpoint != nullptr) {
+        *local_endpoint = "unknown";
+    }
+    if (remote_endpoint != nullptr) {
+        *remote_endpoint = "unknown";
+    }
+    if (sock == SRT_INVALID_SOCK) {
+        return;
+    }
+    sockaddr_storage local_addr {};
+    int local_len = sizeof(local_addr);
+    if (srt_getsockname(sock, reinterpret_cast<sockaddr*>(&local_addr), &local_len) != SRT_ERROR &&
+        local_endpoint != nullptr) {
+        *local_endpoint = FormatSockaddr(reinterpret_cast<sockaddr*>(&local_addr), static_cast<socklen_t>(local_len));
+    }
+    sockaddr_storage remote_addr {};
+    int remote_len = sizeof(remote_addr);
+    if (srt_getpeername(sock, reinterpret_cast<sockaddr*>(&remote_addr), &remote_len) != SRT_ERROR &&
+        remote_endpoint != nullptr) {
+        *remote_endpoint = FormatSockaddr(reinterpret_cast<sockaddr*>(&remote_addr), static_cast<socklen_t>(remote_len));
+    } else if (remote_endpoint != nullptr) {
+        (void)TryReadSrtGroupRemoteEndpoint(sock, remote_endpoint);
+    }
+}
 
 bool IsUdpTimeoutErrno(int err) {
     return err == EAGAIN || err == EWOULDBLOCK;
@@ -116,9 +222,22 @@ public:
                 ApplyIntSockOpt(accepted, SRTO_RCVTIMEO, cfg.io_timeout_ms, "SRTO_RCVTIMEO");
                 session_.Set(accepted);
                 metrics->input_connected.store(1, std::memory_order_relaxed);
+                std::string local_endpoint;
+                std::string remote_endpoint;
+                ReadSrtEndpoints(accepted, &local_endpoint, &remote_endpoint);
+                if (local_endpoint == "unknown" && !listeners_.empty()) {
+                    std::string listener_local;
+                    ReadSrtEndpoints(listeners_.front(), &listener_local, nullptr);
+                    if (listener_local != "unknown") {
+                        local_endpoint = listener_local;
+                    }
+                }
                 logger.Log(LogLevel::kInfo,
                            "input-connected",
                            "socket=" + std::to_string(accepted),
+                           "input_index=" + std::to_string(attempt_ctx.source_index.value_or(1)),
+                           "local_endpoint=" + local_endpoint,
+                           "remote_endpoint=" + remote_endpoint,
                            "attempt_id=" + std::to_string(attempt_ctx.attempt_id),
                            "incident_id=" + (attempt_ctx.incident_id.empty() ? std::string("none") : attempt_ctx.incident_id));
             }
@@ -201,11 +320,17 @@ public:
             session_.Set(sock);
             metrics->input_listening.store(0, std::memory_order_relaxed);
             metrics->input_connected.store(1, std::memory_order_relaxed);
+            std::string local_endpoint;
+            std::string remote_endpoint;
+            ReadSrtEndpoints(sock, &local_endpoint, &remote_endpoint);
             logger.Log(LogLevel::kInfo, "input-connected",
                        std::string("mode=caller"),
+                       "input_index=" + std::to_string(attempt_ctx.source_index.value_or(1)),
                        "bonded=" + std::string(bonded_ ? "true" : "false"),
                        "members=" + std::to_string(uris_.size()),
                        "socket=" + std::to_string(sock),
+                       "local_endpoint=" + local_endpoint,
+                       "remote_endpoint=" + remote_endpoint,
                        "attempt_id=" + std::to_string(attempt_ctx.attempt_id),
                        "incident_id=" + (attempt_ctx.incident_id.empty() ? std::string("none") : attempt_ctx.incident_id));
         } catch (const std::exception& ex) {
@@ -269,9 +394,9 @@ public:
     ~UdpInputSource() override { CloseSocket(); }
 
     void EnsureReady(const Config& cfg,
-                     const Logger&,
+                     const Logger& logger,
                      MetricsState* metrics,
-                     const EnsureAttemptContext&) override {
+                     const EnsureAttemptContext& attempt_ctx) override {
         ensure_error_kind_ = IoErrorKind::kNone;
         ensure_error_message_.clear();
         if (socket_fd_ >= 0) {
@@ -308,6 +433,16 @@ public:
         socket_fd_ = fd;
         metrics->input_connected.store(1, std::memory_order_relaxed);
         metrics->input_listening.store(listener_ ? 1 : 0, std::memory_order_relaxed);
+        std::string local_endpoint;
+        std::string remote_endpoint;
+        ReadFdEndpoints(fd, &local_endpoint, &remote_endpoint);
+        logger.Log(LogLevel::kInfo,
+                   "input-connected",
+                   "input_index=" + std::to_string(attempt_ctx.source_index.value_or(1)),
+                   std::string("mode=") + (listener_ ? "listener" : "caller"),
+                   "socket_fd=" + std::to_string(fd),
+                   "local_endpoint=" + local_endpoint,
+                   "remote_endpoint=" + remote_endpoint);
     }
 
     InputReceiveResult Receive(const Config& cfg, std::vector<char>* buffer, SRT_MSGCTRL* rx_ctrl) override {
@@ -438,8 +573,10 @@ public:
         ensure_error_message_.clear();
         ApplyPendingStop(cfg, logger, metrics);
         InputSource* active = sources_.at(active_index_).get();
+        EnsureAttemptContext active_ctx = attempt_ctx;
+        active_ctx.source_index = active_index_ + 1;
         try {
-            active->EnsureReady(cfg, logger, metrics, attempt_ctx);
+            active->EnsureReady(cfg, logger, metrics, active_ctx);
         } catch (...) {
             ensure_error_kind_ = active->LastEnsureErrorKind();
             ensure_error_message_ = active->LastEnsureErrorMessage();
@@ -448,8 +585,10 @@ public:
                 for (size_t offset = 1; offset < sources_.size(); ++offset) {
                     const size_t candidate_index = (previous + offset) % sources_.size();
                     InputSource* candidate = sources_.at(candidate_index).get();
+                    EnsureAttemptContext candidate_ctx = attempt_ctx;
+                    candidate_ctx.source_index = candidate_index + 1;
                     try {
-                        candidate->EnsureReady(cfg, logger, metrics, attempt_ctx);
+                        candidate->EnsureReady(cfg, logger, metrics, candidate_ctx);
                         sources_.at(previous)->HandleReceiveError(cfg, logger, metrics);
                         active_index_ = candidate_index;
                         delayed_candidate_index_.reset();
@@ -485,7 +624,9 @@ public:
             primary_probe_cfg.io_timeout_ms = 1;
         }
         try {
-            primary_source->EnsureReady(primary_probe_cfg, logger, metrics, attempt_ctx);
+            EnsureAttemptContext primary_ctx = attempt_ctx;
+            primary_ctx.source_index = primary + 1;
+            primary_source->EnsureReady(primary_probe_cfg, logger, metrics, primary_ctx);
         } catch (...) {
             return;
         }

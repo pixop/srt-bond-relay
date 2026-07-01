@@ -104,6 +104,18 @@ docker run --rm --network host \
   --reconnect-delay-ms 1000
 ```
 
+Multi-output fan-out example (same input to two outputs):
+
+```bash
+docker run --rm --network host \
+  srt-bond-relay:dev \
+  --input "srt://0.0.0.0:9000?mode=listener" \
+  --output "srt://127.0.0.1:5000?mode=caller" \
+  --output "udp://127.0.0.1:5001?mode=caller" \
+  --stats-interval-ms 1000 \
+  --reconnect-delay-ms 1000
+```
+
 UDP input example (UDP ingest -> SRT egress):
 
 ```bash
@@ -190,6 +202,8 @@ Independent multi-input switching:
 - `srt://...` with `mode=caller|listener` (default `caller` when omitted)
 - `udp://...` with `mode=caller` (output `mode=listener` is rejected in first pass)
 - `stdout`, `-`, or `fd://stdout` (binary MPEG-TS to process stdout)
+- Repeat `--output` to fan out one input stream to multiple output endpoints
+- Multi-output mode supports at most one stdout sink
 
 UDP query options:
 
@@ -222,7 +236,7 @@ Metrics server:
 
 - `GET /healthz` returns `ok`
 - `GET /metrics` on `http://<metrics-host>:<metrics-port>`
-- `GET /session/specs` returns JSON with configured input/output endpoint specs, live runtime session shape (`runtime.bonded`, `runtime.group_type`), runtime and resolved session transtype (`runtime_transtype`, `session_transtype` with source), connected SRT member details (`connected_members`, including per-member state/peer and `rtt_ms`), and effective live SRT socket options for the active session (when connected), including directional and negotiated latency fields (`rcvlatency_ms`, `peerlatency_ms`, `negotiated_latency_ms`)
+- `GET /session/specs` returns JSON with configured `inputs` and `outputs` endpoint specs (plus legacy `output`), live runtime session shape (`runtime.bonded`, `runtime.group_type`), runtime and resolved session transtype (`runtime_transtype`, `session_transtype` with source), connected SRT member details (`connected_members`, including per-member state/peer and `rtt_ms`), and effective live SRT socket options for the active session (when connected), including directional and negotiated latency fields (`rcvlatency_ms`, `peerlatency_ms`, `negotiated_latency_ms`)
 - `POST /metrics/links/compact?direction=input|output|both` compacts active per-link slot indexes and drops disconnected slots from exported stable-slot series (when `direction` is omitted, default is `both`)
 - Controlled by `--metrics-enabled`, `--metrics-host`, `--metrics-port`
 
@@ -230,6 +244,7 @@ Metrics are refreshed on each stats tick (`--stats-interval-ms`) and include:
 
 - Relay totals and rates (`*_bytes_*`, `*_messages_*`, reconnect/send-failure counters)
 - Path state (`input_listening`, `input_connected`, `output_connected`, `path_ready`)
+- Per-source state (`srt_relay_input_source_*`, `srt_relay_output_source_*`)
 - Bond mode gauges for both directions (`srt_relay_input_bond_mode{mode=...}`, `srt_relay_output_bond_mode{mode=...}`)
 - Input and output link health (`*_links_total|healthy|running`) plus per-link stable-slot metrics (`*_link_connected`, `*_link_*_bytes_*`, `*_link_rtt_ms` with `link_index`/`socket_id` labels)
 - Transport-level SRT counters for both directions (total/current recv or sent bytes, unique bytes, retrans, loss/drop, tracked member count)
@@ -259,6 +274,7 @@ When output mode is `stdout` or `udp://...`:
 - relay tx/rx totals and rates still reflect forwarded traffic
 
 Logs are structured key-value lines on `stderr` (`startup`, connection transitions, periodic `stats`, `shutdown`, and metrics server lifecycle events).
+Connection-established logs include both `local_endpoint` and `remote_endpoint` fields for input and output sockets (where available), including switched multi-input and multi-output fan-out paths.
 
 ### Causality: Operator Playbook
 
@@ -316,7 +332,7 @@ Recognized UDP query keys:
 ## Current Limitations
 
 - unsupported URI query options are ignored (debug logged)
-- output listener mode is single-consumer at a time (no fanout/multi-client)
+- output listener mode is single-consumer at a time (no multi-client listener fanout on one listener socket)
 - output listener mode blocks forwarding until a downstream client is connected
 - per-link observability depends on bonded member snapshot availability from libsrt; when unavailable, relay falls back to a single synthetic input-link slot for continuity
 - UDP endpoint lists are single-endpoint only (no bonded/multipath UDP)

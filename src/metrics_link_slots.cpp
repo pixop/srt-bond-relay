@@ -57,25 +57,65 @@ uint64_t HashBytesFnv1a64(const void* data, size_t size, uint64_t seed = 1469598
     return hash;
 }
 
-uint64_t MemberIdentityKey(const SRT_SOCKGROUPDATA& member) {
+bool TryHashSockaddrEndpoint(const sockaddr_storage& addr, uint64_t* out_hash) {
+    if (out_hash == nullptr) {
+        return false;
+    }
     uint64_t hash = 1469598103934665603ULL;
-
-    if (member.peeraddr.ss_family == AF_INET) {
-        const auto* v4 = reinterpret_cast<const sockaddr_in*>(&member.peeraddr);
+    if (addr.ss_family == AF_INET) {
+        const auto* v4 = reinterpret_cast<const sockaddr_in*>(&addr);
         hash = HashBytesFnv1a64(&v4->sin_addr, sizeof(v4->sin_addr), hash);
         const uint16_t port = ntohs(v4->sin_port);
         hash = HashBytesFnv1a64(&port, sizeof(port), hash);
-    } else if (member.peeraddr.ss_family == AF_INET6) {
-        const auto* v6 = reinterpret_cast<const sockaddr_in6*>(&member.peeraddr);
+        *out_hash = hash;
+        return true;
+    }
+    if (addr.ss_family == AF_INET6) {
+        const auto* v6 = reinterpret_cast<const sockaddr_in6*>(&addr);
         hash = HashBytesFnv1a64(&v6->sin6_addr, sizeof(v6->sin6_addr), hash);
         const uint16_t port = ntohs(v6->sin6_port);
         hash = HashBytesFnv1a64(&port, sizeof(port), hash);
+        *out_hash = hash;
+        return true;
+    }
+    return false;
+}
+
+bool TryReadSocketLocalAddress(SRTSOCKET sock, sockaddr_storage* out_addr) {
+    if (sock == SRT_INVALID_SOCK || sock == 0 || out_addr == nullptr) {
+        return false;
+    }
+    sockaddr_storage addr {};
+    int len = static_cast<int>(sizeof(addr));
+    if (srt_getsockname(sock, reinterpret_cast<sockaddr*>(&addr), &len) == SRT_ERROR) {
+        return false;
+    }
+    *out_addr = addr;
+    return true;
+}
+
+uint64_t MemberIdentityKey(LinkSide side, const SRT_SOCKGROUPDATA& member) {
+    // Input slot identity should follow the relay local leg endpoint so reconnects
+    // with new sender source ports still map to the same slot.
+    if (side == LinkSide::kInput) {
+        sockaddr_storage local_addr {};
+        if (TryReadSocketLocalAddress(member.id, &local_addr)) {
+            uint64_t local_hash = 0;
+            if (TryHashSockaddrEndpoint(local_addr, &local_hash)) {
+                return local_hash;
+            }
+        }
+    }
+
+    uint64_t endpoint_hash = 0;
+    if (TryHashSockaddrEndpoint(member.peeraddr, &endpoint_hash)) {
+        return endpoint_hash;
     }
 
     if (member.token != 0) {
-        hash = HashBytesFnv1a64(&member.token, sizeof(member.token), hash);
+        return HashBytesFnv1a64(&member.token, sizeof(member.token));
     }
-    return hash;
+    return 0;
 }
 
 struct SnapshotSlotState {
@@ -274,7 +314,7 @@ void SaveMemberSnapshot(LinkSide side,
     std::vector<bool> matched(group_members.size(), false);
 
     for (size_t i = 0; i < group_members.size(); ++i) {
-        const uint64_t key = MemberIdentityKey(group_members[i]);
+        const uint64_t key = MemberIdentityKey(side, group_members[i]);
         if (key == 0) {
             continue;
         }
@@ -346,7 +386,7 @@ void SaveMemberSnapshot(LinkSide side,
             slots[slot].peer_port = 0;
         }
 
-        uint64_t identity_key = MemberIdentityKey(member);
+        uint64_t identity_key = MemberIdentityKey(side, member);
         if (identity_key == 0) {
             identity_key = slots[slot].identity_key;
         }
@@ -525,7 +565,8 @@ std::string BuildLinkStatusCompact(LinkSide side, const MetricsState& metrics) {
             first = false;
             const auto socket_id = static_cast<SRTSOCKET>(tracked_slots[i].member_id);
             const auto is_connected = tracked_slots[i].member_connected == 1;
-            out << "slot" << (i + 1) << ":" << socket_id << ":" << (is_connected ? "up" : "down");
+            out << "slot" << (i + 1) << "[socket=" << socket_id
+                << ",state=" << (is_connected ? "up" : "down") << "]";
         }
     } else {
         const auto& tracked_slots = metrics.output_tracked.slots;
@@ -540,7 +581,8 @@ std::string BuildLinkStatusCompact(LinkSide side, const MetricsState& metrics) {
             first = false;
             const auto socket_id = static_cast<SRTSOCKET>(tracked_slots[i].member_id);
             const auto is_connected = tracked_slots[i].member_connected == 1;
-            out << "slot" << (i + 1) << ":" << socket_id << ":" << (is_connected ? "up" : "down");
+            out << "slot" << (i + 1) << "[socket=" << socket_id
+                << ",state=" << (is_connected ? "up" : "down") << "]";
         }
     }
     return out.str();

@@ -25,6 +25,7 @@ SINK_IP_A="${SINK_IP_A:-172.28.10.30}"
 
 RELAY_INPUT_PORT="${RELAY_INPUT_PORT:-9000}"
 RELAY_OUTPUT_PORT="${RELAY_OUTPUT_PORT:-5000}"
+RELAY_SECONDARY_OUTPUT="${RELAY_SECONDARY_OUTPUT:-}"
 RELAY_METRICS_ENABLED="${RELAY_METRICS_ENABLED:-true}"
 RELAY_METRICS_HOST="${RELAY_METRICS_HOST:-0.0.0.0}"
 RELAY_METRICS_PORT="${RELAY_METRICS_PORT:-9464}"
@@ -80,6 +81,7 @@ Environment overrides:
   NET_A, NET_B, SUBNET_A, SUBNET_B
   RELAY_IP_A, RELAY_IP_B, SENDER_IP_A, SENDER_IP_B, SINK_IP_A
   RELAY_INPUT_PORT, RELAY_OUTPUT_PORT, RELAY_METRICS_ENABLED, RELAY_METRICS_HOST, RELAY_METRICS_PORT, RELAY_INPUT_LATENCY_MS
+  RELAY_SECONDARY_OUTPUT (optional extra --output URI for fan-out tests)
   SENDER_UDP_INPUT_PORT, SENDER_RESTART_DELAY
   SENDER_GROUP_TYPE (e.g. backup, broadcast)
   SENDER_LINK_A_WEIGHT, SENDER_LINK_B_WEIGHT
@@ -220,12 +222,17 @@ start_sink() {
 
 start_relay() {
   container_rm_if_exists "$RELAY_NAME"
+  local relay_output_primary="srt://${SINK_IP_A}:${RELAY_OUTPUT_PORT}?mode=caller&transtype=live&latency=20"
+  local -a relay_output_args=(--output "$relay_output_primary")
+  if [[ -n "$RELAY_SECONDARY_OUTPUT" ]]; then
+    relay_output_args+=(--output "$RELAY_SECONDARY_OUTPUT")
+  fi
   docker run -d --name "$RELAY_NAME" \
     --network "$NET_A" --ip "$RELAY_IP_A" \
     -p "${RELAY_METRICS_PORT}:${RELAY_METRICS_PORT}" \
     "$RELAY_IMAGE" \
     --input "srt://0.0.0.0:${RELAY_INPUT_PORT}?mode=listener&latency=${RELAY_INPUT_LATENCY_MS}" \
-    --output "srt://${SINK_IP_A}:${RELAY_OUTPUT_PORT}?mode=caller&transtype=live&latency=20" \
+    "${relay_output_args[@]}" \
     --stats-interval-ms 1000 \
     --reconnect-delay-ms 1000 \
     --io-timeout-ms 1000 \

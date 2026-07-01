@@ -154,3 +154,10 @@ add_executable(metrics_compat_test
 target_include_directories(metrics_compat_test PRIVATE src)
 target_link_libraries(metrics_compat_test PRIVATE srtrelay_core)
 add_test(NAME metrics_compat_test COMMAND metrics_compat_test)
+
+add_executable(relay_behavior_test
+    tests/relay_behavior_test.cpp
+)
+target_include_directories(relay_behavior_test PRIVATE src)
+target_link_libraries(relay_behavior_test PRIVATE srtrelay_core)
+add_test(NAME relay_behavior_test COMMAND relay_behavior_test)

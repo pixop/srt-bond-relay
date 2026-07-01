@@ -21,6 +21,10 @@ bool IsStdinInputSpec(const std::string& input_uri) {
     return input_uri == "stdin" || input_uri == "-" || input_uri == "fd://stdin";
 }
 
+bool IsStdoutOutputSpec(const std::string& output_uri) {
+    return output_uri == "stdout" || output_uri == "-" || output_uri == "fd://stdout";
+}
+
 }  // namespace
 
 void PrintUsage() {
@@ -28,7 +32,7 @@ void PrintUsage() {
         << "Usage:\n"
         << "  srt-bond-relay \\\n"
         << "    --input '<srt://...|udp://...|stdin|group-list>' [--input '...'] \\\n"
-        << "    --output '<srt://...|stdout|group-list>' \\\n"
+        << "    --output '<srt://...|udp://...|stdout|group-list>' [--output '...'] \\\n"
         << "    --stats-interval-ms 1000 \\\n"
         << "    --reconnect-delay-ms 1000\n\n"
         << "Optional flags:\n"
@@ -50,7 +54,9 @@ void PrintUsage() {
         << "  Group list for bonded SRT: separate endpoints with ';' or ','\n"
         << "  Group lists and bond options are only supported for SRT URIs\n"
         << "  Repeat --input to configure independent switched input sources\n"
+        << "  Repeat --output to configure independent fan-out output sinks\n"
         << "  Multi-input mode supports max one stdin source\n"
+        << "  Multi-output mode supports max one stdout sink\n"
         << "  Bond mode query options: grouptype|group_type|bond|bond_mode\n"
         << "  Bonded per-path source IP options: srcip|sourceip|localip|adapterip|adapter_ip\n"
         << "  UDP query options: rcvbuf|sndbuf|reuseaddr|ttl|localip|localport\n"
@@ -111,7 +117,7 @@ Config ParseArgs(int argc, char** argv) {
         } else if (arg == "--input") {
             cfg.input_uris.push_back(require_value("--input"));
         } else if (arg == "--output") {
-            cfg.output_uri = require_value("--output");
+            cfg.output_uris.push_back(require_value("--output"));
         } else if (arg == "--stats-interval-ms") {
             cfg.stats_interval_ms = std::stoi(require_value("--stats-interval-ms"));
         } else if (arg == "--reconnect-delay-ms") {
@@ -152,7 +158,10 @@ Config ParseArgs(int argc, char** argv) {
         if (cfg.input_uris.size() > 16) {
             throw std::runtime_error("at most 16 --input values are supported");
         }
-        if (cfg.output_uri.empty()) throw std::runtime_error("--output is required");
+        if (cfg.output_uris.empty()) throw std::runtime_error("--output is required");
+        if (cfg.output_uris.size() > 16) {
+            throw std::runtime_error("at most 16 --output values are supported");
+        }
         size_t stdin_count = 0;
         for (const auto& input_uri : cfg.input_uris) {
             if (IsStdinInputSpec(input_uri)) {
@@ -161,6 +170,15 @@ Config ParseArgs(int argc, char** argv) {
         }
         if (stdin_count > 1) {
             throw std::runtime_error("multi-input mode supports at most one stdin source");
+        }
+        size_t stdout_count = 0;
+        for (const auto& output_uri : cfg.output_uris) {
+            if (IsStdoutOutputSpec(output_uri)) {
+                ++stdout_count;
+            }
+        }
+        if (stdout_count > 1) {
+            throw std::runtime_error("multi-output mode supports at most one stdout sink");
         }
         if (cfg.primary_input_index.has_value() && *cfg.primary_input_index >= cfg.input_uris.size()) {
             throw std::runtime_error("--primary-input-index must be in range 1.." +

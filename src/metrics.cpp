@@ -94,6 +94,11 @@ MetricsState::MetricsState() {
         input_source_listening[i].store(0, std::memory_order_relaxed);
         input_source_bond_mode[i].store(0, std::memory_order_relaxed);
     }
+    for (size_t i = 0; i < kMaxOutputSources; ++i) {
+        output_source_connected[i].store(0, std::memory_order_relaxed);
+        output_source_listening[i].store(0, std::memory_order_relaxed);
+        output_source_bond_mode[i].store(0, std::memory_order_relaxed);
+    }
     for (size_t side = 0; side < kFailureSides; ++side) {
         for (size_t i = 0; i < kTimeoutTypes; ++i) {
             timeouts_total[side][i].store(0, std::memory_order_relaxed);
@@ -413,6 +418,34 @@ bool TryExtractEndpoint(const sockaddr_storage& addr, std::string* out_host, int
     return false;
 }
 
+std::string EndpointStringFromHostPort(const std::string& host, int port) {
+    if (host.empty() || port <= 0) {
+        return "unknown";
+    }
+    return host + ":" + std::to_string(port);
+}
+
+bool TryGetSocketEndpoint(SRTSOCKET sock, bool local, std::string* endpoint) {
+    if (endpoint == nullptr || sock == SRT_INVALID_SOCK || sock == 0) {
+        return false;
+    }
+    sockaddr_storage addr {};
+    int addr_len = static_cast<int>(sizeof(addr));
+    const int rc = local
+        ? srt_getsockname(sock, reinterpret_cast<sockaddr*>(&addr), &addr_len)
+        : srt_getpeername(sock, reinterpret_cast<sockaddr*>(&addr), &addr_len);
+    if (rc == SRT_ERROR) {
+        return false;
+    }
+    std::string host;
+    int port = 0;
+    if (!TryExtractEndpoint(addr, &host, &port)) {
+        return false;
+    }
+    *endpoint = EndpointStringFromHostPort(host, port);
+    return true;
+}
+
 json BuildConnectedMembersJson(SRTSOCKET session_sock);
 
 json BuildLastFailureJson(const LastFailureSnapshot& snapshot) {
@@ -505,10 +538,19 @@ json BuildInputSessionSpecJson(const InputEndpointSpec& spec,
     };
 }
 
-json BuildOutputSessionSpecJson(const OutputEndpointSpec& spec, const MetricsState& metrics) {
-    const auto connected = metrics.output_connected.load(std::memory_order_relaxed) == 1;
-    const SRTSOCKET socket_id =
-        static_cast<SRTSOCKET>(metrics.output_transport_socket_id.load(std::memory_order_relaxed));
+json BuildOutputSessionSpecJson(const OutputEndpointSpec& spec,
+                                const MetricsState& metrics,
+                                size_t output_index) {
+    bool connected = metrics.output_connected.load(std::memory_order_relaxed) == 1;
+    bool listening = false;
+    if (output_index < MetricsState::kMaxOutputSources) {
+        connected = metrics.output_source_connected[output_index].load(std::memory_order_relaxed) == 1;
+        listening = metrics.output_source_listening[output_index].load(std::memory_order_relaxed) == 1;
+    }
+    SRTSOCKET socket_id = static_cast<SRTSOCKET>(metrics.output_transport_socket_id.load(std::memory_order_relaxed));
+    if (output_index > 0) {
+        socket_id = SRT_INVALID_SOCK;
+    }
     const SRTSOCKET group_socket_id = (socket_id != SRT_INVALID_SOCK) ? srt_groupof(socket_id) : SRT_INVALID_SOCK;
     json configured = {
         {"bonded", spec.bonded},
@@ -547,6 +589,7 @@ json BuildOutputSessionSpecJson(const OutputEndpointSpec& spec, const MetricsSta
         {"protocol", OutputProtocolName(spec.kind)},
         {"mode", OutputModeName(spec.kind)},
         {"connected", connected},
+        {"listening", listening},
         {"socket_id", socket_id == SRT_INVALID_SOCK ? json(nullptr) : json(socket_id)},
         {"group_socket_id", group_socket_id == SRT_INVALID_SOCK ? json(nullptr) : json(group_socket_id)},
         {"configured", configured},
@@ -563,7 +606,7 @@ json BuildOutputSessionSpecJson(const OutputEndpointSpec& spec, const MetricsSta
 }
 
 std::string BuildSessionSpecsJson(const std::vector<InputEndpointSpec>& input_specs,
-                                  const OutputEndpointSpec& output_spec,
+                                  const std::vector<OutputEndpointSpec>& output_specs,
                                   const Config& cfg,
                                   const MetricsState& metrics) {
     json inputs = json::array();
@@ -578,6 +621,13 @@ std::string BuildSessionSpecsJson(const std::vector<InputEndpointSpec>& input_sp
         input_json["active"] = runtime_active;
         inputs.push_back(std::move(input_json));
     }
+    json outputs = json::array();
+    for (size_t i = 0; i < output_specs.size(); ++i) {
+        json output_json = BuildOutputSessionSpecJson(output_specs[i], metrics, i);
+        output_json["output_index"] = static_cast<int64_t>(i + 1);
+        outputs.push_back(std::move(output_json));
+    }
+
     const int64_t primary_input_index = cfg.primary_input_index.has_value()
         ? static_cast<int64_t>(*cfg.primary_input_index + 1)
         : 0;
@@ -590,7 +640,8 @@ std::string BuildSessionSpecsJson(const std::vector<InputEndpointSpec>& input_sp
         {"primary_input_index", primary_input_index == 0 ? json(nullptr) : json(primary_input_index)},
         {"switch_policy", switch_policy},
         {"switch_mode", SwitchModeName(cfg.switch_mode)},
-        {"output", BuildOutputSessionSpecJson(output_spec, metrics)},
+        {"output", output_specs.empty() ? json(nullptr) : BuildOutputSessionSpecJson(output_specs.front(), metrics, 0)},
+        {"outputs", outputs},
     };
     return out.dump();
 }
@@ -729,6 +780,7 @@ void EmitMemberTransitionEvents(const Logger& logger,
                                 const std::string& active_incident_id) {
     struct TransitionEvent {
         const char* side = "input";
+        size_t member_index = 0;  // 1-based stable slot index
         int64_t socket_id = SRT_INVALID_SOCK;
         std::string peer_host;
         int peer_port = 0;
@@ -757,16 +809,21 @@ void EmitMemberTransitionEvents(const Logger& logger,
                     const int previous_state_i = slots[i].member_status_last_logged;
                     const int previous_connected = slots[i].member_connected_last_logged;
 
-                    if (previous_state_i >= 0 &&
-                        (previous_state_i != current_state_i || previous_connected != current_connected)) {
+                    const bool transitioned = previous_state_i >= 0 &&
+                        (previous_state_i != current_state_i || previous_connected != current_connected);
+                    const bool first_seen_connected = previous_state_i < 0 && current_connected == 1;
+                    if (transitioned || first_seen_connected) {
                         TransitionEvent event;
                         event.side = side_name;
+                        event.member_index = i + 1;
                         event.socket_id = slots[i].member_id;
                         event.peer_host = slots[i].member_peer_host;
                         event.peer_port = slots[i].member_peer_port;
-                        event.prior_state = static_cast<MemberLinkState>(previous_state_i);
+                        event.prior_state = previous_state_i >= 0
+                            ? static_cast<MemberLinkState>(previous_state_i)
+                            : MemberLinkState::kDown;
                         event.new_state = current_state;
-                        event.prior_connected = previous_connected;
+                        event.prior_connected = previous_connected >= 0 ? previous_connected : 0;
                         event.new_connected = current_connected;
                         events.push_back(std::move(event));
                     }
@@ -780,17 +837,47 @@ void EmitMemberTransitionEvents(const Logger& logger,
     }
 
     for (const auto& event : events) {
-        logger.Log(LogLevel::kInfo,
+        std::string remote_endpoint = EndpointStringFromHostPort(event.peer_host, event.peer_port);
+        if (remote_endpoint == "unknown") {
+            (void)TryGetSocketEndpoint(static_cast<SRTSOCKET>(event.socket_id), false, &remote_endpoint);
+        }
+        std::string local_endpoint = "unknown";
+        (void)TryGetSocketEndpoint(static_cast<SRTSOCKET>(event.socket_id), true, &local_endpoint);
+
+        logger.Log(LogLevel::kDebug,
                    "member-transition",
                    std::string("side=") + event.side,
+                   "member_index=" + std::to_string(event.member_index),
                    "member_socket_id=" + std::to_string(event.socket_id),
-                   "peer_host=" + (event.peer_host.empty() ? std::string("unknown") : event.peer_host),
-                   "peer_port=" + std::to_string(event.peer_port),
+                   "local_endpoint=" + local_endpoint,
+                   "remote_endpoint=" + remote_endpoint,
                    std::string("prior_state=") + MemberLinkStateName(event.prior_state),
                    std::string("new_state=") + MemberLinkStateName(event.new_state),
                    "prior_connected=" + std::to_string(event.prior_connected),
                    "new_connected=" + std::to_string(event.new_connected),
                    "incident_id=" + (active_incident_id.empty() ? std::string("none") : active_incident_id));
+
+        const bool became_connected = event.prior_connected != 1 && event.new_connected == 1;
+        const bool became_disconnected = event.prior_connected == 1 && event.new_connected != 1;
+        if (became_connected) {
+            const std::string event_name = std::string(event.side) + "-member-connected";
+            logger.Log(LogLevel::kInfo,
+                       event_name.c_str(),
+                       "member_index=" + std::to_string(event.member_index),
+                       "member_socket_id=" + std::to_string(event.socket_id),
+                       "local_endpoint=" + local_endpoint,
+                       "remote_endpoint=" + remote_endpoint,
+                       "incident_id=" + (active_incident_id.empty() ? std::string("none") : active_incident_id));
+        } else if (became_disconnected) {
+            const std::string event_name = std::string(event.side) + "-member-disconnected";
+            logger.Log(LogLevel::kInfo,
+                       event_name.c_str(),
+                       "member_index=" + std::to_string(event.member_index),
+                       "member_socket_id=" + std::to_string(event.socket_id),
+                       "local_endpoint=" + local_endpoint,
+                       "remote_endpoint=" + remote_endpoint,
+                       "incident_id=" + (active_incident_id.empty() ? std::string("none") : active_incident_id));
+        }
     }
 }
 
@@ -1627,6 +1714,7 @@ std::string RenderPrometheusMetrics(const MetricsState& metrics) {
     const auto output_transport_byte_drop_current = metrics.output_transport_byte_drop_current.load(std::memory_order_relaxed);
     const auto path_ready = (input_connected == 1 && output_connected == 1) ? 1 : 0;
     const auto input_sources_total = metrics.input_sources_total.load(std::memory_order_relaxed);
+    const auto output_sources_total = metrics.output_sources_total.load(std::memory_order_relaxed);
     const auto active_input_index = metrics.active_input_index.load(std::memory_order_relaxed);
     const auto input_switches_total = metrics.input_switches_total.load(std::memory_order_relaxed);
     const auto primary_input_index = metrics.primary_input_index.load(std::memory_order_relaxed);
@@ -1692,12 +1780,13 @@ std::string RenderPrometheusMetrics(const MetricsState& metrics) {
         const char* help;
         int64_t value;
     };
-    const std::array<I64MetricDef, 13> i64_metric_defs{{
+    const std::array<I64MetricDef, 14> i64_metric_defs{{
         {"srt_relay_input_listening", "gauge", "Relay input listener is up (1/0).", input_listening},
         {"srt_relay_input_connected", "gauge", "Relay input session is connected (1/0).", input_connected},
         {"srt_relay_output_connected", "gauge", "Relay output session is connected (1/0).", output_connected},
         {"srt_relay_path_ready", "gauge", "Relay data path input+output connected (1/0).", path_ready},
         {"srt_relay_input_sources_total", "gauge", "Configured independent input source count.", input_sources_total},
+        {"srt_relay_output_sources_total", "gauge", "Configured independent output sink count.", output_sources_total},
         {"srt_relay_active_input_index", "gauge", "1-based active input source index.", active_input_index},
         {"srt_relay_primary_input_index", "gauge", "Configured primary input index (1-based, 0 when unset).", primary_input_index},
         {"srt_relay_input_links_total", "gauge", "Total number of input links in the active SRT group.", input_links_total},
@@ -1939,6 +2028,27 @@ std::string RenderPrometheusMetrics(const MetricsState& metrics) {
         out << "srt_relay_input_source_bond_mode{input_index=\"" << (i + 1)
             << "\",mode=\"backup\"} " << (bond_mode == 2 ? 1 : 0) << "\n";
     }
+    out << "# HELP srt_relay_output_source_connected Output sink connection state by index.\n";
+    out << "# TYPE srt_relay_output_source_connected gauge\n";
+    out << "# HELP srt_relay_output_source_listening Output sink listening state by index.\n";
+    out << "# TYPE srt_relay_output_source_listening gauge\n";
+    out << "# HELP srt_relay_output_source_bond_mode Configured bond mode by output index.\n";
+    out << "# TYPE srt_relay_output_source_bond_mode gauge\n";
+    const size_t output_source_count_capped = std::min(static_cast<size_t>(std::max<int64_t>(0, output_sources_total)),
+                                                       MetricsState::kMaxOutputSources);
+    for (size_t i = 0; i < output_source_count_capped; ++i) {
+        const int connected_state = metrics.output_source_connected[i].load(std::memory_order_relaxed);
+        const int listening_state = metrics.output_source_listening[i].load(std::memory_order_relaxed);
+        const int bond_mode = metrics.output_source_bond_mode[i].load(std::memory_order_relaxed);
+        out << "srt_relay_output_source_connected{output_index=\"" << (i + 1) << "\"} " << connected_state << "\n";
+        out << "srt_relay_output_source_listening{output_index=\"" << (i + 1) << "\"} " << listening_state << "\n";
+        out << "srt_relay_output_source_bond_mode{output_index=\"" << (i + 1)
+            << "\",mode=\"unknown\"} " << (bond_mode == 0 ? 1 : 0) << "\n";
+        out << "srt_relay_output_source_bond_mode{output_index=\"" << (i + 1)
+            << "\",mode=\"broadcast\"} " << (bond_mode == 1 ? 1 : 0) << "\n";
+        out << "srt_relay_output_source_bond_mode{output_index=\"" << (i + 1)
+            << "\",mode=\"backup\"} " << (bond_mode == 2 ? 1 : 0) << "\n";
+    }
     emit_i64("srt_relay_last_rx_unix_seconds", "gauge", "Unix timestamp of last received packet.", last_rx_unix_seconds);
     emit_i64("srt_relay_last_tx_unix_seconds", "gauge", "Unix timestamp of last forwarded packet.", last_tx_unix_seconds);
     emit_i64("srt_relay_last_input_failure_unix_seconds", "gauge", "Unix timestamp of last input-side failure.", last_input_failure_unix_seconds);
@@ -1982,8 +2092,8 @@ MetricsServer::MetricsServer(const Config& cfg,
                              const Logger& logger,
                              MetricsState& metrics,
                              const std::vector<InputEndpointSpec>& input_specs,
-                             const OutputEndpointSpec& output_spec)
-    : cfg_(cfg), logger_(logger), metrics_(metrics), input_specs_(&input_specs), output_spec_(&output_spec) {}
+                             const std::vector<OutputEndpointSpec>& output_specs)
+    : cfg_(cfg), logger_(logger), metrics_(metrics), input_specs_(&input_specs), output_specs_(&output_specs) {}
 
 MetricsServer::~MetricsServer() { Stop(); }
 
@@ -1999,13 +2109,13 @@ void MetricsServer::Start() {
         res.set_content("ok\n", "text/plain");
     });
     server_.Get("/session/specs", [&](const httplib::Request&, httplib::Response& res) {
-        if (input_specs_ == nullptr || output_spec_ == nullptr) {
+        if (input_specs_ == nullptr || output_specs_ == nullptr) {
             res.status = 500;
             res.set_content("{\"error\":\"session specs unavailable\"}\n",
                             "application/json; charset=utf-8");
             return;
         }
-        res.set_content(BuildSessionSpecsJson(*input_specs_, *output_spec_, cfg_, metrics_) + "\n",
+        res.set_content(BuildSessionSpecsJson(*input_specs_, *output_specs_, cfg_, metrics_) + "\n",
                         "application/json; charset=utf-8");
     });
     server_.Post("/metrics/links/compact", [&](const httplib::Request& req, httplib::Response& res) {
@@ -2145,6 +2255,21 @@ const char* BondModeName(int bond_mode) {
     return "unknown";
 }
 
+std::string FormatWithThousands(uint64_t value) {
+    std::string digits = std::to_string(value);
+    for (int i = static_cast<int>(digits.size()) - 3; i > 0; i -= 3) {
+        digits.insert(static_cast<size_t>(i), ",");
+    }
+    return digits;
+}
+
+std::string FormatSignedWithThousands(int64_t value) {
+    if (value < 0) {
+        return "-" + FormatWithThousands(static_cast<uint64_t>(-value));
+    }
+    return FormatWithThousands(static_cast<uint64_t>(value));
+}
+
 void PublishIntervalMetrics(const IntervalRates& rates, RelayStats* stats, MetricsState* metrics) {
     metrics->rx_bytes_per_sec.store(rates.rx_bps, std::memory_order_relaxed);
     metrics->tx_bytes_per_sec.store(rates.tx_bps, std::memory_order_relaxed);
@@ -2187,10 +2312,14 @@ void MaybeLogStats(const Config& cfg,
     const auto output_links_healthy = metrics->output_links_healthy.load(std::memory_order_relaxed);
     const auto output_links_running = metrics->output_links_running.load(std::memory_order_relaxed);
     const auto input_transport_byte_recv_total = metrics->input_transport_byte_recv_total.load(std::memory_order_relaxed);
+    const auto input_transport_byte_retrans_total = metrics->input_transport_byte_retrans_total.load(std::memory_order_relaxed);
+    const auto input_transport_byte_loss_total = metrics->input_transport_byte_loss_total.load(std::memory_order_relaxed);
     const auto input_group_packet_drop_total = metrics->input_group_packet_drop_total.load(std::memory_order_relaxed);
     const auto input_group_byte_drop_total = metrics->input_group_byte_drop_total.load(std::memory_order_relaxed);
     const auto input_transport_packet_belated_total = metrics->input_transport_packet_belated_total.load(std::memory_order_relaxed);
     const auto output_transport_byte_sent_total = metrics->output_transport_byte_sent_total.load(std::memory_order_relaxed);
+    const auto output_transport_byte_retrans_total = metrics->output_transport_byte_retrans_total.load(std::memory_order_relaxed);
+    const auto output_transport_byte_drop_total = metrics->output_transport_byte_drop_total.load(std::memory_order_relaxed);
     const char* input_bond_mode_name = BondModeName(metrics->input_bond_mode.load(std::memory_order_relaxed));
     const char* output_bond_mode_name = BondModeName(metrics->output_bond_mode.load(std::memory_order_relaxed));
     const auto input_link_status = BuildInputLinkStatusCompact(*metrics);
@@ -2198,35 +2327,83 @@ void MaybeLogStats(const Config& cfg,
     const auto input_effective_latency_ms = metrics->input_effective_latency_ms.load(std::memory_order_relaxed);
     const auto output_effective_latency_ms = metrics->output_effective_latency_ms.load(std::memory_order_relaxed);
 
+    const auto input_transport_byte_retrans_interval = CounterDeltaWithReset(
+        stats->last_input_transport_byte_retrans_total,
+        input_transport_byte_retrans_total);
+    const auto input_transport_byte_loss_interval = CounterDeltaWithReset(
+        stats->last_input_transport_byte_loss_total,
+        input_transport_byte_loss_total);
+    const auto input_group_byte_drop_interval = CounterDeltaWithReset(
+        stats->last_input_group_byte_drop_total,
+        input_group_byte_drop_total);
+    const auto output_transport_byte_retrans_interval = CounterDeltaWithReset(
+        stats->last_output_transport_byte_retrans_total,
+        output_transport_byte_retrans_total);
+    const auto output_transport_byte_drop_interval = CounterDeltaWithReset(
+        stats->last_output_transport_byte_drop_total,
+        output_transport_byte_drop_total);
+
     logger.Log(LogLevel::kInfo,
-               "stats",
-               "rx_bytes_per_sec=" + std::to_string(rates.rx_bps),
-               "tx_bytes_per_sec=" + std::to_string(rates.tx_bps),
-               "rx_msgs_per_sec=" + std::to_string(rates.rx_mps),
-               "tx_msgs_per_sec=" + std::to_string(rates.tx_mps),
-               "send_failures=" + std::to_string(stats->interval_send_failures),
-               "reconnect_count=" + std::to_string(stats->reconnect_count),
-               "input_rtt_ms=" + std::to_string(input_rtt_ms),
-               "output_rtt_ms=" + std::to_string(output_rtt_ms),
-               "input_links_total=" + std::to_string(input_links_total),
-               "input_links_healthy=" + std::to_string(input_links_healthy),
-               "input_links_running=" + std::to_string(input_links_running),
-               "output_links_total=" + std::to_string(output_links_total),
-               "output_links_healthy=" + std::to_string(output_links_healthy),
-               "output_links_running=" + std::to_string(output_links_running),
-               "input_link_status=" + input_link_status,
-               "output_link_status=" + output_link_status,
-               "input_transport_byte_recv_total=" + std::to_string(input_transport_byte_recv_total),
-               "input_group_packet_drop_total=" + std::to_string(input_group_packet_drop_total),
-               "input_group_byte_drop_total=" + std::to_string(input_group_byte_drop_total),
-               "input_transport_packet_belated_total=" + std::to_string(input_transport_packet_belated_total),
-               "output_transport_byte_sent_total=" + std::to_string(output_transport_byte_sent_total),
-               "input_effective_latency_ms=" + std::to_string(input_effective_latency_ms),
-               "output_effective_latency_ms=" + std::to_string(output_effective_latency_ms),
-               std::string("input_bond_mode=") + input_bond_mode_name,
-               std::string("output_bond_mode=") + output_bond_mode_name,
-               std::string("input_state=") + (state.input_connected ? "connected" : (state.input_listening ? "listening" : "down")),
-               std::string("output_state=") + (state.output_connected ? "connected" : "down"));
+               "stats-throughput",
+               "Total forwarded: rx " + FormatWithThousands(stats->total_rx_bytes) + " bytes, tx " +
+                   FormatWithThousands(stats->total_tx_bytes) + " bytes, rx " +
+                   FormatWithThousands(stats->total_rx_msgs) + " packets, tx " +
+                   FormatWithThousands(stats->total_tx_msgs) + " packets",
+               "| Interval forwarded: rx " + FormatWithThousands(stats->interval_rx_bytes) + " bytes, tx " +
+                   FormatWithThousands(stats->interval_tx_bytes) + " bytes, rx " +
+                   FormatWithThousands(stats->interval_rx_msgs) + " packets, tx " +
+                   FormatWithThousands(stats->interval_tx_msgs) + " packets",
+               "| Rates: rx " + FormatWithThousands(rates.rx_bps) + " Bps, tx " +
+                   FormatWithThousands(rates.tx_bps) + " Bps, rx " +
+                   FormatWithThousands(rates.rx_mps) + " pps, tx " +
+                   FormatWithThousands(rates.tx_mps) + " pps",
+               "| Failures: send: " + FormatWithThousands(stats->interval_send_failures) +
+                   " (interval), reconnects: " + FormatWithThousands(stats->reconnect_count) + " (total)");
+
+    logger.Log(LogLevel::kInfo,
+               "stats-input-transport",
+               "Total recv: " + FormatWithThousands(input_transport_byte_recv_total) +
+                   " bytes, retransmit: " + FormatWithThousands(input_transport_byte_retrans_total) +
+                   " bytes, lost: " + FormatWithThousands(input_transport_byte_loss_total) +
+                   " bytes, dropped: " + FormatWithThousands(input_group_byte_drop_total) + " bytes (" +
+                   FormatWithThousands(input_group_packet_drop_total) + " packets)",
+               "| Interval recv: " + FormatWithThousands(stats->interval_rx_bytes) +
+                   " bytes, retransmit: " + FormatWithThousands(input_transport_byte_retrans_interval) +
+                   " bytes, lost: " + FormatWithThousands(input_transport_byte_loss_interval) +
+                   " bytes, dropped: " + FormatWithThousands(input_group_byte_drop_interval) + " bytes",
+               "| Belated total: " + FormatWithThousands(input_transport_packet_belated_total) + " packets");
+
+    logger.Log(LogLevel::kInfo,
+               "stats-output-transport",
+               "Total sent: " + FormatWithThousands(output_transport_byte_sent_total) +
+                   " bytes, retransmit: " + FormatWithThousands(output_transport_byte_retrans_total) +
+                   " bytes, dropped: " + FormatWithThousands(output_transport_byte_drop_total) + " bytes",
+               "| Interval sent: " + FormatWithThousands(stats->interval_tx_bytes) +
+                   " bytes, retransmit: " + FormatWithThousands(output_transport_byte_retrans_interval) +
+                   " bytes, dropped: " + FormatWithThousands(output_transport_byte_drop_interval) + " bytes");
+
+    logger.Log(LogLevel::kInfo,
+               "stats-link-health",
+               "Link health: input " + FormatSignedWithThousands(input_links_running) + "/" +
+                   FormatSignedWithThousands(input_links_total) + " running (" +
+                   FormatSignedWithThousands(input_links_healthy) + " healthy), output " +
+                   FormatSignedWithThousands(output_links_running) + "/" +
+                   FormatSignedWithThousands(output_links_total) + " running (" +
+                   FormatSignedWithThousands(output_links_healthy) + " healthy)",
+               "| Latency/RTT: input delay: " + FormatSignedWithThousands(input_effective_latency_ms) +
+                   " ms, output delay: " + FormatSignedWithThousands(output_effective_latency_ms) +
+                   " ms, input RTT: " + FormatSignedWithThousands(input_rtt_ms) +
+                   " ms, output RTT: " + FormatSignedWithThousands(output_rtt_ms) + " ms",
+               std::string("| Modes: input: ") + input_bond_mode_name + ", output: " + output_bond_mode_name,
+               std::string("| State: input: ") + (state.input_connected ? "connected" : (state.input_listening ? "listening" : "down")) +
+                   ", output: " + (state.output_connected ? "connected" : "down"),
+               "| Slot map: input[" + input_link_status + "] output[" + output_link_status + "]");
+
+    stats->last_input_transport_byte_retrans_total = input_transport_byte_retrans_total;
+    stats->last_input_transport_byte_loss_total = input_transport_byte_loss_total;
+    stats->last_input_group_byte_drop_total = input_group_byte_drop_total;
+    stats->last_output_transport_byte_retrans_total = output_transport_byte_retrans_total;
+    stats->last_output_transport_byte_drop_total = output_transport_byte_drop_total;
 
     stats->interval_rx_bytes = 0;
     stats->interval_tx_bytes = 0;

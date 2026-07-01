@@ -15,7 +15,7 @@ enum class SwitchMode {
 
 struct Config {
     std::vector<std::string> input_uris;
-    std::string output_uri;
+    std::vector<std::string> output_uris;
     int stats_interval_ms = 1000;
     int reconnect_delay_ms = 1000;
     int max_message_size = 1456;

@@ -123,6 +123,8 @@ std::vector<std::string> ParseRawUriList(const std::string& spec, EndpointScheme
 
 }  // namespace
 
+std::vector<OutputEndpointSpec> ParseOutputEndpointSpecs(const Config& cfg);
+
 InputEndpointSpec ParseInputEndpointSpecFromUri(const std::string& input_uri) {
     InputEndpointSpec out;
     if (IsStdinInputSpec(input_uri)) {
@@ -207,16 +209,21 @@ InputEndpointSpec ParseInputEndpointSpec(const Config& cfg) {
 }
 
 OutputEndpointSpec ParseOutputEndpointSpec(const Config& cfg) {
+    const std::vector<OutputEndpointSpec> specs = ParseOutputEndpointSpecs(cfg);
+    return specs.front();
+}
+
+OutputEndpointSpec ParseOutputEndpointSpecFromUri(const std::string& output_uri) {
     OutputEndpointSpec out;
-    if (IsStdoutOutputSpec(cfg.output_uri)) {
+    if (IsStdoutOutputSpec(output_uri)) {
         out.kind = OutputEndpointKind::kStdout;
         return out;
     }
 
     EndpointScheme scheme = EndpointScheme::kSrt;
-    const auto raw = ParseRawUriList(cfg.output_uri, &scheme);
+    const auto raw = ParseRawUriList(output_uri, &scheme);
     if (scheme == EndpointScheme::kSrt) {
-        out.uris = ParseSrtUriList(cfg.output_uri);
+        out.uris = ParseSrtUriList(output_uri);
         const std::string mode = QueryString(out.uris.front().query, "mode");
         const std::string resolved_mode = mode.empty() ? "caller" : mode;
         for (const auto& uri : out.uris) {
@@ -260,6 +267,26 @@ OutputEndpointSpec ParseOutputEndpointSpec(const Config& cfg) {
         throw std::runtime_error("output UDP listener mode is not supported; use mode=caller");
     } else {
         throw std::runtime_error("output UDP URI mode must be caller or listener");
+    }
+    return out;
+}
+
+std::vector<OutputEndpointSpec> ParseOutputEndpointSpecs(const Config& cfg) {
+    std::vector<OutputEndpointSpec> out;
+    out.reserve(cfg.output_uris.size());
+    size_t stdout_count = 0;
+    for (const auto& output_uri : cfg.output_uris) {
+        OutputEndpointSpec spec = ParseOutputEndpointSpecFromUri(output_uri);
+        if (spec.kind == OutputEndpointKind::kStdout) {
+            ++stdout_count;
+            if (stdout_count > 1) {
+                throw std::runtime_error("multi-output mode supports at most one stdout sink");
+            }
+        }
+        out.push_back(std::move(spec));
+    }
+    if (out.empty()) {
+        throw std::runtime_error("--output is required");
     }
     return out;
 }

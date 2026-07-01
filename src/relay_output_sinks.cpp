@@ -1,6 +1,7 @@
 #include "srtrelay/relay_io.hpp"
 
 #include <errno.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -16,6 +17,74 @@ namespace srtrelay {
 namespace {
 
 constexpr int kDefaultUdpTtl = 64;
+
+std::string FormatSockaddr(const sockaddr* addr, socklen_t addr_len) {
+    if (addr == nullptr || addr_len == 0) {
+        return "unknown";
+    }
+    char host[NI_MAXHOST] {};
+    char service[NI_MAXSERV] {};
+    const int rc = getnameinfo(addr,
+                               addr_len,
+                               host,
+                               sizeof(host),
+                               service,
+                               sizeof(service),
+                               NI_NUMERICHOST | NI_NUMERICSERV);
+    if (rc != 0) {
+        return "unknown";
+    }
+    return std::string(host) + ":" + service;
+}
+
+void ReadFdEndpoints(int fd, std::string* local_endpoint, std::string* remote_endpoint) {
+    if (local_endpoint != nullptr) {
+        *local_endpoint = "unknown";
+    }
+    if (remote_endpoint != nullptr) {
+        *remote_endpoint = "unknown";
+    }
+    if (fd < 0) {
+        return;
+    }
+
+    sockaddr_storage local_addr {};
+    socklen_t local_len = sizeof(local_addr);
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&local_addr), &local_len) == 0 && local_endpoint != nullptr) {
+        *local_endpoint = FormatSockaddr(reinterpret_cast<sockaddr*>(&local_addr), local_len);
+    }
+    sockaddr_storage remote_addr {};
+    socklen_t remote_len = sizeof(remote_addr);
+    if (::getpeername(fd, reinterpret_cast<sockaddr*>(&remote_addr), &remote_len) == 0 && remote_endpoint != nullptr) {
+        *remote_endpoint = FormatSockaddr(reinterpret_cast<sockaddr*>(&remote_addr), remote_len);
+    }
+}
+
+void ReadSrtEndpoints(SRTSOCKET sock, std::string* local_endpoint, std::string* remote_endpoint) {
+    if (local_endpoint != nullptr) {
+        *local_endpoint = "unknown";
+    }
+    if (remote_endpoint != nullptr) {
+        *remote_endpoint = "unknown";
+    }
+    if (sock == SRT_INVALID_SOCK) {
+        return;
+    }
+
+    sockaddr_storage local_addr {};
+    int local_len = sizeof(local_addr);
+    if (srt_getsockname(sock, reinterpret_cast<sockaddr*>(&local_addr), &local_len) != SRT_ERROR &&
+        local_endpoint != nullptr) {
+        *local_endpoint = FormatSockaddr(reinterpret_cast<sockaddr*>(&local_addr), static_cast<socklen_t>(local_len));
+    }
+
+    sockaddr_storage remote_addr {};
+    int remote_len = sizeof(remote_addr);
+    if (srt_getpeername(sock, reinterpret_cast<sockaddr*>(&remote_addr), &remote_len) != SRT_ERROR &&
+        remote_endpoint != nullptr) {
+        *remote_endpoint = FormatSockaddr(reinterpret_cast<sockaddr*>(&remote_addr), static_cast<socklen_t>(remote_len));
+    }
+}
 
 bool IsUdpTimeoutErrno(int err) {
     return err == EAGAIN || err == EWOULDBLOCK;
@@ -114,11 +183,17 @@ public:
             }
             socket_.Set(sock);
             metrics->output_connected.store(1, std::memory_order_relaxed);
+            std::string local_endpoint;
+            std::string remote_endpoint;
+            ReadSrtEndpoints(sock, &local_endpoint, &remote_endpoint);
             logger.Log(LogLevel::kInfo, "output-connected",
                        std::string("mode=caller"),
+                       "output_index=" + std::to_string(attempt_ctx.source_index.value_or(1)),
                        "bonded=" + std::string(bonded_ ? "true" : "false"),
                        "members=" + std::to_string(uris_.size()),
                        "socket=" + std::to_string(sock),
+                       "local_endpoint=" + local_endpoint,
+                       "remote_endpoint=" + remote_endpoint,
                        "attempt_id=" + std::to_string(attempt_ctx.attempt_id),
                        "incident_id=" + (attempt_ctx.incident_id.empty() ? std::string("none") : attempt_ctx.incident_id));
         } catch (const std::exception& ex) {
@@ -166,6 +241,7 @@ public:
     SRTSOCKET TransportSocket() const override { return socket_.Get(); }
     OutputMetricsMode MetricsMode() const override { return OutputMetricsMode::kSrtSocket; }
     bool IsConnected() const override { return socket_.Valid(); }
+    bool IsListening() const override { return false; }
     IoErrorKind LastSendErrorKind() const override { return send_error_kind_; }
     std::string LastSendErrorMessage() const override { return send_error_message_; }
     IoErrorKind LastEnsureErrorKind() const override { return ensure_error_kind_; }
@@ -207,8 +283,14 @@ public:
                 const SRTSOCKET accepted = detail::AcceptBondSession(listeners_, cfg, "output");
                 ApplyIntSockOpt(accepted, SRTO_SNDTIMEO, cfg.io_timeout_ms, "SRTO_SNDTIMEO");
                 session_.Set(accepted);
+                std::string local_endpoint;
+                std::string remote_endpoint;
+                ReadSrtEndpoints(accepted, &local_endpoint, &remote_endpoint);
                 logger.Log(LogLevel::kInfo, "output-client-connected",
                            "socket=" + std::to_string(accepted),
+                           "output_index=" + std::to_string(attempt_ctx.source_index.value_or(1)),
+                           "local_endpoint=" + local_endpoint,
+                           "remote_endpoint=" + remote_endpoint,
                            "attempt_id=" + std::to_string(attempt_ctx.attempt_id),
                            "incident_id=" + (attempt_ctx.incident_id.empty() ? std::string("none") : attempt_ctx.incident_id));
             }
@@ -252,6 +334,7 @@ public:
     SRTSOCKET TransportSocket() const override { return session_.Get(); }
     OutputMetricsMode MetricsMode() const override { return OutputMetricsMode::kSrtSocket; }
     bool IsConnected() const override { return session_.Valid(); }
+    bool IsListening() const override { return !listeners_.empty(); }
     IoErrorKind LastSendErrorKind() const override { return send_error_kind_; }
     std::string LastSendErrorMessage() const override { return send_error_message_; }
     IoErrorKind LastEnsureErrorKind() const override { return ensure_error_kind_; }
@@ -274,10 +357,10 @@ public:
     ~UdpOutputSink() override { CloseSocket(); }
 
     void EnsureReady(const Config& cfg,
-                     const Logger&,
+                     const Logger& logger,
                      RelayStats* stats,
                      MetricsState* metrics,
-                     const EnsureAttemptContext&) override {
+                     const EnsureAttemptContext& attempt_ctx) override {
         ensure_error_kind_ = IoErrorKind::kNone;
         ensure_error_message_.clear();
         if (socket_fd_ >= 0) {
@@ -319,6 +402,16 @@ public:
 
         socket_fd_ = fd;
         metrics->output_connected.store(1, std::memory_order_relaxed);
+        std::string local_endpoint;
+        std::string remote_endpoint;
+        ReadFdEndpoints(fd, &local_endpoint, &remote_endpoint);
+        logger.Log(LogLevel::kInfo,
+                   "output-connected",
+                   "output_index=" + std::to_string(attempt_ctx.source_index.value_or(1)),
+                   std::string("mode=") + (listener_ ? "listener" : "caller"),
+                   "socket_fd=" + std::to_string(fd),
+                   "local_endpoint=" + local_endpoint,
+                   "remote_endpoint=" + remote_endpoint);
     }
 
     OutputSendResult Send(const char* data, int size) override {
@@ -342,6 +435,7 @@ public:
     SRTSOCKET TransportSocket() const override { return SRT_INVALID_SOCK; }
     OutputMetricsMode MetricsMode() const override { return OutputMetricsMode::kStdout; }
     bool IsConnected() const override { return socket_fd_ >= 0; }
+    bool IsListening() const override { return listener_ && socket_fd_ >= 0; }
     IoErrorKind LastSendErrorKind() const override { return send_error_kind_; }
     std::string LastSendErrorMessage() const override { return send_error_message_; }
     IoErrorKind LastEnsureErrorKind() const override { return ensure_error_kind_; }
@@ -419,6 +513,195 @@ private:
     std::string ensure_error_message_;
 };
 
+class OutputFanoutSink : public OutputSink {
+public:
+    explicit OutputFanoutSink(std::vector<OutputEndpointSpec> specs) : specs_(std::move(specs)) {
+        sinks_.reserve(specs_.size());
+        for (const auto& spec : specs_) {
+            sinks_.push_back(BuildOutputSink(spec));
+        }
+    }
+
+    void EnsureReady(const Config& cfg,
+                     const Logger& logger,
+                     RelayStats* stats,
+                     MetricsState* metrics,
+                     const EnsureAttemptContext& attempt_ctx) override {
+        ensure_error_kind_ = IoErrorKind::kNone;
+        ensure_error_message_.clear();
+        logger_ = &logger;
+        metrics_ = metrics;
+
+        bool had_error = false;
+        for (size_t i = 0; i < sinks_.size(); ++i) {
+            OutputSink* sink = sinks_.at(i).get();
+            if (!sink->NeedsEnsurePoll()) {
+                continue;
+            }
+            EnsureAttemptContext child_ctx = attempt_ctx;
+            child_ctx.source_index = i + 1;
+            try {
+                sink->EnsureReady(cfg, logger, stats, metrics, child_ctx);
+            } catch (const std::exception& ex) {
+                had_error = true;
+                ensure_error_kind_ = sink->LastEnsureErrorKind();
+                ensure_error_message_ = sink->LastEnsureErrorMessage().empty()
+                    ? std::string(ex.what())
+                    : sink->LastEnsureErrorMessage();
+                logger.Log(LogLevel::kWarn,
+                           "output-branch-ensure-failed",
+                           "output_index=" + std::to_string(i + 1),
+                           "reason_detail=" + ensure_error_message_,
+                           "attempt_id=" + std::to_string(attempt_ctx.attempt_id),
+                           "incident_id=" + (attempt_ctx.incident_id.empty() ? std::string("none") : attempt_ctx.incident_id));
+            } catch (...) {
+                had_error = true;
+                ensure_error_kind_ = sink->LastEnsureErrorKind();
+                ensure_error_message_ = sink->LastEnsureErrorMessage().empty()
+                    ? std::string("unknown output ensure failure")
+                    : sink->LastEnsureErrorMessage();
+                logger.Log(LogLevel::kWarn,
+                           "output-branch-ensure-failed",
+                           "output_index=" + std::to_string(i + 1),
+                           "reason_detail=" + ensure_error_message_,
+                           "attempt_id=" + std::to_string(attempt_ctx.attempt_id),
+                           "incident_id=" + (attempt_ctx.incident_id.empty() ? std::string("none") : attempt_ctx.incident_id));
+            }
+        }
+
+        RefreshAggregateConnected(metrics);
+        if (!IsConnected() && had_error) {
+            throw std::runtime_error(ensure_error_message_.empty() ? "all outputs disconnected" : ensure_error_message_);
+        }
+    }
+
+    OutputSendResult Send(const char* data, int size) override {
+        send_error_kind_ = IoErrorKind::kNone;
+        send_error_message_.clear();
+        bool sent_any = false;
+        bool had_error = false;
+        int sent_bytes = 0;
+
+        for (size_t i = 0; i < sinks_.size(); ++i) {
+            OutputSink* sink = sinks_.at(i).get();
+            if (!sink->IsConnected()) {
+                continue;
+            }
+            const OutputSendResult child_result = sink->Send(data, size);
+            if (child_result.status == OutputSendStatus::kError) {
+                had_error = true;
+                send_error_kind_ = sink->LastSendErrorKind();
+                send_error_message_ = sink->LastSendErrorMessage();
+                sink->MarkDisconnected(metrics_ == nullptr ? &fallback_metrics_ : metrics_);
+                if (logger_ != nullptr) {
+                    logger_->Log(LogLevel::kWarn,
+                                 "output-branch-send-failed",
+                                 "output_index=" + std::to_string(i + 1),
+                                 "reason_detail=" + (send_error_message_.empty()
+                                     ? std::string("output send failed")
+                                     : send_error_message_));
+                }
+                continue;
+            }
+            sent_any = true;
+            if (sent_bytes == 0) {
+                sent_bytes = child_result.bytes;
+            }
+        }
+
+        RefreshAggregateConnected(metrics_ == nullptr ? &fallback_metrics_ : metrics_);
+        if (sent_any) {
+            send_error_kind_ = IoErrorKind::kNone;
+            send_error_message_.clear();
+            return {OutputSendStatus::kSent, sent_bytes};
+        }
+        if (had_error) {
+            return {OutputSendStatus::kError, 0};
+        }
+        send_error_kind_ = IoErrorKind::kDisconnected;
+        send_error_message_ = "no connected outputs available";
+        return {OutputSendStatus::kError, 0};
+    }
+
+    void MarkDisconnected(MetricsState* metrics) override {
+        for (auto& sink : sinks_) {
+            sink->MarkDisconnected(metrics);
+        }
+        metrics->output_connected.store(0, std::memory_order_relaxed);
+        ResetOutputTrackingMetrics(metrics);
+    }
+
+    SRTSOCKET TransportSocket() const override {
+        for (const auto& sink : sinks_) {
+            if (sink->MetricsMode() == OutputMetricsMode::kSrtSocket && sink->TransportSocket() != SRT_INVALID_SOCK) {
+                return sink->TransportSocket();
+            }
+        }
+        return SRT_INVALID_SOCK;
+    }
+
+    OutputMetricsMode MetricsMode() const override {
+        return TransportSocket() == SRT_INVALID_SOCK ? OutputMetricsMode::kStdout : OutputMetricsMode::kSrtSocket;
+    }
+
+    bool IsConnected() const override {
+        for (const auto& sink : sinks_) {
+            if (sink->IsConnected()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool IsListening() const override {
+        for (const auto& sink : sinks_) {
+            if (sink->IsListening()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool NeedsEnsurePoll() const override {
+        for (const auto& sink : sinks_) {
+            if (sink->NeedsEnsurePoll()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    IoErrorKind LastSendErrorKind() const override { return send_error_kind_; }
+    std::string LastSendErrorMessage() const override { return send_error_message_; }
+    IoErrorKind LastEnsureErrorKind() const override { return ensure_error_kind_; }
+    std::string LastEnsureErrorMessage() const override { return ensure_error_message_; }
+    size_t OutputCount() const override { return sinks_.size(); }
+    bool OutputConnected(size_t index) const override {
+        return index < sinks_.size() ? sinks_[index]->IsConnected() : false;
+    }
+    bool OutputListening(size_t index) const override {
+        return index < sinks_.size() ? sinks_[index]->IsListening() : false;
+    }
+
+private:
+    void RefreshAggregateConnected(MetricsState* metrics) const {
+        if (metrics == nullptr) {
+            return;
+        }
+        metrics->output_connected.store(IsConnected() ? 1 : 0, std::memory_order_relaxed);
+    }
+
+    std::vector<OutputEndpointSpec> specs_;
+    std::vector<std::unique_ptr<OutputSink>> sinks_;
+    IoErrorKind send_error_kind_ = IoErrorKind::kNone;
+    std::string send_error_message_;
+    IoErrorKind ensure_error_kind_ = IoErrorKind::kNone;
+    std::string ensure_error_message_;
+    const Logger* logger_ = nullptr;
+    MetricsState* metrics_ = nullptr;
+    MetricsState fallback_metrics_;
+};
+
 }  // namespace
 
 std::unique_ptr<OutputSink> BuildOutputSink(const OutputEndpointSpec& spec) {
@@ -435,6 +718,16 @@ std::unique_ptr<OutputSink> BuildOutputSink(const OutputEndpointSpec& spec) {
         return std::make_unique<SrtOutputListenerSink>(spec.uris);
     }
     return std::make_unique<SrtOutputCallerSink>(spec.uris, spec.bonded, spec.group_type);
+}
+
+std::unique_ptr<OutputSink> BuildOutputSink(const Config&, std::vector<OutputEndpointSpec> specs) {
+    if (specs.empty()) {
+        throw std::runtime_error("no output specs configured");
+    }
+    if (specs.size() == 1) {
+        return BuildOutputSink(specs.front());
+    }
+    return std::make_unique<OutputFanoutSink>(std::move(specs));
 }
 
 }  // namespace srtrelay

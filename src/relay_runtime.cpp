@@ -1,5 +1,6 @@
 #include "srtrelay/relay.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <sstream>
 #include <stdexcept>
@@ -266,7 +267,7 @@ private:
 int RelayMain(const Config& cfg, const Logger& logger) {
     const std::vector<InputEndpointSpec> input_specs = ParseInputEndpointSpecs(cfg);
     const InputEndpointSpec& input_spec = input_specs.front();
-    const OutputEndpointSpec output_spec = ParseOutputEndpointSpec(cfg);
+    const std::vector<OutputEndpointSpec> output_specs = ParseOutputEndpointSpecs(cfg);
 
     RelayStats stats;
     RelayState state;
@@ -279,6 +280,7 @@ int RelayMain(const Config& cfg, const Logger& logger) {
     metrics.last_rx_unix_ms.store(startup_ms, std::memory_order_relaxed);
     metrics.last_tx_unix_ms.store(startup_ms, std::memory_order_relaxed);
     metrics.input_sources_total.store(static_cast<int64_t>(input_specs.size()), std::memory_order_relaxed);
+    metrics.output_sources_total.store(static_cast<int64_t>(output_specs.size()), std::memory_order_relaxed);
     metrics.primary_input_index.store(
         cfg.primary_input_index.has_value() ? static_cast<int64_t>(*cfg.primary_input_index + 1) : 0,
         std::memory_order_relaxed);
@@ -295,9 +297,20 @@ int RelayMain(const Config& cfg, const Logger& logger) {
                               (group_type == SRT_GTYPE_BACKUP ? 2 : 0);
         metrics.input_source_bond_mode[i].store(bond_mode, std::memory_order_relaxed);
     }
+    for (size_t i = 0; i < MetricsState::kMaxOutputSources; ++i) {
+        metrics.output_source_connected[i].store(0, std::memory_order_relaxed);
+        metrics.output_source_listening[i].store(0, std::memory_order_relaxed);
+        metrics.output_source_bond_mode[i].store(0, std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < output_specs.size() && i < MetricsState::kMaxOutputSources; ++i) {
+        const auto group_type = output_specs[i].group_type;
+        const int bond_mode = group_type == SRT_GTYPE_BROADCAST ? 1 :
+                              (group_type == SRT_GTYPE_BACKUP ? 2 : 0);
+        metrics.output_source_bond_mode[i].store(bond_mode, std::memory_order_relaxed);
+    }
 
     std::unique_ptr<InputSource> input_source = BuildInputSource(cfg, input_specs);
-    std::unique_ptr<OutputSink> output_sink = BuildOutputSink(output_spec);
+    std::unique_ptr<OutputSink> output_sink = BuildOutputSink(cfg, output_specs);
     const bool stdin_repacketize_enabled = (input_specs.size() == 1 &&
                                             input_spec.kind == InputEndpointKind::kStdin);
     int stdin_chunk_size = cfg.max_message_size;
@@ -312,7 +325,7 @@ int RelayMain(const Config& cfg, const Logger& logger) {
                    "chunk_size=" + std::to_string(stdin_chunk_size),
                    "max_message_size=" + std::to_string(cfg.max_message_size));
     }
-    MetricsServer metrics_server(cfg, logger, metrics, input_specs, output_spec);
+    MetricsServer metrics_server(cfg, logger, metrics, input_specs, output_specs);
     metrics_server.Start();
 
     std::ostringstream input_uris_stream;
@@ -322,14 +335,27 @@ int RelayMain(const Config& cfg, const Logger& logger) {
         }
         input_uris_stream << cfg.input_uris[i];
     }
+    std::ostringstream output_uris_stream;
+    for (size_t i = 0; i < cfg.output_uris.size(); ++i) {
+        if (i > 0) {
+            output_uris_stream << ",";
+        }
+        output_uris_stream << cfg.output_uris[i];
+    }
+    const bool any_output_bonded = std::any_of(output_specs.begin(), output_specs.end(), [](const auto& spec) {
+        return spec.bonded;
+    });
+    const std::string output_mode_label = output_specs.size() > 1
+        ? std::string("fanout")
+        : std::string(OutputModeLabel(output_specs.front().kind));
 
     logger.Log(LogLevel::kInfo, "startup",
                "input_uris=" + input_uris_stream.str(),
-               "output_uri=" + cfg.output_uri,
+               "output_uris=" + output_uris_stream.str(),
                "input_mode=" + std::string(InputModeLabel(input_spec.kind)),
-               "output_mode=" + std::string(OutputModeLabel(output_spec.kind)),
+               "output_mode=" + output_mode_label,
                "input_bonded=" + std::string(input_spec.bonded ? "true" : "false"),
-               "output_bonded=" + std::string(output_spec.bonded ? "true" : "false"),
+               "output_bonded=" + std::string(any_output_bonded ? "true" : "false"),
                "stats_interval_ms=" + std::to_string(cfg.stats_interval_ms),
                "reconnect_delay_ms=" + std::to_string(cfg.reconnect_delay_ms),
                "max_message_size=" + std::to_string(cfg.max_message_size),
@@ -355,12 +381,23 @@ int RelayMain(const Config& cfg, const Logger& logger) {
             metrics.input_source_connected[i].store(0, std::memory_order_relaxed);
             metrics.input_source_listening[i].store(0, std::memory_order_relaxed);
         }
+        for (size_t i = 0; i < MetricsState::kMaxOutputSources; ++i) {
+            metrics.output_source_connected[i].store(0, std::memory_order_relaxed);
+            metrics.output_source_listening[i].store(0, std::memory_order_relaxed);
+        }
         const size_t active_index_for_state = input_source->ActiveInputIndex();
         if (active_index_for_state < MetricsState::kMaxInputSources) {
             metrics.input_source_connected[active_index_for_state].store(
                 input_source->IsConnected() ? 1 : 0, std::memory_order_relaxed);
             metrics.input_source_listening[active_index_for_state].store(
                 input_source->IsListening() ? 1 : 0, std::memory_order_relaxed);
+        }
+        const size_t output_count = std::min(output_sink->OutputCount(), MetricsState::kMaxOutputSources);
+        for (size_t i = 0; i < output_count; ++i) {
+            metrics.output_source_connected[i].store(
+                output_sink->OutputConnected(i) ? 1 : 0, std::memory_order_relaxed);
+            metrics.output_source_listening[i].store(
+                output_sink->OutputListening(i) ? 1 : 0, std::memory_order_relaxed);
         }
         state.input_listening = input_source->IsListening();
         state.input_connected = input_source->IsConnected();
@@ -398,7 +435,7 @@ int RelayMain(const Config& cfg, const Logger& logger) {
             }
             try {
                 input_source->EnsureReady(
-                    cfg, logger, &metrics, EnsureAttemptContext{attempt_id, causality.ActiveIncidentId()});
+                    cfg, logger, &metrics, EnsureAttemptContext{attempt_id, causality.ActiveIncidentId(), std::nullopt});
                 if (input_reconnect_needed) {
                     causality.CompleteAttempt(FailureSide::kInput);
                 }
@@ -453,18 +490,28 @@ int RelayMain(const Config& cfg, const Logger& logger) {
             }
         }
 
-        if (!output_sink->IsConnected()) {
-            const uint64_t attempt_id = causality.EnsureAttemptStarted(FailureSide::kOutput);
-            logger.Log(LogLevel::kInfo,
-                       "output-ensure-attempt",
-                       "side=output",
-                       "attempt_id=" + std::to_string(attempt_id),
-                       "incident_id=" + (causality.ActiveIncidentId().empty() ? std::string("none") : causality.ActiveIncidentId()));
+        if (output_sink->NeedsEnsurePoll()) {
+            const bool output_reconnect_needed = !output_sink->IsConnected();
+            const uint64_t attempt_id = output_reconnect_needed
+                ? causality.EnsureAttemptStarted(FailureSide::kOutput)
+                : 0;
+            if (output_reconnect_needed) {
+                logger.Log(LogLevel::kInfo,
+                           "output-ensure-attempt",
+                           "side=output",
+                           "attempt_id=" + std::to_string(attempt_id),
+                           "incident_id=" + (causality.ActiveIncidentId().empty() ? std::string("none") : causality.ActiveIncidentId()));
+            }
             try {
                 output_sink->EnsureReady(
-                    cfg, logger, &stats, &metrics, EnsureAttemptContext{attempt_id, causality.ActiveIncidentId()});
-                causality.CompleteAttempt(FailureSide::kOutput);
+                    cfg, logger, &stats, &metrics, EnsureAttemptContext{attempt_id, causality.ActiveIncidentId(), std::nullopt});
+                if (output_reconnect_needed) {
+                    causality.CompleteAttempt(FailureSide::kOutput);
+                }
             } catch (const std::exception& ex) {
+                if (!output_reconnect_needed && output_sink->IsConnected()) {
+                    continue;
+                }
                 const bool is_timeout = output_sink->LastEnsureErrorKind() == IoErrorKind::kTimeout;
                 const std::string message = output_sink->LastEnsureErrorMessage().empty()
                                                 ? std::string(ex.what())
@@ -474,8 +521,7 @@ int RelayMain(const Config& cfg, const Logger& logger) {
                                                                         FailureOperation::kEnsure,
                                                                         is_timeout,
                                                                         false,
-                                                                        output_spec.kind == OutputEndpointKind::kSrtListener ||
-                                                                            output_spec.kind == OutputEndpointKind::kUdpListener,
+                                                                        output_sink->IsListening(),
                                                                         message,
                                                                         "output.ensure",
                                                                         attempt_id,
@@ -634,7 +680,7 @@ int RelayMain(const Config& cfg, const Logger& logger) {
                            "reason_code=" + std::string(ReasonCodeName(reason.code)),
                            "attempt_id=" + std::to_string(attempt_id),
                            "incident_id=" + causality.ActiveIncidentId());
-                if (cfg.exit_on_output_failure) {
+                if (cfg.exit_on_output_failure && !output_sink->IsConnected()) {
                     g_shutdown_requested.store(true);
                 } else {
                     SleepReconnectDelay(cfg);
