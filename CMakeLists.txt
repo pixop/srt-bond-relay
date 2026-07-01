@@ -80,13 +80,13 @@ else()
     endif()
 endif()
 
-add_executable(srt-bond-relay
-    main.cpp
+set(SRT_BOND_RELAY_CORE_SOURCES
     src/causality.cpp
     src/config.cpp
     src/linkage.cpp
     src/logger.cpp
     src/metrics.cpp
+    src/metrics_link_slots.cpp
     src/relay_endpoint_specs.cpp
     src/relay_input_sources.cpp
     src/relay_output_sinks.cpp
@@ -95,35 +95,46 @@ add_executable(srt-bond-relay
     src/srt_utils.cpp
 )
 
-target_compile_definitions(srt-bond-relay PRIVATE SRT_LINKAGE_MODE="${SRT_LINKAGE}")
-target_compile_definitions(srt-bond-relay PRIVATE SRT_BOND_RELAY_VERSION="${PROJECT_VERSION}")
+add_library(srtrelay_core STATIC
+    ${SRT_BOND_RELAY_CORE_SOURCES}
+)
 
-target_compile_options(srt-bond-relay PRIVATE
+add_executable(srt-bond-relay main.cpp)
+
+target_compile_definitions(srtrelay_core PRIVATE SRT_LINKAGE_MODE="${SRT_LINKAGE}")
+target_compile_definitions(srtrelay_core PRIVATE SRT_BOND_RELAY_VERSION="${PROJECT_VERSION}")
+target_compile_definitions(srtrelay_core PRIVATE SRT_BOND_RELAY_BUILD_TYPE="${CMAKE_BUILD_TYPE}")
+
+target_compile_options(srtrelay_core PRIVATE
     -Wall
     -Wextra
     -Wpedantic
 )
 
 if (PIXOP_SRT_INCLUDE_DIRS)
-    target_include_directories(srt-bond-relay PRIVATE ${PIXOP_SRT_INCLUDE_DIRS})
+    target_include_directories(srtrelay_core PUBLIC ${PIXOP_SRT_INCLUDE_DIRS})
 endif()
-target_include_directories(srt-bond-relay PRIVATE
+target_include_directories(srtrelay_core PUBLIC
     include
 )
 if (PIXOP_SRT_LIBRARY_DIRS)
-    target_link_directories(srt-bond-relay PRIVATE ${PIXOP_SRT_LIBRARY_DIRS})
+    target_link_directories(srtrelay_core PUBLIC ${PIXOP_SRT_LIBRARY_DIRS})
 endif()
 
-target_link_libraries(srt-bond-relay PRIVATE
+target_link_libraries(srtrelay_core PRIVATE
     ${PIXOP_SRT_LINK_TARGET}
     ${PIXOP_SRT_LIBRARIES}
-    httplib::httplib
     nlohmann_json::nlohmann_json
     dl
 )
+target_link_libraries(srtrelay_core PUBLIC
+    httplib::httplib
+)
 if (PIXOP_SRT_LINK_OPTIONS)
-    target_link_options(srt-bond-relay PRIVATE ${PIXOP_SRT_LINK_OPTIONS})
+    target_link_options(srtrelay_core PRIVATE ${PIXOP_SRT_LINK_OPTIONS})
 endif()
+
+target_link_libraries(srt-bond-relay PRIVATE srtrelay_core)
 
 # Keep runtime linkage pinned to the custom libsrt directory in the image.
 set_target_properties(srt-bond-relay PROPERTIES
@@ -134,3 +145,12 @@ set_target_properties(srt-bond-relay PROPERTIES
 install(TARGETS srt-bond-relay
     RUNTIME DESTINATION bin
 )
+
+enable_testing()
+
+add_executable(metrics_compat_test
+    tests/metrics_compat_test.cpp
+)
+target_include_directories(metrics_compat_test PRIVATE src)
+target_link_libraries(metrics_compat_test PRIVATE srtrelay_core)
+add_test(NAME metrics_compat_test COMMAND metrics_compat_test)

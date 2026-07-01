@@ -13,6 +13,10 @@ namespace {
 #define SRT_BOND_RELAY_VERSION "dev"
 #endif
 
+#ifndef SRT_BOND_RELAY_BUILD_TYPE
+#define SRT_BOND_RELAY_BUILD_TYPE "unknown"
+#endif
+
 bool IsStdinInputSpec(const std::string& input_uri) {
     return input_uri == "stdin" || input_uri == "-" || input_uri == "fd://stdin";
 }
@@ -55,7 +59,11 @@ void PrintUsage() {
 
 const char* SoftwareVersion() { return SRT_BOND_RELAY_VERSION; }
 
-void PrintVersion() { std::cout << "srt-bond-relay " << SoftwareVersion() << '\n'; }
+const char* BuildTypeName() { return SRT_BOND_RELAY_BUILD_TYPE; }
+
+void PrintVersion() {
+    std::cout << "srt-bond-relay " << SoftwareVersion() << " (" << BuildTypeName() << ")\n";
+}
 
 bool ParseBool(const std::string& value) {
     if (value == "true" || value == "1" || value == "yes") return true;

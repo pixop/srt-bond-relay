@@ -3,6 +3,7 @@ FROM ubuntu:24.04 AS build
 ARG DEBIAN_FRONTEND=noninteractive
 ARG SRT_TAG=v1.5.5
 ARG SRT_LINKAGE=dynamic
+ARG BUILD_TYPE=Release
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -43,7 +44,7 @@ COPY . /src/srt-bond-relay
 ENV PKG_CONFIG_PATH=/opt/pixop-srt/lib/pkgconfig:/opt/pixop-srt/lib64/pkgconfig
 
 RUN cmake -S /src/srt-bond-relay -B /src/srt-bond-relay/build \
-    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
     -DCMAKE_PREFIX_PATH=/opt/pixop-srt \
     -DSRT_LINKAGE="${SRT_LINKAGE}" \
     -DCMAKE_INSTALL_PREFIX=/usr/local \

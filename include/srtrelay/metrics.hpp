@@ -61,7 +61,30 @@ struct GroupDropCounterSnapshot {
     uint64_t byte_drop_total = 0;
 };
 
+enum class LinkSide {
+    kInput,
+    kOutput,
+};
+
 struct MetricsState {
+    // Guard for link-slot state. Use this instead of directly locking link_metrics_mutex.
+    // It tracks lock ownership in debug builds so locked-only helpers can assert usage.
+    class LinkMetricsGuard {
+    public:
+        explicit LinkMetricsGuard(MetricsState& metrics);
+        explicit LinkMetricsGuard(const MetricsState& metrics);
+        ~LinkMetricsGuard();
+
+        LinkMetricsGuard(const LinkMetricsGuard&) = delete;
+        LinkMetricsGuard& operator=(const LinkMetricsGuard&) = delete;
+        LinkMetricsGuard(LinkMetricsGuard&&) = delete;
+        LinkMetricsGuard& operator=(LinkMetricsGuard&&) = delete;
+
+    private:
+        MetricsState* metrics_ = nullptr;
+        std::unique_lock<std::mutex> lock_;
+    };
+
     static constexpr size_t kMaxTrackedMembers = 16;
     static constexpr size_t kMaxInputSources = 16;
 
@@ -101,21 +124,12 @@ struct MetricsState {
     std::atomic<uint64_t> input_transport_byte_retrans_current{0};
     std::atomic<uint64_t> input_transport_byte_loss_current{0};
     std::atomic<uint64_t> input_transport_packet_belated_current{0};
+
     std::atomic<uint64_t> input_group_packet_drop_total{0};
     std::atomic<uint64_t> input_group_byte_drop_total{0};
     std::atomic<int64_t> input_group_drop_sockets_tracked{0};
     std::atomic<uint64_t> input_group_packet_drop_current{0};
     std::atomic<uint64_t> input_group_byte_drop_current{0};
-    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> input_link_rx_bytes_total {};
-    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> input_link_tx_bytes_total {};
-    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> input_link_rx_bytes_current {};
-    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> input_link_tx_bytes_current {};
-    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> input_link_rx_bytes_last {};
-    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> input_link_tx_bytes_last {};
-    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> input_link_packet_belated_total {};
-    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> input_link_packet_belated_current {};
-    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> input_link_packet_belated_last {};
-    std::array<std::atomic<int64_t>, kMaxTrackedMembers> input_link_rtt_ms {};
 
     std::atomic<uint64_t> output_transport_byte_sent_total{0};
     std::atomic<uint64_t> output_transport_byte_sent_unique_total{0};
@@ -139,6 +153,7 @@ struct MetricsState {
     std::atomic<int64_t> primary_input_index{0};  // 0 means not set
     std::atomic<int> switch_policy{0};            // 0=round_robin, 1=preferred_primary
     std::atomic<int> switch_mode{0};              // 0=serial, 1=delayed
+
     std::array<std::atomic<int>, kMaxInputSources> input_source_connected {};
     std::array<std::atomic<int>, kMaxInputSources> input_source_listening {};
     std::array<std::atomic<int>, kMaxInputSources> input_source_bond_mode {};  // 0=unknown,1=broadcast,2=backup
@@ -148,25 +163,57 @@ struct MetricsState {
     std::atomic<int64_t> input_session_socket_id{static_cast<int64_t>(SRT_INVALID_SOCK)};
     std::atomic<int64_t> output_transport_socket_id{static_cast<int64_t>(SRT_INVALID_SOCK)};
 
-    std::array<std::atomic<int64_t>, kMaxTrackedMembers> input_member_ids {};
-    std::array<std::atomic<int>, kMaxTrackedMembers> input_member_connected {};
-    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> input_member_identity_keys {};
-    std::array<std::atomic<int64_t>, kMaxTrackedMembers> output_member_ids {};
-    std::array<std::atomic<int>, kMaxTrackedMembers> output_member_connected {};
-    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> output_member_identity_keys {};
-    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> output_link_rx_bytes_total {};
-    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> output_link_tx_bytes_total {};
-    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> output_link_rx_bytes_current {};
-    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> output_link_tx_bytes_current {};
-    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> output_link_rx_bytes_last {};
-    std::array<std::atomic<uint64_t>, kMaxTrackedMembers> output_link_tx_bytes_last {};
-    std::array<std::atomic<int64_t>, kMaxTrackedMembers> output_link_rtt_ms {};
-    std::array<std::atomic<int>, kMaxTrackedMembers> input_member_sock_state {};
-    std::array<std::atomic<int>, kMaxTrackedMembers> input_member_group_state {};
-    std::array<std::atomic<int>, kMaxTrackedMembers> input_member_peer_port {};
-    std::array<std::atomic<int>, kMaxTrackedMembers> output_member_sock_state {};
-    std::array<std::atomic<int>, kMaxTrackedMembers> output_member_group_state {};
-    std::array<std::atomic<int>, kMaxTrackedMembers> output_member_peer_port {};
+    struct InputTrackedSlot {
+        int64_t member_id = static_cast<int64_t>(SRT_INVALID_SOCK);
+        int member_connected = 0;
+        uint64_t member_identity_key = 0;
+        int member_sock_state = SRTS_NONEXIST;
+        int member_group_state = SRT_GST_IDLE;
+        int member_peer_port = 0;
+        std::string member_peer_host;
+        int member_status_last_logged = -1;
+        int member_connected_last_logged = -1;
+        uint64_t link_rx_bytes_total = 0;
+        uint64_t link_tx_bytes_total = 0;
+        uint64_t link_rx_bytes_current = 0;
+        uint64_t link_tx_bytes_current = 0;
+        uint64_t link_rx_bytes_last = 0;
+        uint64_t link_tx_bytes_last = 0;
+        uint64_t link_packet_belated_total = 0;
+        uint64_t link_packet_belated_current = 0;
+        uint64_t link_packet_belated_last = 0;
+        int64_t link_rtt_ms = -1;
+    };
+
+    struct OutputTrackedSlot {
+        int64_t member_id = static_cast<int64_t>(SRT_INVALID_SOCK);
+        int member_connected = 0;
+        uint64_t member_identity_key = 0;
+        int member_sock_state = SRTS_NONEXIST;
+        int member_group_state = SRT_GST_IDLE;
+        int member_peer_port = 0;
+        std::string member_peer_host;
+        int member_status_last_logged = -1;
+        int member_connected_last_logged = -1;
+        uint64_t link_rx_bytes_total = 0;
+        uint64_t link_tx_bytes_total = 0;
+        uint64_t link_rx_bytes_current = 0;
+        uint64_t link_tx_bytes_current = 0;
+        uint64_t link_rx_bytes_last = 0;
+        uint64_t link_tx_bytes_last = 0;
+        int64_t link_rtt_ms = -1;
+    };
+
+    struct InputTrackedStorage {
+        std::array<InputTrackedSlot, kMaxTrackedMembers> slots {};
+    };
+
+    struct OutputTrackedStorage {
+        std::array<OutputTrackedSlot, kMaxTrackedMembers> slots {};
+    };
+
+    InputTrackedStorage input_tracked {};
+    OutputTrackedStorage output_tracked {};
 
     std::unordered_map<SRTSOCKET, TransportCounterSnapshot> input_transport_last_by_socket;
     std::unordered_map<SRTSOCKET, TransportCounterSnapshot> output_transport_last_by_socket;
@@ -184,17 +231,32 @@ struct MetricsState {
     std::string active_incident_id;
     LastFailureSnapshot input_last_failure;
     LastFailureSnapshot output_last_failure;
-    std::array<std::string, kMaxTrackedMembers> input_member_peer_host {};
-    std::array<std::string, kMaxTrackedMembers> output_member_peer_host {};
-    std::array<int, kMaxTrackedMembers> input_member_status_last_logged {};
-    std::array<int, kMaxTrackedMembers> output_member_status_last_logged {};
-    std::array<int, kMaxTrackedMembers> input_member_connected_last_logged {};
-    std::array<int, kMaxTrackedMembers> output_member_connected_last_logged {};
 
     mutable std::mutex link_metrics_mutex;
     mutable std::mutex causality_mutex;
 
     MetricsState();
+
+    void AssertLinkMetricsLocked(const char* context) const;
+
+    size_t SnapshotCountCapped(LinkSide side) const {
+        int64_t count = side == LinkSide::kInput
+            ? input_links_snapshot_count.load(std::memory_order_relaxed)
+            : output_links_snapshot_count.load(std::memory_order_relaxed);
+        if (count < 0) {
+            count = 0;
+        }
+        return std::min(static_cast<size_t>(count), kMaxTrackedMembers);
+    }
+
+private:
+    void DebugOnLinkMetricsLocked();
+    void DebugOnLinkMetricsUnlocked();
+
+#ifndef NDEBUG
+    mutable std::atomic<uint64_t> link_metrics_lock_owner_token_{0};
+    mutable std::atomic<uint32_t> link_metrics_lock_depth_{0};
+#endif
 };
 
 enum class OutputMetricsMode {

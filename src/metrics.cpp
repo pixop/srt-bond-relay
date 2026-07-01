@@ -4,8 +4,10 @@
 #include <sys/socket.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <sstream>
 #include <unordered_set>
 
@@ -13,6 +15,7 @@
 
 #include "srtrelay/relay_io.hpp"
 #include "srtrelay/srt_utils.hpp"
+#include "metrics_link_slots.hpp"
 
 namespace srtrelay {
 
@@ -21,42 +24,71 @@ int64_t UnixNowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
 }
 
-MetricsState::MetricsState() {
-    for (size_t i = 0; i < kMaxTrackedMembers; ++i) {
-        input_member_ids[i].store(static_cast<int64_t>(SRT_INVALID_SOCK), std::memory_order_relaxed);
-        input_member_connected[i].store(0, std::memory_order_relaxed);
-        input_member_identity_keys[i].store(0, std::memory_order_relaxed);
-        input_link_rx_bytes_total[i].store(0, std::memory_order_relaxed);
-        input_link_tx_bytes_total[i].store(0, std::memory_order_relaxed);
-        input_link_rx_bytes_current[i].store(0, std::memory_order_relaxed);
-        input_link_tx_bytes_current[i].store(0, std::memory_order_relaxed);
-        input_link_rx_bytes_last[i].store(0, std::memory_order_relaxed);
-        input_link_tx_bytes_last[i].store(0, std::memory_order_relaxed);
-        input_link_packet_belated_total[i].store(0, std::memory_order_relaxed);
-        input_link_packet_belated_current[i].store(0, std::memory_order_relaxed);
-        input_link_packet_belated_last[i].store(0, std::memory_order_relaxed);
-        input_link_rtt_ms[i].store(-1, std::memory_order_relaxed);
-        output_member_ids[i].store(static_cast<int64_t>(SRT_INVALID_SOCK), std::memory_order_relaxed);
-        output_member_connected[i].store(0, std::memory_order_relaxed);
-        output_member_identity_keys[i].store(0, std::memory_order_relaxed);
-        output_link_rx_bytes_total[i].store(0, std::memory_order_relaxed);
-        output_link_tx_bytes_total[i].store(0, std::memory_order_relaxed);
-        output_link_rx_bytes_current[i].store(0, std::memory_order_relaxed);
-        output_link_tx_bytes_current[i].store(0, std::memory_order_relaxed);
-        output_link_rx_bytes_last[i].store(0, std::memory_order_relaxed);
-        output_link_tx_bytes_last[i].store(0, std::memory_order_relaxed);
-        output_link_rtt_ms[i].store(-1, std::memory_order_relaxed);
-        input_member_sock_state[i].store(SRTS_NONEXIST, std::memory_order_relaxed);
-        input_member_group_state[i].store(SRT_GST_IDLE, std::memory_order_relaxed);
-        input_member_peer_port[i].store(0, std::memory_order_relaxed);
-        output_member_sock_state[i].store(SRTS_NONEXIST, std::memory_order_relaxed);
-        output_member_group_state[i].store(SRT_GST_IDLE, std::memory_order_relaxed);
-        output_member_peer_port[i].store(0, std::memory_order_relaxed);
-        input_member_status_last_logged[i] = -1;
-        output_member_status_last_logged[i] = -1;
-        input_member_connected_last_logged[i] = -1;
-        output_member_connected_last_logged[i] = -1;
+namespace {
+#ifndef NDEBUG
+uint64_t CurrentThreadToken() {
+    const uint64_t token = static_cast<uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    return token == 0 ? 1 : token;
+}
+#endif
+}  // namespace
+
+MetricsState::LinkMetricsGuard::LinkMetricsGuard(MetricsState& metrics)
+    : metrics_(&metrics), lock_(metrics.link_metrics_mutex) {
+    metrics_->DebugOnLinkMetricsLocked();
+}
+
+MetricsState::LinkMetricsGuard::LinkMetricsGuard(const MetricsState& metrics)
+    : LinkMetricsGuard(const_cast<MetricsState&>(metrics)) {}
+
+MetricsState::LinkMetricsGuard::~LinkMetricsGuard() {
+    if (!metrics_ || !lock_.owns_lock()) {
+        return;
     }
+    lock_.unlock();
+    metrics_->DebugOnLinkMetricsUnlocked();
+}
+
+void MetricsState::AssertLinkMetricsLocked(const char* context) const {
+    (void)context;
+#ifndef NDEBUG
+    const uint32_t depth = link_metrics_lock_depth_.load(std::memory_order_relaxed);
+    const uint64_t owner = link_metrics_lock_owner_token_.load(std::memory_order_relaxed);
+    assert(depth > 0);
+    assert(owner == CurrentThreadToken());
+#endif
+}
+
+void MetricsState::DebugOnLinkMetricsLocked() {
+#ifndef NDEBUG
+    const uint64_t token = CurrentThreadToken();
+    const uint32_t depth = link_metrics_lock_depth_.load(std::memory_order_relaxed);
+    const uint64_t owner = link_metrics_lock_owner_token_.load(std::memory_order_relaxed);
+    if (depth == 0) {
+        assert(owner == 0 || owner == token);
+        link_metrics_lock_owner_token_.store(token, std::memory_order_relaxed);
+    } else {
+        assert(owner == token);
+    }
+    link_metrics_lock_depth_.fetch_add(1, std::memory_order_relaxed);
+#endif
+}
+
+void MetricsState::DebugOnLinkMetricsUnlocked() {
+#ifndef NDEBUG
+    const uint64_t token = CurrentThreadToken();
+    const uint32_t depth = link_metrics_lock_depth_.load(std::memory_order_relaxed);
+    const uint64_t owner = link_metrics_lock_owner_token_.load(std::memory_order_relaxed);
+    assert(depth > 0);
+    assert(owner == token);
+    const uint32_t new_depth = link_metrics_lock_depth_.fetch_sub(1, std::memory_order_relaxed) - 1;
+    if (new_depth == 0) {
+        link_metrics_lock_owner_token_.store(0, std::memory_order_relaxed);
+    }
+#endif
+}
+
+MetricsState::MetricsState() {
     for (size_t i = 0; i < kMaxInputSources; ++i) {
         input_source_connected[i].store(0, std::memory_order_relaxed);
         input_source_listening[i].store(0, std::memory_order_relaxed);
@@ -708,71 +740,43 @@ void EmitMemberTransitionEvents(const Logger& logger,
 
     std::vector<TransitionEvent> events;
     {
-        std::lock_guard<std::mutex> lock(metrics->link_metrics_mutex);
-        auto inspect_side =
-            [&](const char* side_name,
-                const std::array<std::atomic<int64_t>, MetricsState::kMaxTrackedMembers>& member_ids,
-                const std::array<std::atomic<uint64_t>, MetricsState::kMaxTrackedMembers>& identity_keys,
-                const std::array<std::atomic<int>, MetricsState::kMaxTrackedMembers>& connected,
-                const std::array<std::atomic<int>, MetricsState::kMaxTrackedMembers>& sock_states,
-                const std::array<std::atomic<int>, MetricsState::kMaxTrackedMembers>& group_states,
-                const std::array<std::atomic<int>, MetricsState::kMaxTrackedMembers>& peer_ports,
-                const std::array<std::string, MetricsState::kMaxTrackedMembers>& peer_hosts,
-                std::array<int, MetricsState::kMaxTrackedMembers>* last_status,
-                std::array<int, MetricsState::kMaxTrackedMembers>* last_connected) {
+        MetricsState::LinkMetricsGuard lock(*metrics);
+        auto inspect_side = [&](const char* side_name, auto& slots) {
                 for (size_t i = 0; i < MetricsState::kMaxTrackedMembers; ++i) {
-                    if (identity_keys[i].load(std::memory_order_relaxed) == 0) {
-                        (*last_status)[i] = -1;
-                        (*last_connected)[i] = -1;
+                    if (slots[i].member_identity_key == 0) {
+                        slots[i].member_status_last_logged = -1;
+                        slots[i].member_connected_last_logged = -1;
                         continue;
                     }
-                    const int current_connected = connected[i].load(std::memory_order_relaxed);
-                    const int current_sock_state = sock_states[i].load(std::memory_order_relaxed);
-                    const int current_group_state = group_states[i].load(std::memory_order_relaxed);
+                    const int current_connected = slots[i].member_connected;
+                    const int current_sock_state = slots[i].member_sock_state;
+                    const int current_group_state = slots[i].member_group_state;
                     const MemberLinkState current_state =
                         DeriveMemberLinkState(current_sock_state, current_group_state, current_connected);
                     const int current_state_i = static_cast<int>(current_state);
-                    const int previous_state_i = (*last_status)[i];
-                    const int previous_connected = (*last_connected)[i];
+                    const int previous_state_i = slots[i].member_status_last_logged;
+                    const int previous_connected = slots[i].member_connected_last_logged;
 
                     if (previous_state_i >= 0 &&
                         (previous_state_i != current_state_i || previous_connected != current_connected)) {
                         TransitionEvent event;
                         event.side = side_name;
-                        event.socket_id = member_ids[i].load(std::memory_order_relaxed);
-                        event.peer_host = peer_hosts[i];
-                        event.peer_port = peer_ports[i].load(std::memory_order_relaxed);
+                        event.socket_id = slots[i].member_id;
+                        event.peer_host = slots[i].member_peer_host;
+                        event.peer_port = slots[i].member_peer_port;
                         event.prior_state = static_cast<MemberLinkState>(previous_state_i);
                         event.new_state = current_state;
                         event.prior_connected = previous_connected;
                         event.new_connected = current_connected;
                         events.push_back(std::move(event));
                     }
-                    (*last_status)[i] = current_state_i;
-                    (*last_connected)[i] = current_connected;
+                    slots[i].member_status_last_logged = current_state_i;
+                    slots[i].member_connected_last_logged = current_connected;
                 }
             };
 
-        inspect_side("input",
-                     metrics->input_member_ids,
-                     metrics->input_member_identity_keys,
-                     metrics->input_member_connected,
-                     metrics->input_member_sock_state,
-                     metrics->input_member_group_state,
-                     metrics->input_member_peer_port,
-                     metrics->input_member_peer_host,
-                     &metrics->input_member_status_last_logged,
-                     &metrics->input_member_connected_last_logged);
-        inspect_side("output",
-                     metrics->output_member_ids,
-                     metrics->output_member_identity_keys,
-                     metrics->output_member_connected,
-                     metrics->output_member_sock_state,
-                     metrics->output_member_group_state,
-                     metrics->output_member_peer_port,
-                     metrics->output_member_peer_host,
-                     &metrics->output_member_status_last_logged,
-                     &metrics->output_member_connected_last_logged);
+        inspect_side("input", metrics->input_tracked.slots);
+        inspect_side("output", metrics->output_tracked.slots);
     }
 
     for (const auto& event : events) {
@@ -804,37 +808,6 @@ bool TryGetPeerAddrForSocket(SRTSOCKET sock, sockaddr_storage* out_peer_addr) {
     }
     *out_peer_addr = peer_addr;
     return true;
-}
-
-uint64_t HashBytesFnv1a64(const void* data, size_t size, uint64_t seed = 1469598103934665603ULL) {
-    const auto* bytes = static_cast<const uint8_t*>(data);
-    uint64_t hash = seed;
-    for (size_t i = 0; i < size; ++i) {
-        hash ^= static_cast<uint64_t>(bytes[i]);
-        hash *= 1099511628211ULL;
-    }
-    return hash;
-}
-
-uint64_t MemberIdentityKey(const SRT_SOCKGROUPDATA& member) {
-    const auto family = member.peeraddr.ss_family;
-    if (family == AF_INET) {
-        const auto* v4 = reinterpret_cast<const sockaddr_in*>(&member.peeraddr);
-        const uint64_t hash = HashBytesFnv1a64(&(v4->sin_addr), sizeof(v4->sin_addr));
-        return hash == 0 ? 1 : hash;
-    }
-    if (family == AF_INET6) {
-        const auto* v6 = reinterpret_cast<const sockaddr_in6*>(&member.peeraddr);
-        const uint64_t hash = HashBytesFnv1a64(&(v6->sin6_addr), sizeof(v6->sin6_addr));
-        return hash == 0 ? 1 : hash;
-    }
-    if (member.id != SRT_INVALID_SOCK && member.id != 0) {
-        return static_cast<uint64_t>(member.id);
-    }
-    if (member.token != 0) {
-        return static_cast<uint64_t>(member.token);
-    }
-    return 0;
 }
 
 std::vector<SRT_SOCKGROUPDATA> BuildSingleSocketFallbackSnapshot(SRTSOCKET sock) {
@@ -943,31 +916,10 @@ void SaveOutputMemberSnapshot(const std::vector<SRT_SOCKGROUPDATA>& group_member
 
 void UpdateInputLinkHealthFallbackSingleSocket(SRTSOCKET input_session_sock, MetricsState* metrics) {
     if (input_session_sock == SRT_INVALID_SOCK) {
-        std::lock_guard<std::mutex> lock(metrics->link_metrics_mutex);
         metrics->input_links_total.store(0, std::memory_order_relaxed);
         metrics->input_links_healthy.store(0, std::memory_order_relaxed);
         metrics->input_links_running.store(0, std::memory_order_relaxed);
-        for (size_t i = 0; i < MetricsState::kMaxTrackedMembers; ++i) {
-            const auto key = metrics->input_member_identity_keys[i].load(std::memory_order_relaxed);
-            if (key == 0) continue;
-            metrics->input_member_connected[i].store(0, std::memory_order_relaxed);
-            metrics->input_member_ids[i].store(static_cast<int64_t>(SRT_INVALID_SOCK), std::memory_order_relaxed);
-            metrics->input_member_identity_keys[i].store(0, std::memory_order_relaxed);
-            metrics->input_member_sock_state[i].store(SRTS_NONEXIST, std::memory_order_relaxed);
-            metrics->input_member_group_state[i].store(SRT_GST_IDLE, std::memory_order_relaxed);
-            metrics->input_member_peer_port[i].store(0, std::memory_order_relaxed);
-            metrics->input_member_peer_host[i].clear();
-            metrics->input_link_rx_bytes_current[i].store(0, std::memory_order_relaxed);
-            metrics->input_link_tx_bytes_current[i].store(0, std::memory_order_relaxed);
-            metrics->input_link_rx_bytes_last[i].store(0, std::memory_order_relaxed);
-            metrics->input_link_tx_bytes_last[i].store(0, std::memory_order_relaxed);
-            metrics->input_link_rx_bytes_total[i].store(0, std::memory_order_relaxed);
-            metrics->input_link_tx_bytes_total[i].store(0, std::memory_order_relaxed);
-            metrics->input_link_packet_belated_current[i].store(0, std::memory_order_relaxed);
-            metrics->input_link_packet_belated_last[i].store(0, std::memory_order_relaxed);
-            metrics->input_link_packet_belated_total[i].store(0, std::memory_order_relaxed);
-        }
-        metrics->input_links_snapshot_count.store(0, std::memory_order_relaxed);
+        ClearTrackedMembersForDisconnectedSocket(LinkSide::kInput, metrics);
         return;
     }
     auto members = BuildSingleSocketFallbackSnapshot(input_session_sock);
@@ -976,136 +928,7 @@ void UpdateInputLinkHealthFallbackSingleSocket(SRTSOCKET input_session_sock, Met
 }
 
 void SaveInputMemberSnapshot(const std::vector<SRT_SOCKGROUPDATA>& group_members, MetricsState* metrics) {
-    std::lock_guard<std::mutex> lock(metrics->link_metrics_mutex);
-    std::array<SRTSOCKET, MetricsState::kMaxTrackedMembers> slot_ids {};
-    std::array<int, MetricsState::kMaxTrackedMembers> slot_connected {};
-    std::array<uint64_t, MetricsState::kMaxTrackedMembers> slot_identity_keys {};
-    std::array<int, MetricsState::kMaxTrackedMembers> slot_sock_state {};
-    std::array<int, MetricsState::kMaxTrackedMembers> slot_group_state {};
-    std::array<int, MetricsState::kMaxTrackedMembers> slot_peer_port {};
-    std::array<std::string, MetricsState::kMaxTrackedMembers> slot_peer_host {};
-    for (size_t i = 0; i < MetricsState::kMaxTrackedMembers; ++i) {
-        slot_ids[i] = static_cast<SRTSOCKET>(metrics->input_member_ids[i].load(std::memory_order_relaxed));
-        slot_connected[i] = metrics->input_member_connected[i].load(std::memory_order_relaxed);
-        slot_identity_keys[i] = metrics->input_member_identity_keys[i].load(std::memory_order_relaxed);
-        slot_sock_state[i] = metrics->input_member_sock_state[i].load(std::memory_order_relaxed);
-        slot_group_state[i] = metrics->input_member_group_state[i].load(std::memory_order_relaxed);
-        slot_peer_port[i] = metrics->input_member_peer_port[i].load(std::memory_order_relaxed);
-        slot_peer_host[i] = metrics->input_member_peer_host[i];
-    }
-
-    std::array<bool, MetricsState::kMaxTrackedMembers> slot_used {};
-    std::array<int, MetricsState::kMaxTrackedMembers> member_slot {};
-    member_slot.fill(-1);
-    std::vector<bool> matched(group_members.size(), false);
-
-    for (size_t i = 0; i < group_members.size(); ++i) {
-        const uint64_t key = MemberIdentityKey(group_members[i]);
-        if (key == 0) {
-            continue;
-        }
-        for (size_t slot = 0; slot < MetricsState::kMaxTrackedMembers; ++slot) {
-            if (slot_used[slot]) continue;
-            if (slot_identity_keys[slot] != key) continue;
-            member_slot[i] = static_cast<int>(slot);
-            slot_used[slot] = true;
-            matched[i] = true;
-            break;
-        }
-    }
-
-    for (size_t i = 0; i < group_members.size(); ++i) {
-        if (matched[i]) continue;
-        for (size_t slot = 0; slot < MetricsState::kMaxTrackedMembers; ++slot) {
-            if (slot_used[slot]) continue;
-            if (slot_identity_keys[slot] != 0) continue;
-            member_slot[i] = static_cast<int>(slot);
-            slot_used[slot] = true;
-            matched[i] = true;
-            break;
-        }
-    }
-
-    for (size_t i = 0; i < group_members.size(); ++i) {
-        if (matched[i]) continue;
-        for (size_t slot = 0; slot < MetricsState::kMaxTrackedMembers; ++slot) {
-            if (slot_used[slot]) continue;
-            member_slot[i] = static_cast<int>(slot);
-            slot_used[slot] = true;
-            matched[i] = true;
-            slot_ids[slot] = SRT_INVALID_SOCK;
-            slot_connected[slot] = 0;
-            slot_identity_keys[slot] = 0;
-            metrics->input_link_rx_bytes_current[slot].store(0, std::memory_order_relaxed);
-            metrics->input_link_tx_bytes_current[slot].store(0, std::memory_order_relaxed);
-            metrics->input_link_rx_bytes_last[slot].store(0, std::memory_order_relaxed);
-            metrics->input_link_tx_bytes_last[slot].store(0, std::memory_order_relaxed);
-            metrics->input_link_rx_bytes_total[slot].store(0, std::memory_order_relaxed);
-            metrics->input_link_tx_bytes_total[slot].store(0, std::memory_order_relaxed);
-            metrics->input_link_packet_belated_current[slot].store(0, std::memory_order_relaxed);
-            metrics->input_link_packet_belated_last[slot].store(0, std::memory_order_relaxed);
-            metrics->input_link_packet_belated_total[slot].store(0, std::memory_order_relaxed);
-            break;
-        }
-    }
-
-    std::array<bool, MetricsState::kMaxTrackedMembers> matched_slot {};
-    for (size_t i = 0; i < group_members.size(); ++i) {
-        const int slot = member_slot[i];
-        if (slot < 0) continue;
-        matched_slot[static_cast<size_t>(slot)] = true;
-        const auto& member = group_members[i];
-        slot_ids[slot] = member.id;
-        slot_connected[slot] = IsConnectedGroupMember(member) ? 1 : 0;
-        slot_sock_state[slot] = member.sockstate;
-        slot_group_state[slot] = member.memberstate;
-        std::string peer_host;
-        int peer_port = 0;
-        if (TryExtractEndpoint(member.peeraddr, &peer_host, &peer_port)) {
-            slot_peer_host[slot] = peer_host;
-            slot_peer_port[slot] = peer_port;
-        } else {
-            slot_peer_host[slot].clear();
-            slot_peer_port[slot] = 0;
-        }
-        uint64_t identity_key = MemberIdentityKey(member);
-        if (identity_key == 0) {
-            identity_key = slot_identity_keys[slot];
-        }
-        slot_identity_keys[slot] = identity_key;
-    }
-
-    for (size_t slot = 0; slot < MetricsState::kMaxTrackedMembers; ++slot) {
-        if (matched_slot[slot]) {
-            continue;
-        }
-        if (slot_identity_keys[slot] == 0) {
-            slot_ids[slot] = SRT_INVALID_SOCK;
-            slot_connected[slot] = 0;
-            slot_sock_state[slot] = SRTS_NONEXIST;
-            slot_group_state[slot] = SRT_GST_IDLE;
-            slot_peer_host[slot].clear();
-            slot_peer_port[slot] = 0;
-            continue;
-        }
-        slot_ids[slot] = SRT_INVALID_SOCK;
-        slot_connected[slot] = 0;
-    }
-
-    size_t span = 0;
-    for (size_t slot = 0; slot < MetricsState::kMaxTrackedMembers; ++slot) {
-        metrics->input_member_ids[slot].store(static_cast<int64_t>(slot_ids[slot]), std::memory_order_relaxed);
-        metrics->input_member_connected[slot].store(slot_connected[slot], std::memory_order_relaxed);
-        metrics->input_member_identity_keys[slot].store(slot_identity_keys[slot], std::memory_order_relaxed);
-        metrics->input_member_sock_state[slot].store(slot_sock_state[slot], std::memory_order_relaxed);
-        metrics->input_member_group_state[slot].store(slot_group_state[slot], std::memory_order_relaxed);
-        metrics->input_member_peer_port[slot].store(slot_peer_port[slot], std::memory_order_relaxed);
-        metrics->input_member_peer_host[slot] = slot_peer_host[slot];
-        if (slot_identity_keys[slot] != 0) {
-            span = slot + 1;
-        }
-    }
-    metrics->input_links_snapshot_count.store(static_cast<int64_t>(span), std::memory_order_relaxed);
+    SaveMemberSnapshot(LinkSide::kInput, group_members, metrics);
 }
 
 void UpdateOutputLinkHealthFromGroupMembers(const std::vector<SRT_SOCKGROUPDATA>& group_members,
@@ -1126,159 +949,15 @@ void UpdateOutputLinkHealthFromGroupMembers(const std::vector<SRT_SOCKGROUPDATA>
 }
 
 void SaveOutputMemberSnapshot(const std::vector<SRT_SOCKGROUPDATA>& group_members, MetricsState* metrics) {
-    std::lock_guard<std::mutex> lock(metrics->link_metrics_mutex);
-    std::array<SRTSOCKET, MetricsState::kMaxTrackedMembers> slot_ids {};
-    std::array<int, MetricsState::kMaxTrackedMembers> slot_connected {};
-    std::array<uint64_t, MetricsState::kMaxTrackedMembers> slot_identity_keys {};
-    std::array<int, MetricsState::kMaxTrackedMembers> slot_sock_state {};
-    std::array<int, MetricsState::kMaxTrackedMembers> slot_group_state {};
-    std::array<int, MetricsState::kMaxTrackedMembers> slot_peer_port {};
-    std::array<std::string, MetricsState::kMaxTrackedMembers> slot_peer_host {};
-    for (size_t i = 0; i < MetricsState::kMaxTrackedMembers; ++i) {
-        slot_ids[i] = static_cast<SRTSOCKET>(metrics->output_member_ids[i].load(std::memory_order_relaxed));
-        slot_connected[i] = metrics->output_member_connected[i].load(std::memory_order_relaxed);
-        slot_identity_keys[i] = metrics->output_member_identity_keys[i].load(std::memory_order_relaxed);
-        slot_sock_state[i] = metrics->output_member_sock_state[i].load(std::memory_order_relaxed);
-        slot_group_state[i] = metrics->output_member_group_state[i].load(std::memory_order_relaxed);
-        slot_peer_port[i] = metrics->output_member_peer_port[i].load(std::memory_order_relaxed);
-        slot_peer_host[i] = metrics->output_member_peer_host[i];
-    }
-
-    std::array<bool, MetricsState::kMaxTrackedMembers> slot_used {};
-    std::array<int, MetricsState::kMaxTrackedMembers> member_slot {};
-    member_slot.fill(-1);
-    std::vector<bool> matched(group_members.size(), false);
-
-    for (size_t i = 0; i < group_members.size(); ++i) {
-        const uint64_t key = MemberIdentityKey(group_members[i]);
-        if (key == 0) {
-            continue;
-        }
-        for (size_t slot = 0; slot < MetricsState::kMaxTrackedMembers; ++slot) {
-            if (slot_used[slot]) continue;
-            if (slot_identity_keys[slot] != key) continue;
-            member_slot[i] = static_cast<int>(slot);
-            slot_used[slot] = true;
-            matched[i] = true;
-            break;
-        }
-    }
-
-    for (size_t i = 0; i < group_members.size(); ++i) {
-        if (matched[i]) continue;
-        for (size_t slot = 0; slot < MetricsState::kMaxTrackedMembers; ++slot) {
-            if (slot_used[slot]) continue;
-            if (slot_identity_keys[slot] != 0) continue;
-            member_slot[i] = static_cast<int>(slot);
-            slot_used[slot] = true;
-            matched[i] = true;
-            break;
-        }
-    }
-
-    for (size_t i = 0; i < group_members.size(); ++i) {
-        if (matched[i]) continue;
-        for (size_t slot = 0; slot < MetricsState::kMaxTrackedMembers; ++slot) {
-            if (slot_used[slot]) continue;
-            member_slot[i] = static_cast<int>(slot);
-            slot_used[slot] = true;
-            matched[i] = true;
-            slot_ids[slot] = SRT_INVALID_SOCK;
-            slot_connected[slot] = 0;
-            slot_identity_keys[slot] = 0;
-            metrics->output_link_rx_bytes_current[slot].store(0, std::memory_order_relaxed);
-            metrics->output_link_tx_bytes_current[slot].store(0, std::memory_order_relaxed);
-            metrics->output_link_rx_bytes_last[slot].store(0, std::memory_order_relaxed);
-            metrics->output_link_tx_bytes_last[slot].store(0, std::memory_order_relaxed);
-            metrics->output_link_rx_bytes_total[slot].store(0, std::memory_order_relaxed);
-            metrics->output_link_tx_bytes_total[slot].store(0, std::memory_order_relaxed);
-            break;
-        }
-    }
-
-    std::array<bool, MetricsState::kMaxTrackedMembers> matched_slot {};
-    for (size_t i = 0; i < group_members.size(); ++i) {
-        const int slot = member_slot[i];
-        if (slot < 0) continue;
-        matched_slot[static_cast<size_t>(slot)] = true;
-        const auto& member = group_members[i];
-        slot_ids[slot] = member.id;
-        slot_connected[slot] = IsConnectedGroupMember(member) ? 1 : 0;
-        slot_sock_state[slot] = member.sockstate;
-        slot_group_state[slot] = member.memberstate;
-        std::string peer_host;
-        int peer_port = 0;
-        if (TryExtractEndpoint(member.peeraddr, &peer_host, &peer_port)) {
-            slot_peer_host[slot] = peer_host;
-            slot_peer_port[slot] = peer_port;
-        } else {
-            slot_peer_host[slot].clear();
-            slot_peer_port[slot] = 0;
-        }
-        uint64_t identity_key = MemberIdentityKey(member);
-        if (identity_key == 0) {
-            identity_key = slot_identity_keys[slot];
-        }
-        slot_identity_keys[slot] = identity_key;
-    }
-
-    for (size_t slot = 0; slot < MetricsState::kMaxTrackedMembers; ++slot) {
-        if (matched_slot[slot]) {
-            continue;
-        }
-        if (slot_identity_keys[slot] == 0) {
-            slot_ids[slot] = SRT_INVALID_SOCK;
-            slot_connected[slot] = 0;
-            slot_sock_state[slot] = SRTS_NONEXIST;
-            slot_group_state[slot] = SRT_GST_IDLE;
-            slot_peer_host[slot].clear();
-            slot_peer_port[slot] = 0;
-            continue;
-        }
-        slot_ids[slot] = SRT_INVALID_SOCK;
-        slot_connected[slot] = 0;
-    }
-
-    size_t span = 0;
-    for (size_t slot = 0; slot < MetricsState::kMaxTrackedMembers; ++slot) {
-        metrics->output_member_ids[slot].store(static_cast<int64_t>(slot_ids[slot]), std::memory_order_relaxed);
-        metrics->output_member_connected[slot].store(slot_connected[slot], std::memory_order_relaxed);
-        metrics->output_member_identity_keys[slot].store(slot_identity_keys[slot], std::memory_order_relaxed);
-        metrics->output_member_sock_state[slot].store(slot_sock_state[slot], std::memory_order_relaxed);
-        metrics->output_member_group_state[slot].store(slot_group_state[slot], std::memory_order_relaxed);
-        metrics->output_member_peer_port[slot].store(slot_peer_port[slot], std::memory_order_relaxed);
-        metrics->output_member_peer_host[slot] = slot_peer_host[slot];
-        if (slot_identity_keys[slot] != 0) {
-            span = slot + 1;
-        }
-    }
-    metrics->output_links_snapshot_count.store(static_cast<int64_t>(span), std::memory_order_relaxed);
+    SaveMemberSnapshot(LinkSide::kOutput, group_members, metrics);
 }
 
 void UpdateOutputLinkHealthFallbackSingleSocket(SRTSOCKET output_sock, MetricsState* metrics) {
     if (output_sock == SRT_INVALID_SOCK) {
-        std::lock_guard<std::mutex> lock(metrics->link_metrics_mutex);
         metrics->output_links_total.store(0, std::memory_order_relaxed);
         metrics->output_links_healthy.store(0, std::memory_order_relaxed);
         metrics->output_links_running.store(0, std::memory_order_relaxed);
-        for (size_t i = 0; i < MetricsState::kMaxTrackedMembers; ++i) {
-            const auto key = metrics->output_member_identity_keys[i].load(std::memory_order_relaxed);
-            if (key == 0) continue;
-            metrics->output_member_connected[i].store(0, std::memory_order_relaxed);
-            metrics->output_member_ids[i].store(static_cast<int64_t>(SRT_INVALID_SOCK), std::memory_order_relaxed);
-            metrics->output_member_identity_keys[i].store(0, std::memory_order_relaxed);
-        metrics->output_member_sock_state[i].store(SRTS_NONEXIST, std::memory_order_relaxed);
-        metrics->output_member_group_state[i].store(SRT_GST_IDLE, std::memory_order_relaxed);
-        metrics->output_member_peer_port[i].store(0, std::memory_order_relaxed);
-        metrics->output_member_peer_host[i].clear();
-            metrics->output_link_rx_bytes_current[i].store(0, std::memory_order_relaxed);
-            metrics->output_link_tx_bytes_current[i].store(0, std::memory_order_relaxed);
-            metrics->output_link_rx_bytes_last[i].store(0, std::memory_order_relaxed);
-            metrics->output_link_tx_bytes_last[i].store(0, std::memory_order_relaxed);
-            metrics->output_link_rx_bytes_total[i].store(0, std::memory_order_relaxed);
-            metrics->output_link_tx_bytes_total[i].store(0, std::memory_order_relaxed);
-        }
-        metrics->output_links_snapshot_count.store(0, std::memory_order_relaxed);
+        ClearTrackedMembersForDisconnectedSocket(LinkSide::kOutput, metrics);
         return;
     }
     auto members = BuildSingleSocketFallbackSnapshot(output_sock);
@@ -1290,21 +969,6 @@ enum class CompactDirection {
     kInput,
     kOutput,
     kBoth,
-};
-
-struct CompactResult {
-    size_t before_slots = 0;
-    size_t after_slots = 0;
-    size_t moved = 0;
-    size_t dropped = 0;
-};
-
-struct CompactResponse {
-    std::string direction;
-    bool include_input = false;
-    bool include_output = false;
-    CompactResult input;
-    CompactResult output;
 };
 
 bool ParseCompactDirection(const httplib::Request& req, CompactDirection* out_direction) {
@@ -1332,262 +996,29 @@ bool ParseCompactDirection(const httplib::Request& req, CompactDirection* out_di
 }
 
 CompactResult CompactInputSlotsLocked(MetricsState* metrics) {
-    CompactResult result {};
-    std::array<int64_t, MetricsState::kMaxTrackedMembers> member_ids {};
-    std::array<int, MetricsState::kMaxTrackedMembers> member_connected {};
-    std::array<uint64_t, MetricsState::kMaxTrackedMembers> member_identity {};
-    std::array<uint64_t, MetricsState::kMaxTrackedMembers> rx_total {};
-    std::array<uint64_t, MetricsState::kMaxTrackedMembers> tx_total {};
-    std::array<uint64_t, MetricsState::kMaxTrackedMembers> rx_current {};
-    std::array<uint64_t, MetricsState::kMaxTrackedMembers> tx_current {};
-    std::array<uint64_t, MetricsState::kMaxTrackedMembers> rx_last {};
-    std::array<uint64_t, MetricsState::kMaxTrackedMembers> tx_last {};
-    std::array<uint64_t, MetricsState::kMaxTrackedMembers> belated_total {};
-    std::array<uint64_t, MetricsState::kMaxTrackedMembers> belated_current {};
-    std::array<uint64_t, MetricsState::kMaxTrackedMembers> belated_last {};
-    std::array<int64_t, MetricsState::kMaxTrackedMembers> rtt_ms {};
-
-    std::array<size_t, MetricsState::kMaxTrackedMembers> keep_slots {};
-    size_t keep_count = 0;
-    for (size_t i = 0; i < MetricsState::kMaxTrackedMembers; ++i) {
-        const auto identity = metrics->input_member_identity_keys[i].load(std::memory_order_relaxed);
-        if (identity == 0) {
-            continue;
-        }
-        result.before_slots++;
-        const bool connected = metrics->input_member_connected[i].load(std::memory_order_relaxed) == 1;
-        const auto socket_id = static_cast<SRTSOCKET>(metrics->input_member_ids[i].load(std::memory_order_relaxed));
-        if (!connected || socket_id == SRT_INVALID_SOCK || socket_id == 0) {
-            continue;
-        }
-        keep_slots[keep_count++] = i;
-    }
-
-    result.after_slots = keep_count;
-    result.dropped = result.before_slots - keep_count;
-    for (size_t dst = 0; dst < keep_count; ++dst) {
-        const size_t src = keep_slots[dst];
-        if (src != dst) {
-            result.moved++;
-        }
-        member_ids[dst] = metrics->input_member_ids[src].load(std::memory_order_relaxed);
-        member_connected[dst] = metrics->input_member_connected[src].load(std::memory_order_relaxed);
-        member_identity[dst] = metrics->input_member_identity_keys[src].load(std::memory_order_relaxed);
-        rx_total[dst] = metrics->input_link_rx_bytes_total[src].load(std::memory_order_relaxed);
-        tx_total[dst] = metrics->input_link_tx_bytes_total[src].load(std::memory_order_relaxed);
-        rx_current[dst] = metrics->input_link_rx_bytes_current[src].load(std::memory_order_relaxed);
-        tx_current[dst] = metrics->input_link_tx_bytes_current[src].load(std::memory_order_relaxed);
-        rx_last[dst] = metrics->input_link_rx_bytes_last[src].load(std::memory_order_relaxed);
-        tx_last[dst] = metrics->input_link_tx_bytes_last[src].load(std::memory_order_relaxed);
-        belated_total[dst] = metrics->input_link_packet_belated_total[src].load(std::memory_order_relaxed);
-        belated_current[dst] = metrics->input_link_packet_belated_current[src].load(std::memory_order_relaxed);
-        belated_last[dst] = metrics->input_link_packet_belated_last[src].load(std::memory_order_relaxed);
-        rtt_ms[dst] = metrics->input_link_rtt_ms[src].load(std::memory_order_relaxed);
-    }
-
-    for (size_t i = keep_count; i < MetricsState::kMaxTrackedMembers; ++i) {
-        member_ids[i] = static_cast<int64_t>(SRT_INVALID_SOCK);
-        member_connected[i] = 0;
-        member_identity[i] = 0;
-        rx_total[i] = 0;
-        tx_total[i] = 0;
-        rx_current[i] = 0;
-        tx_current[i] = 0;
-        rx_last[i] = 0;
-        tx_last[i] = 0;
-        belated_total[i] = 0;
-        belated_current[i] = 0;
-        belated_last[i] = 0;
-        rtt_ms[i] = -1;
-    }
-
-    for (size_t i = 0; i < MetricsState::kMaxTrackedMembers; ++i) {
-        metrics->input_member_ids[i].store(member_ids[i], std::memory_order_relaxed);
-        metrics->input_member_connected[i].store(member_connected[i], std::memory_order_relaxed);
-        metrics->input_member_identity_keys[i].store(member_identity[i], std::memory_order_relaxed);
-        metrics->input_link_rx_bytes_total[i].store(rx_total[i], std::memory_order_relaxed);
-        metrics->input_link_tx_bytes_total[i].store(tx_total[i], std::memory_order_relaxed);
-        metrics->input_link_rx_bytes_current[i].store(rx_current[i], std::memory_order_relaxed);
-        metrics->input_link_tx_bytes_current[i].store(tx_current[i], std::memory_order_relaxed);
-        metrics->input_link_rx_bytes_last[i].store(rx_last[i], std::memory_order_relaxed);
-        metrics->input_link_tx_bytes_last[i].store(tx_last[i], std::memory_order_relaxed);
-        metrics->input_link_packet_belated_total[i].store(belated_total[i], std::memory_order_relaxed);
-        metrics->input_link_packet_belated_current[i].store(belated_current[i], std::memory_order_relaxed);
-        metrics->input_link_packet_belated_last[i].store(belated_last[i], std::memory_order_relaxed);
-        metrics->input_link_rtt_ms[i].store(rtt_ms[i], std::memory_order_relaxed);
-    }
-    metrics->input_links_snapshot_count.store(static_cast<int64_t>(keep_count), std::memory_order_relaxed);
-    return result;
+    return CompactSlotsLocked(LinkSide::kInput, metrics);
 }
 
 CompactResult CompactOutputSlotsLocked(MetricsState* metrics) {
-    CompactResult result {};
-    std::array<int64_t, MetricsState::kMaxTrackedMembers> member_ids {};
-    std::array<int, MetricsState::kMaxTrackedMembers> member_connected {};
-    std::array<uint64_t, MetricsState::kMaxTrackedMembers> member_identity {};
-    std::array<uint64_t, MetricsState::kMaxTrackedMembers> rx_total {};
-    std::array<uint64_t, MetricsState::kMaxTrackedMembers> tx_total {};
-    std::array<uint64_t, MetricsState::kMaxTrackedMembers> rx_current {};
-    std::array<uint64_t, MetricsState::kMaxTrackedMembers> tx_current {};
-    std::array<uint64_t, MetricsState::kMaxTrackedMembers> rx_last {};
-    std::array<uint64_t, MetricsState::kMaxTrackedMembers> tx_last {};
-    std::array<int64_t, MetricsState::kMaxTrackedMembers> rtt_ms {};
-
-    std::array<size_t, MetricsState::kMaxTrackedMembers> keep_slots {};
-    size_t keep_count = 0;
-    for (size_t i = 0; i < MetricsState::kMaxTrackedMembers; ++i) {
-        const auto identity = metrics->output_member_identity_keys[i].load(std::memory_order_relaxed);
-        if (identity == 0) {
-            continue;
-        }
-        result.before_slots++;
-        const bool connected = metrics->output_member_connected[i].load(std::memory_order_relaxed) == 1;
-        const auto socket_id = static_cast<SRTSOCKET>(metrics->output_member_ids[i].load(std::memory_order_relaxed));
-        if (!connected || socket_id == SRT_INVALID_SOCK || socket_id == 0) {
-            continue;
-        }
-        keep_slots[keep_count++] = i;
-    }
-
-    result.after_slots = keep_count;
-    result.dropped = result.before_slots - keep_count;
-    for (size_t dst = 0; dst < keep_count; ++dst) {
-        const size_t src = keep_slots[dst];
-        if (src != dst) {
-            result.moved++;
-        }
-        member_ids[dst] = metrics->output_member_ids[src].load(std::memory_order_relaxed);
-        member_connected[dst] = metrics->output_member_connected[src].load(std::memory_order_relaxed);
-        member_identity[dst] = metrics->output_member_identity_keys[src].load(std::memory_order_relaxed);
-        rx_total[dst] = metrics->output_link_rx_bytes_total[src].load(std::memory_order_relaxed);
-        tx_total[dst] = metrics->output_link_tx_bytes_total[src].load(std::memory_order_relaxed);
-        rx_current[dst] = metrics->output_link_rx_bytes_current[src].load(std::memory_order_relaxed);
-        tx_current[dst] = metrics->output_link_tx_bytes_current[src].load(std::memory_order_relaxed);
-        rx_last[dst] = metrics->output_link_rx_bytes_last[src].load(std::memory_order_relaxed);
-        tx_last[dst] = metrics->output_link_tx_bytes_last[src].load(std::memory_order_relaxed);
-        rtt_ms[dst] = metrics->output_link_rtt_ms[src].load(std::memory_order_relaxed);
-    }
-
-    for (size_t i = keep_count; i < MetricsState::kMaxTrackedMembers; ++i) {
-        member_ids[i] = static_cast<int64_t>(SRT_INVALID_SOCK);
-        member_connected[i] = 0;
-        member_identity[i] = 0;
-        rx_total[i] = 0;
-        tx_total[i] = 0;
-        rx_current[i] = 0;
-        tx_current[i] = 0;
-        rx_last[i] = 0;
-        tx_last[i] = 0;
-        rtt_ms[i] = -1;
-    }
-
-    for (size_t i = 0; i < MetricsState::kMaxTrackedMembers; ++i) {
-        metrics->output_member_ids[i].store(member_ids[i], std::memory_order_relaxed);
-        metrics->output_member_connected[i].store(member_connected[i], std::memory_order_relaxed);
-        metrics->output_member_identity_keys[i].store(member_identity[i], std::memory_order_relaxed);
-        metrics->output_link_rx_bytes_total[i].store(rx_total[i], std::memory_order_relaxed);
-        metrics->output_link_tx_bytes_total[i].store(tx_total[i], std::memory_order_relaxed);
-        metrics->output_link_rx_bytes_current[i].store(rx_current[i], std::memory_order_relaxed);
-        metrics->output_link_tx_bytes_current[i].store(tx_current[i], std::memory_order_relaxed);
-        metrics->output_link_rx_bytes_last[i].store(rx_last[i], std::memory_order_relaxed);
-        metrics->output_link_tx_bytes_last[i].store(tx_last[i], std::memory_order_relaxed);
-        metrics->output_link_rtt_ms[i].store(rtt_ms[i], std::memory_order_relaxed);
-    }
-    metrics->output_links_snapshot_count.store(static_cast<int64_t>(keep_count), std::memory_order_relaxed);
-    return result;
-}
-
-std::string BuildCompactResponseJson(const CompactResponse& response) {
-    auto emit = [](const CompactResult& result) {
-        return json{
-            {"before_slots", result.before_slots},
-            {"after_slots", result.after_slots},
-            {"moved", result.moved},
-            {"dropped", result.dropped},
-        };
-    };
-    json out = {
-        {"direction", response.direction},
-    };
-    if (response.include_input) {
-        out["input"] = emit(response.input);
-    }
-    if (response.include_output) {
-        out["output"] = emit(response.output);
-    }
-    return out.dump();
+    return CompactSlotsLocked(LinkSide::kOutput, metrics);
 }
 
 }  // namespace
 
 std::string BuildInputLinkStatusCompact(const MetricsState& metrics) {
-    std::lock_guard<std::mutex> lock(metrics.link_metrics_mutex);
-    int64_t count = metrics.input_links_snapshot_count.load(std::memory_order_relaxed);
-    if (count < 0) count = 0;
-    const size_t capped = std::min(static_cast<size_t>(count), MetricsState::kMaxTrackedMembers);
-    std::ostringstream out;
-    bool first = true;
-    for (size_t i = 0; i < capped; ++i) {
-        const auto identity_key = metrics.input_member_identity_keys[i].load(std::memory_order_relaxed);
-        if (identity_key == 0) {
-            continue;
-        }
-        if (!first) out << ",";
-        first = false;
-        const auto socket_id = static_cast<SRTSOCKET>(metrics.input_member_ids[i].load(std::memory_order_relaxed));
-        const auto is_connected = metrics.input_member_connected[i].load(std::memory_order_relaxed) == 1;
-        out << "slot" << (i + 1) << ":" << socket_id << ":" << (is_connected ? "up" : "down");
-    }
-    return out.str();
+    return BuildLinkStatusCompact(LinkSide::kInput, metrics);
 }
 
 std::string BuildOutputLinkStatusCompact(const MetricsState& metrics) {
-    std::lock_guard<std::mutex> lock(metrics.link_metrics_mutex);
-    int64_t count = metrics.output_links_snapshot_count.load(std::memory_order_relaxed);
-    if (count < 0) count = 0;
-    const size_t capped = std::min(static_cast<size_t>(count), MetricsState::kMaxTrackedMembers);
-    std::ostringstream out;
-    bool first = true;
-    for (size_t i = 0; i < capped; ++i) {
-        const auto identity_key = metrics.output_member_identity_keys[i].load(std::memory_order_relaxed);
-        if (identity_key == 0) {
-            continue;
-        }
-        if (!first) out << ",";
-        first = false;
-        const auto socket_id = static_cast<SRTSOCKET>(metrics.output_member_ids[i].load(std::memory_order_relaxed));
-        const auto is_connected = metrics.output_member_connected[i].load(std::memory_order_relaxed) == 1;
-        out << "slot" << (i + 1) << ":" << socket_id << ":" << (is_connected ? "up" : "down");
-    }
-    return out.str();
+    return BuildLinkStatusCompact(LinkSide::kOutput, metrics);
 }
 
 void MarkAllTrackedInputLinksDisconnected(MetricsState* metrics) {
-    std::lock_guard<std::mutex> lock(metrics->link_metrics_mutex);
-    int64_t count = metrics->input_links_snapshot_count.load(std::memory_order_relaxed);
-    if (count < 0) count = 0;
-    const size_t capped = std::min(static_cast<size_t>(count), MetricsState::kMaxTrackedMembers);
-    for (size_t i = 0; i < capped; ++i) {
-        const auto identity_key = metrics->input_member_identity_keys[i].load(std::memory_order_relaxed);
-        if (identity_key == 0) {
-            continue;
-        }
-        metrics->input_member_connected[i].store(0, std::memory_order_relaxed);
-    }
+    MarkAllTrackedLinksDisconnected(LinkSide::kInput, metrics);
 }
 
 void MarkAllTrackedOutputLinksDisconnected(MetricsState* metrics) {
-    std::lock_guard<std::mutex> lock(metrics->link_metrics_mutex);
-    int64_t count = metrics->output_links_snapshot_count.load(std::memory_order_relaxed);
-    if (count < 0) count = 0;
-    const size_t capped = std::min(static_cast<size_t>(count), MetricsState::kMaxTrackedMembers);
-    for (size_t i = 0; i < capped; ++i) {
-        const auto identity_key = metrics->output_member_identity_keys[i].load(std::memory_order_relaxed);
-        if (identity_key == 0) {
-            continue;
-        }
-        metrics->output_member_connected[i].store(0, std::memory_order_relaxed);
-    }
+    MarkAllTrackedLinksDisconnected(LinkSide::kOutput, metrics);
 }
 
 void ResetInputTrackingMetrics(MetricsState* metrics) {
@@ -1713,17 +1144,17 @@ void UpdateOutputLinkHealthFromMsgCtrl(const SRT_MSGCTRL& tx_ctrl, MetricsState*
 namespace {
 
 std::vector<SRTSOCKET> GetInputMemberSocketsSnapshot(const MetricsState& metrics) {
-    std::lock_guard<std::mutex> lock(metrics.link_metrics_mutex);
+    MetricsState::LinkMetricsGuard lock(metrics);
     std::vector<SRTSOCKET> sockets;
     int64_t count = metrics.input_links_snapshot_count.load(std::memory_order_relaxed);
     if (count < 0) count = 0;
     const size_t capped = std::min(static_cast<size_t>(count), MetricsState::kMaxTrackedMembers);
     sockets.reserve(capped);
     for (size_t i = 0; i < capped; ++i) {
-        if (metrics.input_member_connected[i].load(std::memory_order_relaxed) != 1) {
+        if (metrics.input_tracked.slots[i].member_connected != 1) {
             continue;
         }
-        const auto id = static_cast<SRTSOCKET>(metrics.input_member_ids[i].load(std::memory_order_relaxed));
+        const auto id = static_cast<SRTSOCKET>(metrics.input_tracked.slots[i].member_id);
         if (id == SRT_INVALID_SOCK || id == 0) {
             continue;
         }
@@ -1733,17 +1164,17 @@ std::vector<SRTSOCKET> GetInputMemberSocketsSnapshot(const MetricsState& metrics
 }
 
 std::vector<SRTSOCKET> GetOutputMemberSocketsSnapshot(const MetricsState& metrics) {
-    std::lock_guard<std::mutex> lock(metrics.link_metrics_mutex);
+    MetricsState::LinkMetricsGuard lock(metrics);
     std::vector<SRTSOCKET> sockets;
     int64_t count = metrics.output_links_snapshot_count.load(std::memory_order_relaxed);
     if (count < 0) count = 0;
     const size_t capped = std::min(static_cast<size_t>(count), MetricsState::kMaxTrackedMembers);
     sockets.reserve(capped);
     for (size_t i = 0; i < capped; ++i) {
-        if (metrics.output_member_connected[i].load(std::memory_order_relaxed) != 1) {
+        if (metrics.output_tracked.slots[i].member_connected != 1) {
             continue;
         }
-        const auto id = static_cast<SRTSOCKET>(metrics.output_member_ids[i].load(std::memory_order_relaxed));
+        const auto id = static_cast<SRTSOCKET>(metrics.output_tracked.slots[i].member_id);
         if (id == SRT_INVALID_SOCK || id == 0) {
             continue;
         }
@@ -1757,6 +1188,27 @@ uint64_t CounterDeltaWithReset(uint64_t prev, uint64_t curr) {
         return curr - prev;
     }
     return curr;
+}
+
+uint64_t UpdateCounterTotalAndLast(uint64_t current, uint64_t total, uint64_t* last) {
+    total += CounterDeltaWithReset(*last, current);
+    *last = current;
+    return total;
+}
+
+void ResetInputLinkSlotCurrentCountersLocked(MetricsState* metrics, size_t index) {
+    metrics->AssertLinkMetricsLocked("ResetInputLinkSlotCurrentCountersLocked");
+    metrics->input_tracked.slots[index].link_rx_bytes_current = 0;
+    metrics->input_tracked.slots[index].link_tx_bytes_current = 0;
+    metrics->input_tracked.slots[index].link_packet_belated_current = 0;
+    metrics->input_tracked.slots[index].link_rtt_ms = -1;
+}
+
+void ResetOutputLinkSlotCurrentCountersLocked(MetricsState* metrics, size_t index) {
+    metrics->AssertLinkMetricsLocked("ResetOutputLinkSlotCurrentCountersLocked");
+    metrics->output_tracked.slots[index].link_rx_bytes_current = 0;
+    metrics->output_tracked.slots[index].link_tx_bytes_current = 0;
+    metrics->output_tracked.slots[index].link_rtt_ms = -1;
 }
 
 using SocketStatsSnapshot = std::unordered_map<SRTSOCKET, SRT_TRACEBSTATS>;
@@ -1779,28 +1231,22 @@ SocketStatsSnapshot CollectSocketStatsSnapshot(const std::vector<SRTSOCKET>& soc
 }
 
 void UpdateInputLinkTrafficPerSlot(MetricsState* metrics, const SocketStatsSnapshot& input_stats_by_socket) {
-    std::lock_guard<std::mutex> lock(metrics->link_metrics_mutex);
+    MetricsState::LinkMetricsGuard lock(*metrics);
     int64_t count = metrics->input_links_snapshot_count.load(std::memory_order_relaxed);
     if (count < 0) count = 0;
     const size_t capped = std::min(static_cast<size_t>(count), MetricsState::kMaxTrackedMembers);
 
     for (size_t i = 0; i < capped; ++i) {
-        const auto identity_key = metrics->input_member_identity_keys[i].load(std::memory_order_relaxed);
+        const auto identity_key = metrics->input_tracked.slots[i].member_identity_key;
         if (identity_key == 0) {
-            metrics->input_link_rx_bytes_current[i].store(0, std::memory_order_relaxed);
-            metrics->input_link_tx_bytes_current[i].store(0, std::memory_order_relaxed);
-            metrics->input_link_packet_belated_current[i].store(0, std::memory_order_relaxed);
-            metrics->input_link_rtt_ms[i].store(-1, std::memory_order_relaxed);
+            ResetInputLinkSlotCurrentCountersLocked(metrics, i);
             continue;
         }
 
-        const auto member_sock = static_cast<SRTSOCKET>(metrics->input_member_ids[i].load(std::memory_order_relaxed));
-        const auto member_connected = metrics->input_member_connected[i].load(std::memory_order_relaxed) == 1;
+        const auto member_sock = static_cast<SRTSOCKET>(metrics->input_tracked.slots[i].member_id);
+        const auto member_connected = metrics->input_tracked.slots[i].member_connected == 1;
         if (!member_connected || member_sock == SRT_INVALID_SOCK || member_sock == 0) {
-            metrics->input_link_rx_bytes_current[i].store(0, std::memory_order_relaxed);
-            metrics->input_link_tx_bytes_current[i].store(0, std::memory_order_relaxed);
-            metrics->input_link_packet_belated_current[i].store(0, std::memory_order_relaxed);
-            metrics->input_link_rtt_ms[i].store(-1, std::memory_order_relaxed);
+            ResetInputLinkSlotCurrentCountersLocked(metrics, i);
             continue;
         }
 
@@ -1813,50 +1259,52 @@ void UpdateInputLinkTrafficPerSlot(MetricsState* metrics, const SocketStatsSnaps
         const auto rx_current = static_cast<uint64_t>(stats.byteRecvTotal);
         const auto tx_current = static_cast<uint64_t>(stats.byteSentTotal);
         const auto belated_current = static_cast<uint64_t>(stats.pktRcvBelated);
-        const auto rx_last = metrics->input_link_rx_bytes_last[i].load(std::memory_order_relaxed);
-        const auto tx_last = metrics->input_link_tx_bytes_last[i].load(std::memory_order_relaxed);
-        const auto belated_last = metrics->input_link_packet_belated_last[i].load(std::memory_order_relaxed);
-        const auto rx_total = metrics->input_link_rx_bytes_total[i].load(std::memory_order_relaxed) +
-                              CounterDeltaWithReset(rx_last, rx_current);
-        const auto tx_total = metrics->input_link_tx_bytes_total[i].load(std::memory_order_relaxed) +
-                              CounterDeltaWithReset(tx_last, tx_current);
-        const auto belated_total = metrics->input_link_packet_belated_total[i].load(std::memory_order_relaxed) +
-                                   CounterDeltaWithReset(belated_last, belated_current);
+        auto rx_last = metrics->input_tracked.slots[i].link_rx_bytes_last;
+        auto tx_last = metrics->input_tracked.slots[i].link_tx_bytes_last;
+        auto belated_last = metrics->input_tracked.slots[i].link_packet_belated_last;
+        const auto rx_total = UpdateCounterTotalAndLast(
+            rx_current,
+            metrics->input_tracked.slots[i].link_rx_bytes_total,
+            &rx_last);
+        const auto tx_total = UpdateCounterTotalAndLast(
+            tx_current,
+            metrics->input_tracked.slots[i].link_tx_bytes_total,
+            &tx_last);
+        const auto belated_total = UpdateCounterTotalAndLast(
+            belated_current,
+            metrics->input_tracked.slots[i].link_packet_belated_total,
+            &belated_last);
         const auto rtt_ms = static_cast<int64_t>(stats.msRTT);
-        metrics->input_link_rx_bytes_total[i].store(rx_total, std::memory_order_relaxed);
-        metrics->input_link_tx_bytes_total[i].store(tx_total, std::memory_order_relaxed);
-        metrics->input_link_packet_belated_total[i].store(belated_total, std::memory_order_relaxed);
-        metrics->input_link_rx_bytes_current[i].store(rx_current, std::memory_order_relaxed);
-        metrics->input_link_tx_bytes_current[i].store(tx_current, std::memory_order_relaxed);
-        metrics->input_link_packet_belated_current[i].store(belated_current, std::memory_order_relaxed);
-        metrics->input_link_rx_bytes_last[i].store(rx_current, std::memory_order_relaxed);
-        metrics->input_link_tx_bytes_last[i].store(tx_current, std::memory_order_relaxed);
-        metrics->input_link_packet_belated_last[i].store(belated_current, std::memory_order_relaxed);
-        metrics->input_link_rtt_ms[i].store(rtt_ms, std::memory_order_relaxed);
+        metrics->input_tracked.slots[i].link_rx_bytes_total = rx_total;
+        metrics->input_tracked.slots[i].link_tx_bytes_total = tx_total;
+        metrics->input_tracked.slots[i].link_packet_belated_total = belated_total;
+        metrics->input_tracked.slots[i].link_rx_bytes_current = rx_current;
+        metrics->input_tracked.slots[i].link_tx_bytes_current = tx_current;
+        metrics->input_tracked.slots[i].link_packet_belated_current = belated_current;
+        metrics->input_tracked.slots[i].link_rx_bytes_last = rx_last;
+        metrics->input_tracked.slots[i].link_tx_bytes_last = tx_last;
+        metrics->input_tracked.slots[i].link_packet_belated_last = belated_last;
+        metrics->input_tracked.slots[i].link_rtt_ms = rtt_ms;
     }
 }
 
 void UpdateOutputLinkTrafficPerSlot(MetricsState* metrics, const SocketStatsSnapshot& output_stats_by_socket) {
-    std::lock_guard<std::mutex> lock(metrics->link_metrics_mutex);
+    MetricsState::LinkMetricsGuard lock(*metrics);
     int64_t count = metrics->output_links_snapshot_count.load(std::memory_order_relaxed);
     if (count < 0) count = 0;
     const size_t capped = std::min(static_cast<size_t>(count), MetricsState::kMaxTrackedMembers);
 
     for (size_t i = 0; i < capped; ++i) {
-        const auto identity_key = metrics->output_member_identity_keys[i].load(std::memory_order_relaxed);
+        const auto identity_key = metrics->output_tracked.slots[i].member_identity_key;
         if (identity_key == 0) {
-            metrics->output_link_rx_bytes_current[i].store(0, std::memory_order_relaxed);
-            metrics->output_link_tx_bytes_current[i].store(0, std::memory_order_relaxed);
-            metrics->output_link_rtt_ms[i].store(-1, std::memory_order_relaxed);
+            ResetOutputLinkSlotCurrentCountersLocked(metrics, i);
             continue;
         }
 
-        const auto member_sock = static_cast<SRTSOCKET>(metrics->output_member_ids[i].load(std::memory_order_relaxed));
-        const auto member_connected = metrics->output_member_connected[i].load(std::memory_order_relaxed) == 1;
+        const auto member_sock = static_cast<SRTSOCKET>(metrics->output_tracked.slots[i].member_id);
+        const auto member_connected = metrics->output_tracked.slots[i].member_connected == 1;
         if (!member_connected || member_sock == SRT_INVALID_SOCK || member_sock == 0) {
-            metrics->output_link_rx_bytes_current[i].store(0, std::memory_order_relaxed);
-            metrics->output_link_tx_bytes_current[i].store(0, std::memory_order_relaxed);
-            metrics->output_link_rtt_ms[i].store(-1, std::memory_order_relaxed);
+            ResetOutputLinkSlotCurrentCountersLocked(metrics, i);
             continue;
         }
 
@@ -1868,20 +1316,24 @@ void UpdateOutputLinkTrafficPerSlot(MetricsState* metrics, const SocketStatsSnap
 
         const auto rx_current = static_cast<uint64_t>(stats.byteRecvTotal);
         const auto tx_current = static_cast<uint64_t>(stats.byteSentTotal);
-        const auto rx_last = metrics->output_link_rx_bytes_last[i].load(std::memory_order_relaxed);
-        const auto tx_last = metrics->output_link_tx_bytes_last[i].load(std::memory_order_relaxed);
-        const auto rx_total = metrics->output_link_rx_bytes_total[i].load(std::memory_order_relaxed) +
-                              CounterDeltaWithReset(rx_last, rx_current);
-        const auto tx_total = metrics->output_link_tx_bytes_total[i].load(std::memory_order_relaxed) +
-                              CounterDeltaWithReset(tx_last, tx_current);
+        auto rx_last = metrics->output_tracked.slots[i].link_rx_bytes_last;
+        auto tx_last = metrics->output_tracked.slots[i].link_tx_bytes_last;
+        const auto rx_total = UpdateCounterTotalAndLast(
+            rx_current,
+            metrics->output_tracked.slots[i].link_rx_bytes_total,
+            &rx_last);
+        const auto tx_total = UpdateCounterTotalAndLast(
+            tx_current,
+            metrics->output_tracked.slots[i].link_tx_bytes_total,
+            &tx_last);
         const auto rtt_ms = static_cast<int64_t>(stats.msRTT);
-        metrics->output_link_rx_bytes_total[i].store(rx_total, std::memory_order_relaxed);
-        metrics->output_link_tx_bytes_total[i].store(tx_total, std::memory_order_relaxed);
-        metrics->output_link_rx_bytes_current[i].store(rx_current, std::memory_order_relaxed);
-        metrics->output_link_tx_bytes_current[i].store(tx_current, std::memory_order_relaxed);
-        metrics->output_link_rx_bytes_last[i].store(rx_current, std::memory_order_relaxed);
-        metrics->output_link_tx_bytes_last[i].store(tx_current, std::memory_order_relaxed);
-        metrics->output_link_rtt_ms[i].store(rtt_ms, std::memory_order_relaxed);
+        metrics->output_tracked.slots[i].link_rx_bytes_total = rx_total;
+        metrics->output_tracked.slots[i].link_tx_bytes_total = tx_total;
+        metrics->output_tracked.slots[i].link_rx_bytes_current = rx_current;
+        metrics->output_tracked.slots[i].link_tx_bytes_current = tx_current;
+        metrics->output_tracked.slots[i].link_rx_bytes_last = rx_last;
+        metrics->output_tracked.slots[i].link_tx_bytes_last = tx_last;
+        metrics->output_tracked.slots[i].link_rtt_ms = rtt_ms;
     }
 }
 
@@ -1912,10 +1364,14 @@ void UpdateTransportTrafficMetrics(SRTSOCKET input_session_sock, SRTSOCKET outpu
             input_group_packet_drop_current = static_cast<uint64_t>(input_group_stats.pktRcvDropTotal);
             input_group_byte_drop_current = static_cast<uint64_t>(input_group_stats.byteRcvDropTotal);
             auto& prev = metrics->input_group_drop_last_by_socket[input_group_sock];
-            input_group_packet_drop_total += CounterDeltaWithReset(prev.packet_drop_total, input_group_packet_drop_current);
-            input_group_byte_drop_total += CounterDeltaWithReset(prev.byte_drop_total, input_group_byte_drop_current);
-            prev.packet_drop_total = input_group_packet_drop_current;
-            prev.byte_drop_total = input_group_byte_drop_current;
+            input_group_packet_drop_total = UpdateCounterTotalAndLast(
+                input_group_packet_drop_current,
+                input_group_packet_drop_total,
+                &prev.packet_drop_total);
+            input_group_byte_drop_total = UpdateCounterTotalAndLast(
+                input_group_byte_drop_current,
+                input_group_byte_drop_total,
+                &prev.byte_drop_total);
         }
     }
     std::unordered_map<SRTSOCKET, GroupDropCounterSnapshot> next_input_group_last;
@@ -1956,16 +1412,26 @@ void UpdateTransportTrafficMetrics(SRTSOCKET input_session_sock, SRTSOCKET outpu
         input_packet_belated_current += static_cast<uint64_t>(in_stats.pktRcvBelated);
 
         auto& prev = metrics->input_transport_last_by_socket[member_sock];
-        input_byte_recv_total += CounterDeltaWithReset(prev.byte_recv_total, static_cast<uint64_t>(in_stats.byteRecvTotal));
-        input_byte_recv_unique_total += CounterDeltaWithReset(prev.byte_recv_unique_total, static_cast<uint64_t>(in_stats.byteRecvUniqueTotal));
-        input_byte_retrans_total += CounterDeltaWithReset(prev.byte_retrans_total, static_cast<uint64_t>(in_stats.byteRetransTotal));
-        input_byte_loss_total += CounterDeltaWithReset(prev.byte_loss_total, static_cast<uint64_t>(in_stats.byteRcvLossTotal));
-        input_packet_belated_total += CounterDeltaWithReset(prev.packet_belated_total, static_cast<uint64_t>(in_stats.pktRcvBelated));
-        prev.byte_recv_total = static_cast<uint64_t>(in_stats.byteRecvTotal);
-        prev.byte_recv_unique_total = static_cast<uint64_t>(in_stats.byteRecvUniqueTotal);
-        prev.byte_retrans_total = static_cast<uint64_t>(in_stats.byteRetransTotal);
-        prev.byte_loss_total = static_cast<uint64_t>(in_stats.byteRcvLossTotal);
-        prev.packet_belated_total = static_cast<uint64_t>(in_stats.pktRcvBelated);
+        input_byte_recv_total = UpdateCounterTotalAndLast(
+            static_cast<uint64_t>(in_stats.byteRecvTotal),
+            input_byte_recv_total,
+            &prev.byte_recv_total);
+        input_byte_recv_unique_total = UpdateCounterTotalAndLast(
+            static_cast<uint64_t>(in_stats.byteRecvUniqueTotal),
+            input_byte_recv_unique_total,
+            &prev.byte_recv_unique_total);
+        input_byte_retrans_total = UpdateCounterTotalAndLast(
+            static_cast<uint64_t>(in_stats.byteRetransTotal),
+            input_byte_retrans_total,
+            &prev.byte_retrans_total);
+        input_byte_loss_total = UpdateCounterTotalAndLast(
+            static_cast<uint64_t>(in_stats.byteRcvLossTotal),
+            input_byte_loss_total,
+            &prev.byte_loss_total);
+        input_packet_belated_total = UpdateCounterTotalAndLast(
+            static_cast<uint64_t>(in_stats.pktRcvBelated),
+            input_packet_belated_total,
+            &prev.packet_belated_total);
     }
 
     std::unordered_map<SRTSOCKET, TransportCounterSnapshot> next_last;
@@ -2017,14 +1483,22 @@ void UpdateTransportTrafficMetrics(SRTSOCKET input_session_sock, SRTSOCKET outpu
         output_byte_drop_current += static_cast<uint64_t>(output_stats.byteSndDropTotal);
 
         auto& prev = metrics->output_transport_last_by_socket[member_sock];
-        output_byte_sent_total += CounterDeltaWithReset(prev.byte_sent_total, static_cast<uint64_t>(output_stats.byteSentTotal));
-        output_byte_sent_unique_total += CounterDeltaWithReset(prev.byte_sent_unique_total, static_cast<uint64_t>(output_stats.byteSentUniqueTotal));
-        output_byte_retrans_total += CounterDeltaWithReset(prev.byte_retrans_total, static_cast<uint64_t>(output_stats.byteRetransTotal));
-        output_byte_drop_total += CounterDeltaWithReset(prev.byte_drop_total, static_cast<uint64_t>(output_stats.byteSndDropTotal));
-        prev.byte_sent_total = static_cast<uint64_t>(output_stats.byteSentTotal);
-        prev.byte_sent_unique_total = static_cast<uint64_t>(output_stats.byteSentUniqueTotal);
-        prev.byte_retrans_total = static_cast<uint64_t>(output_stats.byteRetransTotal);
-        prev.byte_drop_total = static_cast<uint64_t>(output_stats.byteSndDropTotal);
+        output_byte_sent_total = UpdateCounterTotalAndLast(
+            static_cast<uint64_t>(output_stats.byteSentTotal),
+            output_byte_sent_total,
+            &prev.byte_sent_total);
+        output_byte_sent_unique_total = UpdateCounterTotalAndLast(
+            static_cast<uint64_t>(output_stats.byteSentUniqueTotal),
+            output_byte_sent_unique_total,
+            &prev.byte_sent_unique_total);
+        output_byte_retrans_total = UpdateCounterTotalAndLast(
+            static_cast<uint64_t>(output_stats.byteRetransTotal),
+            output_byte_retrans_total,
+            &prev.byte_retrans_total);
+        output_byte_drop_total = UpdateCounterTotalAndLast(
+            static_cast<uint64_t>(output_stats.byteSndDropTotal),
+            output_byte_drop_total,
+            &prev.byte_drop_total);
     }
 
     std::unordered_map<SRTSOCKET, TransportCounterSnapshot> next_output_last;
@@ -2045,10 +1519,9 @@ void UpdateTransportTrafficMetrics(SRTSOCKET input_session_sock, SRTSOCKET outpu
     metrics->output_transport_byte_drop_current.store(output_byte_drop_current, std::memory_order_relaxed);
 }
 
-template <typename ConnectedArr, typename RttArr>
+template <typename SlotArr>
 bool TryComputeMaxConnectedLinkRttGeneric(int64_t snapshot_count,
-                                          const ConnectedArr& connected,
-                                          const RttArr& rtt_values,
+                                          const SlotArr& slots,
                                           int64_t* out_max_rtt_ms) {
     if (out_max_rtt_ms == nullptr) {
         return false;
@@ -2057,10 +1530,10 @@ bool TryComputeMaxConnectedLinkRttGeneric(int64_t snapshot_count,
     const size_t capped = std::min(static_cast<size_t>(snapshot_count), MetricsState::kMaxTrackedMembers);
     int64_t max_rtt = -1;
     for (size_t i = 0; i < capped; ++i) {
-        if (connected[i].load(std::memory_order_relaxed) != 1) {
+        if (slots[i].member_connected != 1) {
             continue;
         }
-        const int64_t rtt_ms = rtt_values[i].load(std::memory_order_relaxed);
+        const int64_t rtt_ms = slots[i].link_rtt_ms;
         if (rtt_ms < 0) {
             continue;
         }
@@ -2074,27 +1547,25 @@ bool TryComputeMaxConnectedLinkRttGeneric(int64_t snapshot_count,
 }
 
 bool TryComputeMaxConnectedInputLinkRtt(const MetricsState& metrics, int64_t* out_max_rtt_ms) {
-    std::lock_guard<std::mutex> lock(metrics.link_metrics_mutex);
+    MetricsState::LinkMetricsGuard lock(metrics);
     const int64_t count = metrics.input_links_snapshot_count.load(std::memory_order_relaxed);
     return TryComputeMaxConnectedLinkRttGeneric(count,
-                                                metrics.input_member_connected,
-                                                metrics.input_link_rtt_ms,
+                                                metrics.input_tracked.slots,
                                                 out_max_rtt_ms);
 }
 
 bool TryComputeMaxConnectedOutputLinkRtt(const MetricsState& metrics, int64_t* out_max_rtt_ms) {
-    std::lock_guard<std::mutex> lock(metrics.link_metrics_mutex);
+    MetricsState::LinkMetricsGuard lock(metrics);
     const int64_t count = metrics.output_links_snapshot_count.load(std::memory_order_relaxed);
     return TryComputeMaxConnectedLinkRttGeneric(count,
-                                                metrics.output_member_connected,
-                                                metrics.output_link_rtt_ms,
+                                                metrics.output_tracked.slots,
                                                 out_max_rtt_ms);
 }
 
 }  // namespace
 
 std::string RenderPrometheusMetrics(const MetricsState& metrics) {
-    std::lock_guard<std::mutex> lock(metrics.link_metrics_mutex);
+    MetricsState::LinkMetricsGuard lock(metrics);
     const auto total_rx_bytes = metrics.total_rx_bytes.load(std::memory_order_relaxed);
     const auto total_tx_bytes = metrics.total_tx_bytes.load(std::memory_order_relaxed);
     const auto total_rx_msgs = metrics.total_rx_msgs.load(std::memory_order_relaxed);
@@ -2191,179 +1662,206 @@ std::string RenderPrometheusMetrics(const MetricsState& metrics) {
         out << name << " " << value << "\n";
     };
 
-    emit_u64("srt_relay_rx_bytes_total", "counter", "Total bytes received by relay input.", total_rx_bytes);
-    emit_u64("srt_relay_tx_bytes_total", "counter", "Total bytes sent by relay output.", total_tx_bytes);
-    emit_u64("srt_relay_rx_messages_total", "counter", "Total messages received by relay input.", total_rx_msgs);
-    emit_u64("srt_relay_tx_messages_total", "counter", "Total messages sent by relay output.", total_tx_msgs);
-    emit_u64("srt_relay_send_failures_total", "counter", "Total failed output send attempts.", total_send_failures);
-    emit_u64("srt_relay_reconnects_total", "counter", "Total reconnect attempts after output failures.", reconnect_count);
+    struct U64MetricDef {
+        const char* name;
+        const char* type;
+        const char* help;
+        uint64_t value;
+    };
+    const std::array<U64MetricDef, 12> u64_metric_defs{{
+        {"srt_relay_rx_bytes_total", "counter", "Total bytes received by relay input.", total_rx_bytes},
+        {"srt_relay_tx_bytes_total", "counter", "Total bytes sent by relay output.", total_tx_bytes},
+        {"srt_relay_rx_messages_total", "counter", "Total messages received by relay input.", total_rx_msgs},
+        {"srt_relay_tx_messages_total", "counter", "Total messages sent by relay output.", total_tx_msgs},
+        {"srt_relay_send_failures_total", "counter", "Total failed output send attempts.", total_send_failures},
+        {"srt_relay_reconnects_total", "counter", "Total reconnect attempts after output failures.", reconnect_count},
+        {"srt_relay_rx_bytes_per_sec", "gauge", "Received bytes per second over last stats interval.", rx_bytes_per_sec},
+        {"srt_relay_tx_bytes_per_sec", "gauge", "Sent bytes per second over last stats interval.", tx_bytes_per_sec},
+        {"srt_relay_rx_messages_per_sec", "gauge", "Received messages per second over last stats interval.", rx_msgs_per_sec},
+        {"srt_relay_tx_messages_per_sec", "gauge", "Sent messages per second over last stats interval.", tx_msgs_per_sec},
+        {"srt_relay_send_failures_interval", "gauge", "Output send failures over last stats interval.", interval_send_failures},
+        {"srt_relay_input_switches_total", "counter", "Total input source switch events.", input_switches_total},
+    }};
+    for (const auto& metric : u64_metric_defs) {
+        emit_u64(metric.name, metric.type, metric.help, metric.value);
+    }
 
-    emit_u64("srt_relay_rx_bytes_per_sec", "gauge", "Received bytes per second over last stats interval.", rx_bytes_per_sec);
-    emit_u64("srt_relay_tx_bytes_per_sec", "gauge", "Sent bytes per second over last stats interval.", tx_bytes_per_sec);
-    emit_u64("srt_relay_rx_messages_per_sec", "gauge", "Received messages per second over last stats interval.", rx_msgs_per_sec);
-    emit_u64("srt_relay_tx_messages_per_sec", "gauge", "Sent messages per second over last stats interval.", tx_msgs_per_sec);
-    emit_u64("srt_relay_send_failures_interval", "gauge", "Output send failures over last stats interval.", interval_send_failures);
-
-    emit_i64("srt_relay_input_listening", "gauge", "Relay input listener is up (1/0).", input_listening);
-    emit_i64("srt_relay_input_connected", "gauge", "Relay input session is connected (1/0).", input_connected);
-    emit_i64("srt_relay_output_connected", "gauge", "Relay output session is connected (1/0).", output_connected);
-    emit_i64("srt_relay_path_ready", "gauge", "Relay data path input+output connected (1/0).", path_ready);
-    emit_i64("srt_relay_input_sources_total", "gauge", "Configured independent input source count.", input_sources_total);
-    emit_i64("srt_relay_active_input_index", "gauge", "1-based active input source index.", active_input_index);
-    emit_u64("srt_relay_input_switches_total", "counter", "Total input source switch events.", input_switches_total);
-    emit_i64("srt_relay_primary_input_index", "gauge", "Configured primary input index (1-based, 0 when unset).", primary_input_index);
-    emit_i64("srt_relay_input_links_total", "gauge", "Total number of input links in the active SRT group.", input_links_total);
-    emit_i64("srt_relay_input_links_healthy", "gauge", "Number of healthy input links in the active SRT group.", input_links_healthy);
-    emit_i64("srt_relay_input_links_running", "gauge", "Number of currently running/active input links in the active SRT group.", input_links_running);
-    emit_i64("srt_relay_output_links_total", "gauge", "Total number of output links in the active SRT group.", output_links_total);
-    emit_i64("srt_relay_output_links_healthy", "gauge", "Number of healthy output links in the active SRT group.", output_links_healthy);
-    emit_i64("srt_relay_output_links_running", "gauge", "Number of currently running/active output links in the active SRT group.", output_links_running);
+    struct I64MetricDef {
+        const char* name;
+        const char* type;
+        const char* help;
+        int64_t value;
+    };
+    const std::array<I64MetricDef, 13> i64_metric_defs{{
+        {"srt_relay_input_listening", "gauge", "Relay input listener is up (1/0).", input_listening},
+        {"srt_relay_input_connected", "gauge", "Relay input session is connected (1/0).", input_connected},
+        {"srt_relay_output_connected", "gauge", "Relay output session is connected (1/0).", output_connected},
+        {"srt_relay_path_ready", "gauge", "Relay data path input+output connected (1/0).", path_ready},
+        {"srt_relay_input_sources_total", "gauge", "Configured independent input source count.", input_sources_total},
+        {"srt_relay_active_input_index", "gauge", "1-based active input source index.", active_input_index},
+        {"srt_relay_primary_input_index", "gauge", "Configured primary input index (1-based, 0 when unset).", primary_input_index},
+        {"srt_relay_input_links_total", "gauge", "Total number of input links in the active SRT group.", input_links_total},
+        {"srt_relay_input_links_healthy", "gauge", "Number of healthy input links in the active SRT group.", input_links_healthy},
+        {"srt_relay_input_links_running", "gauge", "Number of currently running/active input links in the active SRT group.", input_links_running},
+        {"srt_relay_output_links_total", "gauge", "Total number of output links in the active SRT group.", output_links_total},
+        {"srt_relay_output_links_healthy", "gauge", "Number of healthy output links in the active SRT group.", output_links_healthy},
+        {"srt_relay_output_links_running", "gauge", "Number of currently running/active output links in the active SRT group.", output_links_running},
+    }};
+    for (const auto& metric : i64_metric_defs) {
+        emit_i64(metric.name, metric.type, metric.help, metric.value);
+    }
 
     auto emit_input_link_metric_u64 = [&](const char* name,
                                           const char* type,
                                           const char* help,
-                                          const std::array<std::atomic<uint64_t>, MetricsState::kMaxTrackedMembers>& values) {
+                                          const auto& value_for_slot) {
         out << "# HELP " << name << " " << help << "\n";
         out << "# TYPE " << name << " " << type << "\n";
         for (size_t i = 0; i < input_links_snapshot_capped; ++i) {
-            const auto identity_key = metrics.input_member_identity_keys[i].load(std::memory_order_relaxed);
+            const auto& slot = metrics.input_tracked.slots[i];
+            const auto identity_key = slot.member_identity_key;
             if (identity_key == 0) {
                 continue;
             }
-            const auto socket_id = static_cast<SRTSOCKET>(metrics.input_member_ids[i].load(std::memory_order_relaxed));
+            const auto socket_id = static_cast<SRTSOCKET>(slot.member_id);
             out << name << "{link_index=\"" << (i + 1)
                 << "\",socket_id=\"" << socket_id << "\"} "
-                << values[i].load(std::memory_order_relaxed) << "\n";
+                << value_for_slot(slot) << "\n";
         }
     };
     auto emit_input_link_metric_i64 = [&](const char* name,
                                           const char* type,
                                           const char* help,
-                                          const std::array<std::atomic<int64_t>, MetricsState::kMaxTrackedMembers>& values) {
+                                          const auto& value_for_slot) {
         out << "# HELP " << name << " " << help << "\n";
         out << "# TYPE " << name << " " << type << "\n";
         for (size_t i = 0; i < input_links_snapshot_capped; ++i) {
-            const auto identity_key = metrics.input_member_identity_keys[i].load(std::memory_order_relaxed);
+            const auto& slot = metrics.input_tracked.slots[i];
+            const auto identity_key = slot.member_identity_key;
             if (identity_key == 0) {
                 continue;
             }
-            const auto socket_id = static_cast<SRTSOCKET>(metrics.input_member_ids[i].load(std::memory_order_relaxed));
+            const auto socket_id = static_cast<SRTSOCKET>(slot.member_id);
             out << name << "{link_index=\"" << (i + 1)
                 << "\",socket_id=\"" << socket_id << "\"} "
-                << values[i].load(std::memory_order_relaxed) << "\n";
+                << value_for_slot(slot) << "\n";
         }
     };
     auto emit_input_link_metric_i32 = [&](const char* name,
                                           const char* type,
                                           const char* help,
-                                          const std::array<std::atomic<int>, MetricsState::kMaxTrackedMembers>& values) {
+                                          const auto& value_for_slot) {
         out << "# HELP " << name << " " << help << "\n";
         out << "# TYPE " << name << " " << type << "\n";
         for (size_t i = 0; i < input_links_snapshot_capped; ++i) {
-            const auto identity_key = metrics.input_member_identity_keys[i].load(std::memory_order_relaxed);
+            const auto& slot = metrics.input_tracked.slots[i];
+            const auto identity_key = slot.member_identity_key;
             if (identity_key == 0) {
                 continue;
             }
-            const auto socket_id = static_cast<SRTSOCKET>(metrics.input_member_ids[i].load(std::memory_order_relaxed));
+            const auto socket_id = static_cast<SRTSOCKET>(slot.member_id);
             out << name << "{link_index=\"" << (i + 1)
                 << "\",socket_id=\"" << socket_id << "\"} "
-                << values[i].load(std::memory_order_relaxed) << "\n";
+                << value_for_slot(slot) << "\n";
         }
     };
     auto emit_output_link_metric_u64 = [&](const char* name,
                                            const char* type,
                                            const char* help,
-                                           const std::array<std::atomic<uint64_t>, MetricsState::kMaxTrackedMembers>& values) {
+                                           const auto& value_for_slot) {
         out << "# HELP " << name << " " << help << "\n";
         out << "# TYPE " << name << " " << type << "\n";
         for (size_t i = 0; i < output_links_snapshot_capped; ++i) {
-            const auto identity_key = metrics.output_member_identity_keys[i].load(std::memory_order_relaxed);
+            const auto& slot = metrics.output_tracked.slots[i];
+            const auto identity_key = slot.member_identity_key;
             if (identity_key == 0) {
                 continue;
             }
-            const auto socket_id = static_cast<SRTSOCKET>(metrics.output_member_ids[i].load(std::memory_order_relaxed));
+            const auto socket_id = static_cast<SRTSOCKET>(slot.member_id);
             out << name << "{link_index=\"" << (i + 1)
                 << "\",socket_id=\"" << socket_id << "\"} "
-                << values[i].load(std::memory_order_relaxed) << "\n";
+                << value_for_slot(slot) << "\n";
         }
     };
     auto emit_output_link_metric_i64 = [&](const char* name,
                                            const char* type,
                                            const char* help,
-                                           const std::array<std::atomic<int64_t>, MetricsState::kMaxTrackedMembers>& values) {
+                                           const auto& value_for_slot) {
         out << "# HELP " << name << " " << help << "\n";
         out << "# TYPE " << name << " " << type << "\n";
         for (size_t i = 0; i < output_links_snapshot_capped; ++i) {
-            const auto identity_key = metrics.output_member_identity_keys[i].load(std::memory_order_relaxed);
+            const auto& slot = metrics.output_tracked.slots[i];
+            const auto identity_key = slot.member_identity_key;
             if (identity_key == 0) {
                 continue;
             }
-            const auto socket_id = static_cast<SRTSOCKET>(metrics.output_member_ids[i].load(std::memory_order_relaxed));
+            const auto socket_id = static_cast<SRTSOCKET>(slot.member_id);
             out << name << "{link_index=\"" << (i + 1)
                 << "\",socket_id=\"" << socket_id << "\"} "
-                << values[i].load(std::memory_order_relaxed) << "\n";
+                << value_for_slot(slot) << "\n";
         }
     };
     auto emit_output_link_metric_i32 = [&](const char* name,
                                            const char* type,
                                            const char* help,
-                                           const std::array<std::atomic<int>, MetricsState::kMaxTrackedMembers>& values) {
+                                           const auto& value_for_slot) {
         out << "# HELP " << name << " " << help << "\n";
         out << "# TYPE " << name << " " << type << "\n";
         for (size_t i = 0; i < output_links_snapshot_capped; ++i) {
-            const auto identity_key = metrics.output_member_identity_keys[i].load(std::memory_order_relaxed);
+            const auto& slot = metrics.output_tracked.slots[i];
+            const auto identity_key = slot.member_identity_key;
             if (identity_key == 0) {
                 continue;
             }
-            const auto socket_id = static_cast<SRTSOCKET>(metrics.output_member_ids[i].load(std::memory_order_relaxed));
+            const auto socket_id = static_cast<SRTSOCKET>(slot.member_id);
             out << name << "{link_index=\"" << (i + 1)
                 << "\",socket_id=\"" << socket_id << "\"} "
-                << values[i].load(std::memory_order_relaxed) << "\n";
+                << value_for_slot(slot) << "\n";
         }
     };
 
     emit_input_link_metric_i32("srt_relay_input_link_connected", "gauge",
                                "Per-input-link connection state in the active SRT group (1/0).",
-                               metrics.input_member_connected);
+                               [](const auto& slot) { return slot.member_connected; });
     emit_input_link_metric_u64("srt_relay_input_link_rx_bytes_total", "counter",
                                "Monotonic per-link transport RX bytes for each stable input link slot.",
-                               metrics.input_link_rx_bytes_total);
+                               [](const auto& slot) { return slot.link_rx_bytes_total; });
     emit_input_link_metric_u64("srt_relay_input_link_tx_bytes_total", "counter",
                                "Monotonic per-link transport TX bytes for each stable input link slot.",
-                               metrics.input_link_tx_bytes_total);
+                               [](const auto& slot) { return slot.link_tx_bytes_total; });
     emit_input_link_metric_u64("srt_relay_input_link_rx_bytes_current", "gauge",
                                "Current per-link byteRecvTotal for each stable input link slot.",
-                               metrics.input_link_rx_bytes_current);
+                               [](const auto& slot) { return slot.link_rx_bytes_current; });
     emit_input_link_metric_u64("srt_relay_input_link_tx_bytes_current", "gauge",
                                "Current per-link byteSentTotal for each stable input link slot.",
-                               metrics.input_link_tx_bytes_current);
+                               [](const auto& slot) { return slot.link_tx_bytes_current; });
     emit_input_link_metric_u64("srt_relay_input_link_packet_belated_total", "counter",
                                "Monotonic per-link belated packets ignored for playout for each stable input link slot.",
-                               metrics.input_link_packet_belated_total);
+                               [](const auto& slot) { return slot.link_packet_belated_total; });
     emit_input_link_metric_u64("srt_relay_input_link_packet_belated_current", "gauge",
                                "Current per-link pktRcvBelated for each stable input link slot.",
-                               metrics.input_link_packet_belated_current);
+                               [](const auto& slot) { return slot.link_packet_belated_current; });
     emit_input_link_metric_i64("srt_relay_input_link_rtt_ms", "gauge",
                                "Per-link RTT in milliseconds for each stable input link slot.",
-                               metrics.input_link_rtt_ms);
+                               [](const auto& slot) { return slot.link_rtt_ms; });
     emit_output_link_metric_i32("srt_relay_output_link_connected", "gauge",
                                 "Per-output-link connection state in the active SRT group (1/0).",
-                                metrics.output_member_connected);
+                                [](const auto& slot) { return slot.member_connected; });
     emit_output_link_metric_u64("srt_relay_output_link_rx_bytes_total", "counter",
                                 "Monotonic per-link transport RX bytes for each stable output link slot.",
-                                metrics.output_link_rx_bytes_total);
+                                [](const auto& slot) { return slot.link_rx_bytes_total; });
     emit_output_link_metric_u64("srt_relay_output_link_tx_bytes_total", "counter",
                                 "Monotonic per-link transport TX bytes for each stable output link slot.",
-                                metrics.output_link_tx_bytes_total);
+                                [](const auto& slot) { return slot.link_tx_bytes_total; });
     emit_output_link_metric_u64("srt_relay_output_link_rx_bytes_current", "gauge",
                                 "Current per-link byteRecvTotal for each stable output link slot.",
-                                metrics.output_link_rx_bytes_current);
+                                [](const auto& slot) { return slot.link_rx_bytes_current; });
     emit_output_link_metric_u64("srt_relay_output_link_tx_bytes_current", "gauge",
                                 "Current per-link byteSentTotal for each stable output link slot.",
-                                metrics.output_link_tx_bytes_current);
+                                [](const auto& slot) { return slot.link_tx_bytes_current; });
     emit_output_link_metric_i64("srt_relay_output_link_rtt_ms", "gauge",
                                 "Per-link RTT in milliseconds for each stable output link slot.",
-                                metrics.output_link_rtt_ms);
+                                [](const auto& slot) { return slot.link_rtt_ms; });
 
     emit_u64("srt_relay_input_transport_byte_recv_total", "counter", "Monotonic input transport bytes received across tracked SRT member sockets (includes duplicate traffic).", input_transport_byte_recv_total);
     emit_u64("srt_relay_input_transport_byte_recv_unique_total", "counter", "Monotonic input transport unique bytes received across tracked SRT member sockets.", input_transport_byte_recv_unique_total);
@@ -2522,7 +2020,7 @@ void MetricsServer::Start() {
 
         CompactResponse response {};
         {
-            std::lock_guard<std::mutex> lock(metrics_.link_metrics_mutex);
+            MetricsState::LinkMetricsGuard lock(metrics_);
             switch (direction) {
                 case CompactDirection::kInput:
                     response.direction = "input";
@@ -2582,6 +2080,81 @@ void MetricsServer::Stop() {
     }
 }
 
+namespace {
+
+struct IntervalRates {
+    uint64_t rx_bps = 0;
+    uint64_t tx_bps = 0;
+    uint64_t rx_mps = 0;
+    uint64_t tx_mps = 0;
+};
+
+IntervalRates ComputeIntervalRates(const RelayStats& stats, int64_t elapsed_ms) {
+    const double sec = static_cast<double>(elapsed_ms) / 1000.0;
+    return IntervalRates{
+        static_cast<uint64_t>(stats.interval_rx_bytes / sec),
+        static_cast<uint64_t>(stats.interval_tx_bytes / sec),
+        static_cast<uint64_t>(stats.interval_rx_msgs / sec),
+        static_cast<uint64_t>(stats.interval_tx_msgs / sec),
+    };
+}
+
+SRTSOCKET ResolveOutputStatsSocket(SRTSOCKET output_sock, OutputMetricsMode output_metrics_mode) {
+    return output_metrics_mode == OutputMetricsMode::kSrtSocket ? output_sock : SRT_INVALID_SOCK;
+}
+
+void CollectTickMetrics(const Logger& logger,
+                        MetricsState* metrics,
+                        SRTSOCKET input_session_sock,
+                        SRTSOCKET output_stats_sock,
+                        const std::string& active_incident_id) {
+    MaybeUpdateRttMetric(input_session_sock, &metrics->input_rtt_ms);
+    if (output_stats_sock != SRT_INVALID_SOCK) {
+        MaybeUpdateRttMetric(output_stats_sock, &metrics->output_rtt_ms);
+    } else {
+        metrics->output_rtt_ms.store(0, std::memory_order_relaxed);
+    }
+
+    UpdateInputBondModeMetric(input_session_sock, metrics);
+    UpdateOutputBondModeMetric(output_stats_sock, metrics);
+    UpdateInputLinkHealthMetrics(input_session_sock, metrics);
+    UpdateOutputLinkHealthMetrics(output_stats_sock, metrics);
+    UpdateTransportTrafficMetrics(input_session_sock, output_stats_sock, metrics);
+    EmitMemberTransitionEvents(logger, metrics, active_incident_id);
+
+    int64_t max_input_link_rtt_ms = -1;
+    if (TryComputeMaxConnectedInputLinkRtt(*metrics, &max_input_link_rtt_ms)) {
+        metrics->input_rtt_ms.store(max_input_link_rtt_ms, std::memory_order_relaxed);
+    }
+    int64_t max_output_link_rtt_ms = -1;
+    if (TryComputeMaxConnectedOutputLinkRtt(*metrics, &max_output_link_rtt_ms)) {
+        metrics->output_rtt_ms.store(max_output_link_rtt_ms, std::memory_order_relaxed);
+    }
+}
+
+void RefreshEffectiveLatencyMetrics(MetricsState* metrics, SRTSOCKET input_session_sock, SRTSOCKET output_stats_sock) {
+    const RuntimeLatencySnapshot input_latency_snapshot = ReadRuntimeLatencySnapshot(input_session_sock);
+    const RuntimeLatencySnapshot output_latency_snapshot = ReadRuntimeLatencySnapshot(output_stats_sock);
+    metrics->input_effective_latency_ms.store(EffectiveLatencyMsOrMinusOne(input_latency_snapshot), std::memory_order_relaxed);
+    metrics->output_effective_latency_ms.store(EffectiveLatencyMsOrMinusOne(output_latency_snapshot), std::memory_order_relaxed);
+}
+
+const char* BondModeName(int bond_mode) {
+    if (bond_mode == 1) return "broadcast";
+    if (bond_mode == 2) return "backup";
+    return "unknown";
+}
+
+void PublishIntervalMetrics(const IntervalRates& rates, RelayStats* stats, MetricsState* metrics) {
+    metrics->rx_bytes_per_sec.store(rates.rx_bps, std::memory_order_relaxed);
+    metrics->tx_bytes_per_sec.store(rates.tx_bps, std::memory_order_relaxed);
+    metrics->rx_msgs_per_sec.store(rates.rx_mps, std::memory_order_relaxed);
+    metrics->tx_msgs_per_sec.store(rates.tx_mps, std::memory_order_relaxed);
+    metrics->interval_send_failures.store(stats->interval_send_failures, std::memory_order_relaxed);
+}
+
+}  // namespace
+
 void MaybeLogStats(const Config& cfg,
                    const Logger& logger,
                    RelayStats* stats,
@@ -2597,33 +2170,14 @@ void MaybeLogStats(const Config& cfg,
     if (elapsed_ms < cfg.stats_interval_ms) {
         return;
     }
-    const double sec = static_cast<double>(elapsed_ms) / 1000.0;
-    const auto rx_bps = static_cast<uint64_t>(stats->interval_rx_bytes / sec);
-    const auto tx_bps = static_cast<uint64_t>(stats->interval_tx_bytes / sec);
-    const auto rx_mps = static_cast<uint64_t>(stats->interval_rx_msgs / sec);
-    const auto tx_mps = static_cast<uint64_t>(stats->interval_tx_msgs / sec);
-    MaybeUpdateRttMetric(input_session_sock, &metrics->input_rtt_ms);
-    if (output_metrics_mode == OutputMetricsMode::kSrtSocket) {
-        MaybeUpdateRttMetric(output_sock, &metrics->output_rtt_ms);
-    } else {
-        metrics->output_rtt_ms.store(0, std::memory_order_relaxed);
-    }
-    UpdateInputBondModeMetric(input_session_sock, metrics);
-    UpdateOutputBondModeMetric(output_metrics_mode == OutputMetricsMode::kSrtSocket ? output_sock : SRT_INVALID_SOCK, metrics);
-    UpdateInputLinkHealthMetrics(input_session_sock, metrics);
-    UpdateOutputLinkHealthMetrics(output_metrics_mode == OutputMetricsMode::kSrtSocket ? output_sock : SRT_INVALID_SOCK, metrics);
-    UpdateTransportTrafficMetrics(input_session_sock,
-                                  output_metrics_mode == OutputMetricsMode::kSrtSocket ? output_sock : SRT_INVALID_SOCK,
-                                  metrics);
-    EmitMemberTransitionEvents(logger, metrics, active_incident_id);
-    int64_t max_input_link_rtt_ms = -1;
-    if (TryComputeMaxConnectedInputLinkRtt(*metrics, &max_input_link_rtt_ms)) {
-        metrics->input_rtt_ms.store(max_input_link_rtt_ms, std::memory_order_relaxed);
-    }
-    int64_t max_output_link_rtt_ms = -1;
-    if (TryComputeMaxConnectedOutputLinkRtt(*metrics, &max_output_link_rtt_ms)) {
-        metrics->output_rtt_ms.store(max_output_link_rtt_ms, std::memory_order_relaxed);
-    }
+
+    const IntervalRates rates = ComputeIntervalRates(*stats, elapsed_ms);
+    const SRTSOCKET output_stats_sock = ResolveOutputStatsSocket(output_sock, output_metrics_mode);
+
+    CollectTickMetrics(logger, metrics, input_session_sock, output_stats_sock, active_incident_id);
+    RefreshEffectiveLatencyMetrics(metrics, input_session_sock, output_stats_sock);
+    PublishIntervalMetrics(rates, stats, metrics);
+
     const auto input_rtt_ms = metrics->input_rtt_ms.load(std::memory_order_relaxed);
     const auto output_rtt_ms = metrics->output_rtt_ms.load(std::memory_order_relaxed);
     const auto input_links_total = metrics->input_links_total.load(std::memory_order_relaxed);
@@ -2637,42 +2191,19 @@ void MaybeLogStats(const Config& cfg,
     const auto input_group_byte_drop_total = metrics->input_group_byte_drop_total.load(std::memory_order_relaxed);
     const auto input_transport_packet_belated_total = metrics->input_transport_packet_belated_total.load(std::memory_order_relaxed);
     const auto output_transport_byte_sent_total = metrics->output_transport_byte_sent_total.load(std::memory_order_relaxed);
-    const auto input_bond_mode = metrics->input_bond_mode.load(std::memory_order_relaxed);
-    const auto output_bond_mode = metrics->output_bond_mode.load(std::memory_order_relaxed);
-    const char* input_bond_mode_name = "unknown";
-    if (input_bond_mode == 1) {
-        input_bond_mode_name = "broadcast";
-    } else if (input_bond_mode == 2) {
-        input_bond_mode_name = "backup";
-    }
-    const char* output_bond_mode_name = "unknown";
-    if (output_bond_mode == 1) {
-        output_bond_mode_name = "broadcast";
-    } else if (output_bond_mode == 2) {
-        output_bond_mode_name = "backup";
-    }
+    const char* input_bond_mode_name = BondModeName(metrics->input_bond_mode.load(std::memory_order_relaxed));
+    const char* output_bond_mode_name = BondModeName(metrics->output_bond_mode.load(std::memory_order_relaxed));
     const auto input_link_status = BuildInputLinkStatusCompact(*metrics);
     const auto output_link_status = BuildOutputLinkStatusCompact(*metrics);
-    const RuntimeLatencySnapshot input_latency_snapshot = ReadRuntimeLatencySnapshot(input_session_sock);
-    const RuntimeLatencySnapshot output_latency_snapshot =
-        ReadRuntimeLatencySnapshot(output_metrics_mode == OutputMetricsMode::kSrtSocket ? output_sock : SRT_INVALID_SOCK);
-    const int input_effective_latency_ms = EffectiveLatencyMsOrMinusOne(input_latency_snapshot);
-    const int output_effective_latency_ms = EffectiveLatencyMsOrMinusOne(output_latency_snapshot);
-    metrics->input_effective_latency_ms.store(input_effective_latency_ms, std::memory_order_relaxed);
-    metrics->output_effective_latency_ms.store(output_effective_latency_ms, std::memory_order_relaxed);
-
-    metrics->rx_bytes_per_sec.store(rx_bps, std::memory_order_relaxed);
-    metrics->tx_bytes_per_sec.store(tx_bps, std::memory_order_relaxed);
-    metrics->rx_msgs_per_sec.store(rx_mps, std::memory_order_relaxed);
-    metrics->tx_msgs_per_sec.store(tx_mps, std::memory_order_relaxed);
-    metrics->interval_send_failures.store(stats->interval_send_failures, std::memory_order_relaxed);
+    const auto input_effective_latency_ms = metrics->input_effective_latency_ms.load(std::memory_order_relaxed);
+    const auto output_effective_latency_ms = metrics->output_effective_latency_ms.load(std::memory_order_relaxed);
 
     logger.Log(LogLevel::kInfo,
                "stats",
-               "rx_bytes_per_sec=" + std::to_string(rx_bps),
-               "tx_bytes_per_sec=" + std::to_string(tx_bps),
-               "rx_msgs_per_sec=" + std::to_string(rx_mps),
-               "tx_msgs_per_sec=" + std::to_string(tx_mps),
+               "rx_bytes_per_sec=" + std::to_string(rates.rx_bps),
+               "tx_bytes_per_sec=" + std::to_string(rates.tx_bps),
+               "rx_msgs_per_sec=" + std::to_string(rates.rx_mps),
+               "tx_msgs_per_sec=" + std::to_string(rates.tx_mps),
                "send_failures=" + std::to_string(stats->interval_send_failures),
                "reconnect_count=" + std::to_string(stats->reconnect_count),
                "input_rtt_ms=" + std::to_string(input_rtt_ms),
