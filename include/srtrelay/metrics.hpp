@@ -240,6 +240,11 @@ struct MetricsState {
     std::unordered_map<SRTSOCKET, TransportCounterSnapshot> output_transport_last_by_socket;
     std::unordered_map<SRTSOCKET, GroupDropCounterSnapshot> input_group_drop_last_by_socket;
 
+    struct AutoCompactRuntimeState {
+        int64_t disconnect_deadline_unix_ms = 0;
+    };
+    std::array<AutoCompactRuntimeState, 2> auto_compact_state {};
+
     std::array<std::array<std::atomic<uint64_t>, kTimeoutTypes>, kFailureSides> timeouts_total {};
     std::array<std::array<std::atomic<uint64_t>, kReasonCodes>, kFailureSides> disconnects_total {};
     std::array<std::atomic<uint64_t>, kFailureSides> reconnect_attempts_total {};
@@ -327,6 +332,10 @@ void MaybeLogStats(const Config& cfg,
                    SRTSOCKET output_sock,
                    OutputMetricsMode output_metrics_mode,
                    std::chrono::steady_clock::time_point* last_stats_at);
+void MaybeAutoCompactLinkSlots(const Config& cfg,
+                               const Logger& logger,
+                               MetricsState* metrics,
+                               int64_t now_unix_ms);
 void MaybeEmitMemberConnectionEvents(const Logger& logger,
                                      MetricsState* metrics,
                                      SRTSOCKET input_session_sock,

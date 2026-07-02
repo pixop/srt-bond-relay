@@ -13,6 +13,12 @@ enum class SwitchMode {
     kDelayed,
 };
 
+enum class AutoCompactSides {
+    kBoth,
+    kInput,
+    kOutput,
+};
+
 struct Config {
     std::vector<std::string> input_uris;
     std::vector<std::string> output_uris;
@@ -29,6 +35,8 @@ struct Config {
     int metrics_port = 9464;
     std::optional<size_t> primary_input_index;
     SwitchMode switch_mode = SwitchMode::kSerial;
+    int links_compact_disconnect_delay_ms = -1;
+    AutoCompactSides links_compact_sides = AutoCompactSides::kBoth;
 };
 
 void PrintUsage();
@@ -37,6 +45,8 @@ void PrintVersion();
 bool ParseBool(const std::string& value);
 SwitchMode ParseSwitchMode(const std::string& value);
 const char* SwitchModeName(SwitchMode mode);
+AutoCompactSides ParseAutoCompactSides(const std::string& value);
+const char* AutoCompactSidesName(AutoCompactSides sides);
 Config ParseArgs(int argc, char** argv);
 
 }  // namespace srtrelay

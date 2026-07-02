@@ -1164,22 +1164,6 @@ CompactResult CompactOutputSlotsLocked(MetricsState* metrics) {
 
 }  // namespace
 
-std::string BuildInputLinkStatusCompact(const MetricsState& metrics) {
-    return BuildLinkStatusCompact(LinkSide::kInput, metrics);
-}
-
-std::string BuildOutputLinkStatusCompact(const MetricsState& metrics) {
-    return BuildLinkStatusCompact(LinkSide::kOutput, metrics);
-}
-
-void MarkAllTrackedInputLinksDisconnected(MetricsState* metrics) {
-    MarkAllTrackedLinksDisconnected(LinkSide::kInput, metrics);
-}
-
-void MarkAllTrackedOutputLinksDisconnected(MetricsState* metrics) {
-    MarkAllTrackedLinksDisconnected(LinkSide::kOutput, metrics);
-}
-
 void ResetInputTrackingMetrics(MetricsState* metrics) {
     if (metrics == nullptr) return;
     metrics->input_links_total.store(0, std::memory_order_relaxed);
@@ -2412,6 +2396,7 @@ void MaybeLogStats(const Config& cfg,
 
     CollectTickMetrics(metrics, input_session_sock, output_stats_sock);
     RefreshEffectiveLatencyMetrics(metrics, input_session_sock, output_stats_sock);
+    MaybeAutoCompactLinkSlots(cfg, logger, metrics, UnixNowMs());
     PublishIntervalMetrics(rates, stats, metrics);
 
     const auto input_rtt_ms = metrics->input_rtt_ms.load(std::memory_order_relaxed);

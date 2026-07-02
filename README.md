@@ -179,6 +179,8 @@ Common optional flags:
 - `--metrics-port`
 - `--primary-input-index` (optional, 1-based)
 - `--switch-mode` (`serial` or `delayed`; default `serial`)
+- `--links-compact-disconnect-delay-ms` (default disabled; set `0` for immediate compact on disconnect detection)
+- `--links-compact-sides` (`input`, `output`, or `both`; default `both`)
 - `--verify-linkage`
 - `--version` (prints relay version and exits)
 

@@ -233,6 +233,37 @@ void TestParseOutputEndpointSpecsListenerFanoutOptions() {
     assert(specs[0].listener_max_clients == 5);
 }
 
+void TestParseArgsAutoCompactionOptions() {
+    const srtrelay::Config cfg = ParseConfig({
+        "srt-bond-relay",
+        "--input", "stdin",
+        "--output", "stdout",
+        "--links-compact-disconnect-delay-ms", "1500",
+        "--links-compact-sides", "output",
+    });
+    assert(cfg.links_compact_disconnect_delay_ms == 1500);
+    assert(cfg.links_compact_sides == srtrelay::AutoCompactSides::kOutput);
+}
+
+void TestParseArgsRejectsInvalidAutoCompactionOptions() {
+    ExpectThrows([]() {
+        (void)ParseConfig({
+            "srt-bond-relay",
+            "--input", "stdin",
+            "--output", "stdout",
+            "--links-compact-disconnect-delay-ms", "-2",
+        });
+    });
+    ExpectThrows([]() {
+        (void)ParseConfig({
+            "srt-bond-relay",
+            "--input", "stdin",
+            "--output", "stdout",
+            "--links-compact-sides", "foo",
+        });
+    });
+}
+
 }  // namespace
 
 int main() {
@@ -245,6 +276,8 @@ int main() {
     TestParseArgsRejectsMultipleStdoutOutputs();
     TestParseOutputEndpointSpecsPreservesBondedSingleFlag();
     TestParseOutputEndpointSpecsListenerFanoutOptions();
+    TestParseArgsAutoCompactionOptions();
+    TestParseArgsRejectsInvalidAutoCompactionOptions();
     std::cout << "metrics_compat_test passed\n";
     return 0;
 }

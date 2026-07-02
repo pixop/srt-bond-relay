@@ -83,6 +83,7 @@ endif()
 set(SRT_BOND_RELAY_CORE_SOURCES
     src/causality.cpp
     src/config.cpp
+    src/link_slot_tracker.cpp
     src/linkage.cpp
     src/logger.cpp
     src/metrics.cpp

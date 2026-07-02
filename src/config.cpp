@@ -47,6 +47,8 @@ void PrintUsage() {
         << "  --metrics-port 9464\n"
         << "  --primary-input-index <1..N>\n"
         << "  --switch-mode serial|delayed\n"
+        << "  --links-compact-disconnect-delay-ms <ms>\n"
+        << "  --links-compact-sides input|output|both\n"
         << "  --version\n"
         << "\nI/O mode notes:\n"
         << "  Input:  srt:// mode=listener|caller, udp:// mode=listener (caller unsupported), stdin aliases: stdin|-|fd://stdin\n"
@@ -94,6 +96,32 @@ const char* SwitchModeName(SwitchMode mode) {
             return "serial";
         case SwitchMode::kDelayed:
             return "delayed";
+    }
+    return "unknown";
+}
+
+AutoCompactSides ParseAutoCompactSides(const std::string& value) {
+    if (value == "both") {
+        return AutoCompactSides::kBoth;
+    }
+    if (value == "input") {
+        return AutoCompactSides::kInput;
+    }
+    if (value == "output") {
+        return AutoCompactSides::kOutput;
+    }
+    throw std::runtime_error(
+        "invalid --links-compact-sides value: " + value + " (expected input, output, or both)");
+}
+
+const char* AutoCompactSidesName(AutoCompactSides sides) {
+    switch (sides) {
+        case AutoCompactSides::kBoth:
+            return "both";
+        case AutoCompactSides::kInput:
+            return "input";
+        case AutoCompactSides::kOutput:
+            return "output";
     }
     return "unknown";
 }
@@ -149,6 +177,10 @@ Config ParseArgs(int argc, char** argv) {
             cfg.primary_input_index = static_cast<size_t>(index - 1);
         } else if (arg == "--switch-mode") {
             cfg.switch_mode = ParseSwitchMode(require_value("--switch-mode"));
+        } else if (arg == "--links-compact-disconnect-delay-ms") {
+            cfg.links_compact_disconnect_delay_ms = std::stoi(require_value("--links-compact-disconnect-delay-ms"));
+        } else if (arg == "--links-compact-sides") {
+            cfg.links_compact_sides = ParseAutoCompactSides(require_value("--links-compact-sides"));
         } else {
             throw std::runtime_error("unknown argument: " + arg);
         }
@@ -196,6 +228,9 @@ Config ParseArgs(int argc, char** argv) {
     }
     if (cfg.metrics_host.empty()) {
         throw std::runtime_error("--metrics-host must not be empty");
+    }
+    if (cfg.links_compact_disconnect_delay_ms < -1) {
+        throw std::runtime_error("--links-compact-disconnect-delay-ms must be >= 0 when set");
     }
     return cfg;
 }

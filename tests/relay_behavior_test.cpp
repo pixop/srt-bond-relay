@@ -380,6 +380,74 @@ void TestMarkAllTrackedDisconnectedPreservesIdentityAndCounters() {
     assert(metrics.output_tracked.slots[1].link_tx_bytes_total == 222);
 }
 
+void TestAutoCompactionDelayTrigger() {
+    srtrelay::Config cfg;
+    cfg.links_compact_disconnect_delay_ms = 1000;
+    srtrelay::Logger logger;
+    logger.min_level = srtrelay::LogLevel::kError;
+
+    srtrelay::MetricsState metrics;
+    metrics.input_links_snapshot_count.store(2, std::memory_order_relaxed);
+    metrics.output_links_snapshot_count.store(2, std::memory_order_relaxed);
+
+    metrics.input_tracked.slots[0].member_identity_key = 10;
+    metrics.input_tracked.slots[0].member_id = static_cast<int64_t>(SRT_INVALID_SOCK);
+    metrics.input_tracked.slots[0].member_connected = 0;
+    metrics.input_tracked.slots[1].member_identity_key = 20;
+    metrics.input_tracked.slots[1].member_id = 9001;
+    metrics.input_tracked.slots[1].member_connected = 1;
+
+    metrics.output_tracked.slots[0].member_identity_key = 30;
+    metrics.output_tracked.slots[0].member_id = static_cast<int64_t>(SRT_INVALID_SOCK);
+    metrics.output_tracked.slots[0].member_connected = 0;
+    metrics.output_tracked.slots[1].member_identity_key = 40;
+    metrics.output_tracked.slots[1].member_id = 9002;
+    metrics.output_tracked.slots[1].member_connected = 1;
+
+    srtrelay::MaybeAutoCompactLinkSlots(cfg, logger, &metrics, 10'000);
+    assert(metrics.input_links_snapshot_count.load(std::memory_order_relaxed) == 2);
+    assert(metrics.output_links_snapshot_count.load(std::memory_order_relaxed) == 2);
+
+    srtrelay::MaybeAutoCompactLinkSlots(cfg, logger, &metrics, 10'999);
+    assert(metrics.input_links_snapshot_count.load(std::memory_order_relaxed) == 2);
+    assert(metrics.output_links_snapshot_count.load(std::memory_order_relaxed) == 2);
+
+    srtrelay::MaybeAutoCompactLinkSlots(cfg, logger, &metrics, 11'000);
+    assert(metrics.input_links_snapshot_count.load(std::memory_order_relaxed) == 1);
+    assert(metrics.output_links_snapshot_count.load(std::memory_order_relaxed) == 1);
+    assert(metrics.input_tracked.slots[0].member_id == 9001);
+    assert(metrics.output_tracked.slots[0].member_id == 9002);
+}
+
+void TestAutoCompactionRespectsConfiguredSides() {
+    srtrelay::Config cfg;
+    cfg.links_compact_disconnect_delay_ms = 0;
+    cfg.links_compact_sides = srtrelay::AutoCompactSides::kInput;
+    srtrelay::Logger logger;
+    logger.min_level = srtrelay::LogLevel::kError;
+    srtrelay::MetricsState metrics;
+
+    metrics.input_links_snapshot_count.store(2, std::memory_order_relaxed);
+    metrics.input_tracked.slots[0].member_identity_key = 71;
+    metrics.input_tracked.slots[0].member_id = static_cast<int64_t>(SRT_INVALID_SOCK);
+    metrics.input_tracked.slots[0].member_connected = 0;
+    metrics.input_tracked.slots[1].member_identity_key = 72;
+    metrics.input_tracked.slots[1].member_id = 9300;
+    metrics.input_tracked.slots[1].member_connected = 1;
+
+    metrics.output_links_snapshot_count.store(2, std::memory_order_relaxed);
+    metrics.output_tracked.slots[0].member_identity_key = 81;
+    metrics.output_tracked.slots[0].member_id = static_cast<int64_t>(SRT_INVALID_SOCK);
+    metrics.output_tracked.slots[0].member_connected = 0;
+    metrics.output_tracked.slots[1].member_identity_key = 82;
+    metrics.output_tracked.slots[1].member_id = 9400;
+    metrics.output_tracked.slots[1].member_connected = 1;
+
+    srtrelay::MaybeAutoCompactLinkSlots(cfg, logger, &metrics, 300'000);
+    assert(metrics.input_links_snapshot_count.load(std::memory_order_relaxed) == 1);
+    assert(metrics.output_links_snapshot_count.load(std::memory_order_relaxed) == 2);
+}
+
 }  // namespace
 
 int main() {
@@ -400,6 +468,8 @@ int main() {
     TestSaveMemberSnapshotAtCapacity();
     TestClearTrackedMembersResetsCountersAndSnapshotCount();
     TestMarkAllTrackedDisconnectedPreservesIdentityAndCounters();
+    TestAutoCompactionDelayTrigger();
+    TestAutoCompactionRespectsConfiguredSides();
     std::cout << "relay_behavior_test passed\n";
     return 0;
 }
