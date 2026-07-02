@@ -6,6 +6,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -17,6 +18,7 @@ namespace srtrelay {
 namespace {
 
 constexpr int kDefaultUdpTtl = 64;
+constexpr int64_t kFanoutAcceptPollTimeoutMs = 10;
 
 std::string FormatSockaddr(const sockaddr* addr, socklen_t addr_len) {
     if (addr == nullptr || addr_len == 0) {
@@ -92,6 +94,21 @@ bool IsUdpTimeoutErrno(int err) {
 
 bool HasMeaningfulSrtError(const std::string& value) {
     return !value.empty() && value != "Success";
+}
+
+bool IsAcceptNoClientYetErrorCode(int code) {
+    return code == SRT_ETIMEOUT || code == SRT_EASYNCRCV;
+}
+
+void ForceCloseSocketNow(SRTSOCKET sock) {
+    if (sock == SRT_INVALID_SOCK) {
+        return;
+    }
+    linger lin {};
+    lin.l_onoff = 1;
+    lin.l_linger = 0;
+    (void)srt_setsockflag(sock, SRTO_LINGER, &lin, sizeof(lin));
+    srt_close(sock);
 }
 
 std::string ComposeSrtEnsureErrorMessage(const std::string& cause) {
@@ -261,8 +278,14 @@ private:
 
 class SrtOutputListenerSink : public OutputSink {
 public:
-    explicit SrtOutputListenerSink(std::vector<SrtUri> uris) : uris_(std::move(uris)) {}
-    ~SrtOutputListenerSink() override { detail::CloseSocketList(&listeners_); }
+    SrtOutputListenerSink(std::vector<SrtUri> uris, bool fanout_enabled, int fanout_max_clients)
+        : uris_(std::move(uris)),
+          fanout_enabled_(fanout_enabled),
+          fanout_max_clients_(std::max(1, fanout_max_clients)) {}
+    ~SrtOutputListenerSink() override {
+        CloseAllSessions();
+        detail::CloseSocketList(&listeners_);
+    }
 
     void EnsureReady(const Config& cfg,
                      const Logger& logger,
@@ -272,6 +295,8 @@ public:
         ensure_error_kind_ = IoErrorKind::kNone;
         ensure_error_message_.clear();
         metrics_ = metrics;
+        logger_ = &logger;
+        output_index_ = attempt_ctx.source_index.value_or(1);
         try {
             if (listeners_.empty()) {
                 listeners_.reserve(uris_.size());
@@ -279,22 +304,10 @@ public:
                     listeners_.push_back(detail::CreateListeningSocket(uri, cfg, logger, "output"));
                 }
             }
-            if (!session_.Valid()) {
-                const SRTSOCKET accepted = detail::AcceptBondSession(listeners_, cfg, "output");
-                ApplyIntSockOpt(accepted, SRTO_SNDTIMEO, cfg.io_timeout_ms, "SRTO_SNDTIMEO");
-                session_.Set(accepted);
-                std::string local_endpoint;
-                std::string remote_endpoint;
-                ReadSrtEndpoints(accepted, &local_endpoint, &remote_endpoint);
-                logger.Log(LogLevel::kInfo, "output-client-connected",
-                           "socket=" + std::to_string(accepted),
-                           "output_index=" + std::to_string(attempt_ctx.source_index.value_or(1)),
-                           "local_endpoint=" + local_endpoint,
-                           "remote_endpoint=" + remote_endpoint,
-                           "attempt_id=" + std::to_string(attempt_ctx.attempt_id),
-                           "incident_id=" + (attempt_ctx.incident_id.empty() ? std::string("none") : attempt_ctx.incident_id));
-            }
-            metrics->output_connected.store(session_.Valid() ? 1 : 0, std::memory_order_relaxed);
+            const int64_t accept_timeout_ms =
+                sessions_.empty() ? static_cast<int64_t>(cfg.io_timeout_ms) : kFanoutAcceptPollTimeoutMs;
+            MaybeAcceptClient(cfg, logger, attempt_ctx, accept_timeout_ms);
+            metrics->output_connected.store(IsConnected() ? 1 : 0, std::memory_order_relaxed);
         } catch (const std::exception& ex) {
             ensure_error_kind_ = IsSrtTimeoutError() ? IoErrorKind::kTimeout : IoErrorKind::kError;
             ensure_error_message_ = ComposeSrtEnsureErrorMessage(ex.what());
@@ -307,11 +320,147 @@ public:
     }
 
     OutputSendResult Send(const char* data, int size) override {
+        if (sessions_.empty()) {
+            send_error_kind_ = IoErrorKind::kDisconnected;
+            send_error_message_ = "no connected output clients";
+            return {OutputSendStatus::kError, 0};
+        }
+        if (!fanout_enabled_) {
+            return SendSingleClient(data, size);
+        }
+
+        bool sent_any = false;
+        bool had_error = false;
+        int sent_bytes = 0;
+        IoErrorKind last_error_kind = IoErrorKind::kDisconnected;
+        std::string last_error_message = "all output clients failed";
+        std::vector<size_t> failed_indices;
+
+        for (size_t i = 0; i < sessions_.size(); ++i) {
+            const SRTSOCKET sock = sessions_[i];
+            SRT_MSGCTRL tx_ctrl = srt_msgctrl_default;
+            const int rc = srt_sendmsg2(sock, data, size, &tx_ctrl);
+            if (rc == SRT_ERROR) {
+                had_error = true;
+                const IoErrorKind error_kind = IsSrtTimeoutError() ? IoErrorKind::kTimeout : IoErrorKind::kDisconnected;
+                const std::string error_message = SrtLastErrorString();
+                last_error_kind = error_kind;
+                last_error_message = error_message;
+                RecordClientDrop(error_kind);
+                if (logger_ != nullptr) {
+                    logger_->Log(LogLevel::kWarn,
+                                 "output-client-disconnected",
+                                 "output_index=" + std::to_string(output_index_),
+                                 "socket=" + std::to_string(sock),
+                                 "reason_detail=" + error_message,
+                                 "active_clients=" + std::to_string(sessions_.size() - 1));
+                }
+                failed_indices.push_back(i);
+                continue;
+            }
+            sent_any = true;
+            if (sent_bytes == 0) {
+                sent_bytes = rc;
+            }
+        }
+
+        for (auto it = failed_indices.rbegin(); it != failed_indices.rend(); ++it) {
+            const size_t index = *it;
+            if (index >= sessions_.size()) {
+                continue;
+            }
+            srt_close(sessions_[index]);
+            sessions_.erase(sessions_.begin() + index);
+        }
+
+        if (sent_any) {
+            send_error_kind_ = IoErrorKind::kNone;
+            send_error_message_.clear();
+            return {OutputSendStatus::kSent, sent_bytes};
+        }
+        if (had_error) {
+            send_error_kind_ = last_error_kind;
+            send_error_message_ = last_error_message;
+            return {OutputSendStatus::kError, 0};
+        }
+        send_error_kind_ = IoErrorKind::kDisconnected;
+        send_error_message_ = "no connected output clients";
+        return {OutputSendStatus::kError, 0};
+    }
+
+    void MarkDisconnected(MetricsState* metrics) override {
+        CloseAllSessions();
+        metrics->output_connected.store(0, std::memory_order_relaxed);
+        ResetOutputTrackingMetrics(metrics);
+    }
+
+    SRTSOCKET TransportSocket() const override {
+        return sessions_.empty() ? SRT_INVALID_SOCK : sessions_.front();
+    }
+    OutputMetricsMode MetricsMode() const override { return OutputMetricsMode::kSrtSocket; }
+    bool IsConnected() const override { return !sessions_.empty(); }
+    bool IsListening() const override { return !listeners_.empty(); }
+    bool NeedsEnsurePoll() const override {
+        if (!fanout_enabled_) {
+            // Keep polling accept in single-client listener mode so extra clients
+            // are accepted and immediately rejected instead of appearing connected
+            // but idle from the caller side.
+            return !listeners_.empty() || !IsConnected();
+        }
+        if (listeners_.empty()) {
+            return true;
+        }
+        if (sessions_.empty()) {
+            return true;
+        }
+        return sessions_.size() < static_cast<size_t>(fanout_max_clients_);
+    }
+    IoErrorKind LastSendErrorKind() const override { return send_error_kind_; }
+    std::string LastSendErrorMessage() const override { return send_error_message_; }
+    IoErrorKind LastEnsureErrorKind() const override { return ensure_error_kind_; }
+    std::string LastEnsureErrorMessage() const override { return ensure_error_message_; }
+    int64_t OutputListenerClientsActive(size_t index) const override {
+        return index == 0 ? static_cast<int64_t>(sessions_.size()) : 0;
+    }
+    uint64_t OutputListenerClientsAcceptedTotal(size_t index) const override {
+        return index == 0 ? listener_clients_accepted_total_ : 0;
+    }
+    uint64_t OutputListenerClientsDroppedTimeoutTotal(size_t index) const override {
+        return index == 0 ? listener_clients_dropped_timeout_total_ : 0;
+    }
+    uint64_t OutputListenerClientsDroppedDisconnectedTotal(size_t index) const override {
+        return index == 0 ? listener_clients_dropped_disconnected_total_ : 0;
+    }
+    uint64_t OutputListenerClientsDroppedErrorTotal(size_t index) const override {
+        return index == 0 ? listener_clients_dropped_error_total_ : 0;
+    }
+    uint64_t OutputListenerAcceptRejectedMaxClientsTotal(size_t index) const override {
+        return index == 0 ? listener_accept_rejected_max_clients_total_ : 0;
+    }
+    std::vector<std::string> OutputListenerConnectedEndpoints(size_t index) const override {
+        std::vector<std::string> endpoints;
+        if (index != 0) {
+            return endpoints;
+        }
+        endpoints.reserve(sessions_.size());
+        for (const SRTSOCKET sock : sessions_) {
+            std::string remote_endpoint;
+            ReadSrtEndpoints(sock, nullptr, &remote_endpoint);
+            if (remote_endpoint.empty() || remote_endpoint == "unknown") {
+                continue;
+            }
+            endpoints.push_back(remote_endpoint);
+        }
+        return endpoints;
+    }
+
+private:
+    OutputSendResult SendSingleClient(const char* data, int size) {
         SRT_MSGCTRL tx_ctrl = srt_msgctrl_default;
         SRT_SOCKGROUPDATA tx_group_data[MetricsState::kMaxTrackedMembers] {};
         tx_ctrl.grpdata = tx_group_data;
         tx_ctrl.grpdata_size = sizeof(tx_group_data) / sizeof(tx_group_data[0]);
-        const int rc = srt_sendmsg2(session_.Get(), data, size, &tx_ctrl);
+        const int rc = srt_sendmsg2(sessions_.front(), data, size, &tx_ctrl);
         if (rc == SRT_ERROR) {
             send_error_kind_ = IsSrtTimeoutError() ? IoErrorKind::kTimeout : IoErrorKind::kDisconnected;
             send_error_message_ = SrtLastErrorString();
@@ -325,25 +474,85 @@ public:
         return {OutputSendStatus::kSent, rc};
     }
 
-    void MarkDisconnected(MetricsState* metrics) override {
-        session_.Reset();
-        metrics->output_connected.store(0, std::memory_order_relaxed);
-        ResetOutputTrackingMetrics(metrics);
+    void MaybeAcceptClient(const Config& cfg,
+                           const Logger& logger,
+                           const EnsureAttemptContext& attempt_ctx,
+                           int64_t timeout_ms) {
+        const SRTSOCKET accepted = srt_accept_bond(listeners_.data(),
+                                                   static_cast<int>(listeners_.size()),
+                                                   timeout_ms);
+        if (accepted == SRT_INVALID_SOCK) {
+            const int srt_error_code = SrtLastErrorCode();
+            if (IsAcceptNoClientYetErrorCode(srt_error_code)) {
+                if (sessions_.empty()) {
+                    throw std::runtime_error("output accept failed: " + SrtLastErrorString());
+                }
+                return;
+            }
+            throw std::runtime_error("output accept failed: " + SrtLastErrorString());
+        }
+
+        if (sessions_.size() >= static_cast<size_t>(fanout_max_clients_)) {
+            ForceCloseSocketNow(accepted);
+            ++listener_accept_rejected_max_clients_total_;
+            logger.Log(LogLevel::kWarn,
+                       "output-client-rejected",
+                       "output_index=" + std::to_string(output_index_),
+                       "reason=max_clients",
+                       "max_clients=" + std::to_string(fanout_max_clients_));
+            return;
+        }
+
+        ApplyIntSockOpt(accepted, SRTO_SNDTIMEO, cfg.io_timeout_ms, "SRTO_SNDTIMEO");
+        sessions_.push_back(accepted);
+        ++listener_clients_accepted_total_;
+        std::string local_endpoint;
+        std::string remote_endpoint;
+        ReadSrtEndpoints(accepted, &local_endpoint, &remote_endpoint);
+        logger.Log(LogLevel::kInfo, "output-client-connected",
+                   "socket=" + std::to_string(accepted),
+                   "output_index=" + std::to_string(attempt_ctx.source_index.value_or(1)),
+                   "fanout=" + std::string(fanout_enabled_ ? "on" : "off"),
+                   "active_clients=" + std::to_string(sessions_.size()),
+                   "max_clients=" + std::to_string(fanout_max_clients_),
+                   "local_endpoint=" + local_endpoint,
+                   "remote_endpoint=" + remote_endpoint,
+                   "attempt_id=" + std::to_string(attempt_ctx.attempt_id),
+                   "incident_id=" + (attempt_ctx.incident_id.empty() ? std::string("none") : attempt_ctx.incident_id));
     }
 
-    SRTSOCKET TransportSocket() const override { return session_.Get(); }
-    OutputMetricsMode MetricsMode() const override { return OutputMetricsMode::kSrtSocket; }
-    bool IsConnected() const override { return session_.Valid(); }
-    bool IsListening() const override { return !listeners_.empty(); }
-    IoErrorKind LastSendErrorKind() const override { return send_error_kind_; }
-    std::string LastSendErrorMessage() const override { return send_error_message_; }
-    IoErrorKind LastEnsureErrorKind() const override { return ensure_error_kind_; }
-    std::string LastEnsureErrorMessage() const override { return ensure_error_message_; }
+    void RecordClientDrop(IoErrorKind kind) {
+        if (kind == IoErrorKind::kTimeout) {
+            ++listener_clients_dropped_timeout_total_;
+        } else if (kind == IoErrorKind::kDisconnected) {
+            ++listener_clients_dropped_disconnected_total_;
+        } else {
+            ++listener_clients_dropped_error_total_;
+        }
+    }
 
-private:
+    void CloseAllSessions() {
+        for (SRTSOCKET& sock : sessions_) {
+            if (sock != SRT_INVALID_SOCK) {
+                srt_close(sock);
+                sock = SRT_INVALID_SOCK;
+            }
+        }
+        sessions_.clear();
+    }
+
     std::vector<SrtUri> uris_;
     std::vector<SRTSOCKET> listeners_;
-    SrtSocketHolder session_;
+    std::vector<SRTSOCKET> sessions_;
+    bool fanout_enabled_ = false;
+    int fanout_max_clients_ = 1;
+    size_t output_index_ = 1;
+    const Logger* logger_ = nullptr;
+    uint64_t listener_clients_accepted_total_ = 0;
+    uint64_t listener_clients_dropped_timeout_total_ = 0;
+    uint64_t listener_clients_dropped_disconnected_total_ = 0;
+    uint64_t listener_clients_dropped_error_total_ = 0;
+    uint64_t listener_accept_rejected_max_clients_total_ = 0;
     IoErrorKind send_error_kind_ = IoErrorKind::kNone;
     std::string send_error_message_;
     IoErrorKind ensure_error_kind_ = IoErrorKind::kNone;
@@ -682,6 +891,27 @@ public:
     bool OutputListening(size_t index) const override {
         return index < sinks_.size() ? sinks_[index]->IsListening() : false;
     }
+    int64_t OutputListenerClientsActive(size_t index) const override {
+        return index < sinks_.size() ? sinks_[index]->OutputListenerClientsActive(0) : 0;
+    }
+    uint64_t OutputListenerClientsAcceptedTotal(size_t index) const override {
+        return index < sinks_.size() ? sinks_[index]->OutputListenerClientsAcceptedTotal(0) : 0;
+    }
+    uint64_t OutputListenerClientsDroppedTimeoutTotal(size_t index) const override {
+        return index < sinks_.size() ? sinks_[index]->OutputListenerClientsDroppedTimeoutTotal(0) : 0;
+    }
+    uint64_t OutputListenerClientsDroppedDisconnectedTotal(size_t index) const override {
+        return index < sinks_.size() ? sinks_[index]->OutputListenerClientsDroppedDisconnectedTotal(0) : 0;
+    }
+    uint64_t OutputListenerClientsDroppedErrorTotal(size_t index) const override {
+        return index < sinks_.size() ? sinks_[index]->OutputListenerClientsDroppedErrorTotal(0) : 0;
+    }
+    uint64_t OutputListenerAcceptRejectedMaxClientsTotal(size_t index) const override {
+        return index < sinks_.size() ? sinks_[index]->OutputListenerAcceptRejectedMaxClientsTotal(0) : 0;
+    }
+    std::vector<std::string> OutputListenerConnectedEndpoints(size_t index) const override {
+        return index < sinks_.size() ? sinks_[index]->OutputListenerConnectedEndpoints(0) : std::vector<std::string>{};
+    }
 
 private:
     void RefreshAggregateConnected(MetricsState* metrics) const {
@@ -715,7 +945,8 @@ std::unique_ptr<OutputSink> BuildOutputSink(const OutputEndpointSpec& spec) {
         return std::make_unique<UdpOutputSink>(spec.udp_uri, true);
     }
     if (spec.kind == OutputEndpointKind::kSrtListener) {
-        return std::make_unique<SrtOutputListenerSink>(spec.uris);
+        return std::make_unique<SrtOutputListenerSink>(
+            spec.uris, spec.listener_fanout_enabled, spec.listener_max_clients);
     }
     return std::make_unique<SrtOutputCallerSink>(spec.uris, spec.bonded, spec.group_type);
 }

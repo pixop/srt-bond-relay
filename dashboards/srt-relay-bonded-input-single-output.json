@@ -1088,12 +1088,12 @@
       },
       "targets": [
         {
-          "expr": "rate(srt_relay_input_link_rx_bytes_total{instance=~\"$relay_instance\"}[1m]) * 8",
+          "expr": "avg_over_time((rate(srt_relay_input_link_rx_bytes_total{instance=~\"$relay_instance\"}[30s]) * 8)[1m:])",
           "legendFormat": "Input {{link_index}} RX bps",
           "refId": "A"
         },
         {
-          "expr": "rate(srt_relay_output_link_tx_bytes_total{instance=~\"$relay_instance\"}[1m]) * 8",
+          "expr": "avg_over_time((rate(srt_relay_output_link_tx_bytes_total{instance=~\"$relay_instance\"}[30s]) * 8)[1m:])",
           "legendFormat": "Output {{link_index}} TX bps",
           "refId": "B"
         }

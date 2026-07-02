@@ -70,6 +70,42 @@ void TestParseOutputEndpointSpecsRejectsGroupedUdp() {
     });
 }
 
+void TestParseOutputEndpointSpecsListenerFanoutDefaults() {
+    srtrelay::Config cfg;
+    cfg.output_uris = {"srt://0.0.0.0:5000?mode=listener"};
+    const auto specs = srtrelay::ParseOutputEndpointSpecs(cfg);
+    assert(specs.size() == 1);
+    assert(specs[0].kind == srtrelay::OutputEndpointKind::kSrtListener);
+    assert(specs[0].listener_fanout_enabled == false);
+    assert(specs[0].listener_max_clients == 1);
+}
+
+void TestParseOutputEndpointSpecsListenerFanoutEnabled() {
+    srtrelay::Config cfg;
+    cfg.output_uris = {"srt://0.0.0.0:5000?mode=listener&fanout=on&max_clients=4"};
+    const auto specs = srtrelay::ParseOutputEndpointSpecs(cfg);
+    assert(specs.size() == 1);
+    assert(specs[0].kind == srtrelay::OutputEndpointKind::kSrtListener);
+    assert(specs[0].listener_fanout_enabled == true);
+    assert(specs[0].listener_max_clients == 4);
+}
+
+void TestParseOutputEndpointSpecsRejectsListenerMaxClientsWithoutFanout() {
+    srtrelay::Config cfg;
+    cfg.output_uris = {"srt://0.0.0.0:5000?mode=listener&max_clients=2"};
+    ExpectThrows([&cfg]() {
+        (void)srtrelay::ParseOutputEndpointSpecs(cfg);
+    });
+}
+
+void TestParseOutputEndpointSpecsRejectsFanoutInCallerMode() {
+    srtrelay::Config cfg;
+    cfg.output_uris = {"srt://127.0.0.1:5000?mode=caller&fanout=on"};
+    ExpectThrows([&cfg]() {
+        (void)srtrelay::ParseOutputEndpointSpecs(cfg);
+    });
+}
+
 void TestInputSlotReuseByEndpointIdentity() {
     srtrelay::MetricsState metrics;
 
@@ -350,6 +386,10 @@ int main() {
     TestBuildOutputSinkFanoutShape();
     TestBuildOutputSinkSinglePathCompatibility();
     TestParseOutputEndpointSpecsRejectsGroupedUdp();
+    TestParseOutputEndpointSpecsListenerFanoutDefaults();
+    TestParseOutputEndpointSpecsListenerFanoutEnabled();
+    TestParseOutputEndpointSpecsRejectsListenerMaxClientsWithoutFanout();
+    TestParseOutputEndpointSpecsRejectsFanoutInCallerMode();
     TestInputSlotReuseByEndpointIdentity();
     TestOutputCompactionBehavior();
     TestLinkStatusCompactFormatting();

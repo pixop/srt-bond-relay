@@ -185,6 +185,9 @@ void ApplyCommonSrtOptions(SRTSOCKET sock, const SrtUri& uri, const Logger& logg
     }
     for (const auto& [key, value] : uri.query) {
         if (key == "mode" ||
+            key == "fanout" ||
+            key == "max_clients" ||
+            key == "fanout_max_clients" ||
             key == "passphrase" ||
             key == "pbkeylen" ||
             key == "latency" ||

@@ -49,6 +49,14 @@ Prioritize, in this order:
 - Keep metric labels and cardinality bounded and stable.
 - Ensure important state transitions are observable via logs and/or metrics.
 
+## Compatibility Surface Guardrails
+
+- For any change that expands, reshapes, or reinterprets runtime behavior/state, audit public and internal interfaces for hidden single-case assumptions (for example singular getters, scalar fields, fixed cardinality metrics, or logs that imply one active entity).
+- Explicitly classify each affected interface as one of: unchanged semantics, additive extension, compatibility shim, or deliberate breaking change.
+- Call out compatibility shims and semantic drift risks in the plan before implementation, including operator-visible caveats.
+- Do not silently repurpose existing metrics/logs/CLI outputs to mean something broader or different than before; prefer additive fields/series and preserve legacy semantics by default.
+- Add regression tests that lock legacy/default behavior and dedicated tests for the new semantic shape, including partial-failure paths where applicable.
+
 ## Testability Requirements
 
 - Every behavior change should include or update tests in `tests/`.

@@ -51,6 +51,7 @@ void PrintUsage() {
         << "\nI/O mode notes:\n"
         << "  Input:  srt:// mode=listener|caller, udp:// mode=listener (caller unsupported), stdin aliases: stdin|-|fd://stdin\n"
         << "  Output: srt:// mode=caller|listener, udp:// mode=caller (listener unsupported), stdout aliases: stdout|-|fd://stdout\n"
+        << "          output listener fanout: fanout=on&max_clients=<N> (optional, default single-client)\n"
         << "  Group list for bonded SRT: separate endpoints with ';' or ','\n"
         << "  Group lists and bond options are only supported for SRT URIs\n"
         << "  Repeat --input to configure independent switched input sources\n"

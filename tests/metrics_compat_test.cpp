@@ -36,6 +36,12 @@ void TestPrometheusCompatibility() {
     metrics.output_sources_total.store(2, std::memory_order_relaxed);
     metrics.output_source_connected[0].store(1, std::memory_order_relaxed);
     metrics.output_source_connected[1].store(0, std::memory_order_relaxed);
+    metrics.output_listener_clients_active[0].store(3, std::memory_order_relaxed);
+    metrics.output_listener_clients_accepted_total[0].store(9, std::memory_order_relaxed);
+    metrics.output_listener_clients_dropped_timeout_total[0].store(2, std::memory_order_relaxed);
+    metrics.output_listener_clients_dropped_disconnected_total[0].store(1, std::memory_order_relaxed);
+    metrics.output_listener_clients_dropped_error_total[0].store(0, std::memory_order_relaxed);
+    metrics.output_listener_accept_rejected_max_clients_total[0].store(4, std::memory_order_relaxed);
 
     metrics.input_tracked.slots[0].member_identity_key = 1234;
     metrics.input_tracked.slots[0].member_id = 5001;
@@ -51,6 +57,11 @@ void TestPrometheusCompatibility() {
     ExpectContains(rendered, "srt_relay_output_sources_total 2");
     ExpectContains(rendered, "srt_relay_output_source_connected{output_index=\"1\"} 1");
     ExpectContains(rendered, "srt_relay_output_source_connected{output_index=\"2\"} 0");
+    ExpectContains(rendered, "srt_relay_output_listener_clients_active{output_index=\"1\"} 3");
+    ExpectContains(rendered, "srt_relay_output_listener_clients_accepted_total{output_index=\"1\"} 9");
+    ExpectContains(rendered, "srt_relay_output_listener_clients_dropped_total{output_index=\"1\",reason=\"timeout\"} 2");
+    ExpectContains(rendered, "srt_relay_output_listener_clients_dropped_total{output_index=\"1\",reason=\"disconnected\"} 1");
+    ExpectContains(rendered, "srt_relay_output_listener_accept_rejected_total{output_index=\"1\",reason=\"max_clients\"} 4");
     ExpectContains(rendered, "srt_relay_input_link_rx_bytes_total{link_index=\"1\",socket_id=\"5001\"} 999");
 }
 
@@ -210,6 +221,18 @@ void TestParseOutputEndpointSpecsPreservesBondedSingleFlag() {
     assert(specs[1].kind == srtrelay::OutputEndpointKind::kUdpCaller);
 }
 
+void TestParseOutputEndpointSpecsListenerFanoutOptions() {
+    srtrelay::Config cfg;
+    cfg.output_uris = {
+        "srt://0.0.0.0:5000?mode=listener&fanout=on&max_clients=5",
+    };
+    const auto specs = srtrelay::ParseOutputEndpointSpecs(cfg);
+    assert(specs.size() == 1);
+    assert(specs[0].kind == srtrelay::OutputEndpointKind::kSrtListener);
+    assert(specs[0].listener_fanout_enabled);
+    assert(specs[0].listener_max_clients == 5);
+}
+
 }  // namespace
 
 int main() {
@@ -221,6 +244,7 @@ int main() {
     TestParseArgsMultiOutput();
     TestParseArgsRejectsMultipleStdoutOutputs();
     TestParseOutputEndpointSpecsPreservesBondedSingleFlag();
+    TestParseOutputEndpointSpecsListenerFanoutOptions();
     std::cout << "metrics_compat_test passed\n";
     return 0;
 }

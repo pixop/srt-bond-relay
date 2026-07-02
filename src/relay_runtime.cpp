@@ -378,6 +378,12 @@ int RelayMain(const Config& cfg, const Logger& logger) {
         return input_specs.front().kind;
     };
     while (!g_shutdown_requested.load()) {
+        {
+            std::lock_guard<std::mutex> session_lock(metrics.session_specs_mutex);
+            for (size_t i = 0; i < MetricsState::kMaxOutputSources; ++i) {
+                metrics.output_listener_connected_endpoints[i].clear();
+            }
+        }
         for (size_t i = 0; i < MetricsState::kMaxInputSources; ++i) {
             metrics.input_source_connected[i].store(0, std::memory_order_relaxed);
             metrics.input_source_listening[i].store(0, std::memory_order_relaxed);
@@ -385,6 +391,7 @@ int RelayMain(const Config& cfg, const Logger& logger) {
         for (size_t i = 0; i < MetricsState::kMaxOutputSources; ++i) {
             metrics.output_source_connected[i].store(0, std::memory_order_relaxed);
             metrics.output_source_listening[i].store(0, std::memory_order_relaxed);
+            metrics.output_listener_clients_active[i].store(0, std::memory_order_relaxed);
         }
         const size_t active_index_for_state = input_source->ActiveInputIndex();
         if (active_index_for_state < MetricsState::kMaxInputSources) {
@@ -399,6 +406,22 @@ int RelayMain(const Config& cfg, const Logger& logger) {
                 output_sink->OutputConnected(i) ? 1 : 0, std::memory_order_relaxed);
             metrics.output_source_listening[i].store(
                 output_sink->OutputListening(i) ? 1 : 0, std::memory_order_relaxed);
+            metrics.output_listener_clients_active[i].store(
+                output_sink->OutputListenerClientsActive(i), std::memory_order_relaxed);
+            metrics.output_listener_clients_accepted_total[i].store(
+                output_sink->OutputListenerClientsAcceptedTotal(i), std::memory_order_relaxed);
+            metrics.output_listener_clients_dropped_timeout_total[i].store(
+                output_sink->OutputListenerClientsDroppedTimeoutTotal(i), std::memory_order_relaxed);
+            metrics.output_listener_clients_dropped_disconnected_total[i].store(
+                output_sink->OutputListenerClientsDroppedDisconnectedTotal(i), std::memory_order_relaxed);
+            metrics.output_listener_clients_dropped_error_total[i].store(
+                output_sink->OutputListenerClientsDroppedErrorTotal(i), std::memory_order_relaxed);
+            metrics.output_listener_accept_rejected_max_clients_total[i].store(
+                output_sink->OutputListenerAcceptRejectedMaxClientsTotal(i), std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> session_lock(metrics.session_specs_mutex);
+                metrics.output_listener_connected_endpoints[i] = output_sink->OutputListenerConnectedEndpoints(i);
+            }
         }
         state.input_listening = input_source->IsListening();
         state.input_connected = input_source->IsConnected();

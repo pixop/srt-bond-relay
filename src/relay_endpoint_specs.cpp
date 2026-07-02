@@ -76,6 +76,73 @@ bool HasBondQueryOption(const std::map<std::string, std::string>& query) {
            !QueryString(query, "bond_mode").empty();
 }
 
+bool HasOutputListenerFanoutQueryOption(const std::map<std::string, std::string>& query) {
+    return !QueryString(query, "fanout").empty() ||
+           !QueryString(query, "max_clients").empty() ||
+           !QueryString(query, "fanout_max_clients").empty();
+}
+
+bool ParseFanoutBoolValue(const std::string& value) {
+    if (value == "on" || value == "true" || value == "1" || value == "yes") {
+        return true;
+    }
+    if (value == "off" || value == "false" || value == "0" || value == "no") {
+        return false;
+    }
+    throw std::runtime_error("invalid fanout value: " + value + " (expected on/off)");
+}
+
+void ResolveOutputListenerFanoutOptions(const std::vector<SrtUri>& uris,
+                                        bool* out_enabled,
+                                        int* out_max_clients) {
+    bool fanout_enabled = false;
+    bool fanout_seen = false;
+    int max_clients = 1;
+    bool max_clients_seen = false;
+
+    for (const auto& uri : uris) {
+        const std::string fanout = QueryString(uri.query, "fanout");
+        if (!fanout.empty()) {
+            const bool parsed = ParseFanoutBoolValue(fanout);
+            if (fanout_seen && parsed != fanout_enabled) {
+                throw std::runtime_error("all output SRT listener URIs must use the same fanout value");
+            }
+            fanout_enabled = parsed;
+            fanout_seen = true;
+        }
+
+        std::string max_clients_value = QueryString(uri.query, "max_clients");
+        if (max_clients_value.empty()) {
+            max_clients_value = QueryString(uri.query, "fanout_max_clients");
+        }
+        if (!max_clients_value.empty()) {
+            const int parsed = ParseIntOptionValue(max_clients_value, "max_clients");
+            if (parsed <= 0) {
+                throw std::runtime_error("max_clients must be > 0");
+            }
+            if (parsed > static_cast<int>(MetricsState::kMaxTrackedMembers)) {
+                throw std::runtime_error("max_clients must be <= " +
+                                         std::to_string(MetricsState::kMaxTrackedMembers));
+            }
+            if (max_clients_seen && parsed != max_clients) {
+                throw std::runtime_error("all output SRT listener URIs must use the same max_clients value");
+            }
+            max_clients = parsed;
+            max_clients_seen = true;
+        }
+    }
+
+    if (!fanout_enabled && max_clients != 1) {
+        throw std::runtime_error("max_clients requires fanout=on for output SRT listener mode");
+    }
+
+    if (!fanout_enabled) {
+        max_clients = 1;
+    }
+    *out_enabled = fanout_enabled;
+    *out_max_clients = max_clients;
+}
+
 std::optional<SRT_GROUP_TYPE> ParseBondGroupType(const std::map<std::string, std::string>& query) {
     std::string value = QueryString(query, "grouptype");
     if (value.empty()) value = QueryString(query, "group_type");
@@ -235,9 +302,15 @@ OutputEndpointSpec ParseOutputEndpointSpecFromUri(const std::string& output_uri)
         }
 
         if (resolved_mode == "caller") {
+            for (const auto& uri : out.uris) {
+                if (HasOutputListenerFanoutQueryOption(uri.query)) {
+                    throw std::runtime_error("fanout and max_clients are only supported for output SRT listener mode");
+                }
+            }
             out.kind = OutputEndpointKind::kSrtCaller;
         } else if (resolved_mode == "listener") {
             out.kind = OutputEndpointKind::kSrtListener;
+            ResolveOutputListenerFanoutOptions(out.uris, &out.listener_fanout_enabled, &out.listener_max_clients);
         } else {
             throw std::runtime_error("output SRT URI mode must be caller or listener");
         }

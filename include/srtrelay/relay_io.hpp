@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -76,6 +77,8 @@ struct OutputEndpointSpec {
     UdpUri udp_uri;
     bool bonded = false;
     SRT_GROUP_TYPE group_type = SRT_GTYPE_UNDEFINED;
+    bool listener_fanout_enabled = false;
+    int listener_max_clients = 1;
 };
 
 struct EnsureAttemptContext {
@@ -128,6 +131,13 @@ public:
     virtual size_t OutputCount() const { return 1; }
     virtual bool OutputConnected(size_t index) const { return index == 0 && IsConnected(); }
     virtual bool OutputListening(size_t index) const { return index == 0 && IsListening(); }
+    virtual int64_t OutputListenerClientsActive(size_t) const { return 0; }
+    virtual uint64_t OutputListenerClientsAcceptedTotal(size_t) const { return 0; }
+    virtual uint64_t OutputListenerClientsDroppedTimeoutTotal(size_t) const { return 0; }
+    virtual uint64_t OutputListenerClientsDroppedDisconnectedTotal(size_t) const { return 0; }
+    virtual uint64_t OutputListenerClientsDroppedErrorTotal(size_t) const { return 0; }
+    virtual uint64_t OutputListenerAcceptRejectedMaxClientsTotal(size_t) const { return 0; }
+    virtual std::vector<std::string> OutputListenerConnectedEndpoints(size_t) const { return {}; }
 };
 
 InputEndpointSpec ParseInputEndpointSpec(const Config& cfg);

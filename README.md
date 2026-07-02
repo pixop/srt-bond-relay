@@ -201,6 +201,8 @@ Independent multi-input switching:
 `--output` accepted values:
 
 - `srt://...` with `mode=caller|listener` (default `caller` when omitted)
+  - Output listener fanout is optional via `fanout=on&max_clients=<N>` (default remains single-client)
+  - With default single-client listener mode (`fanout=off`), additional downstream clients are accepted then closed immediately (best-effort fast reject)
 - `udp://...` with `mode=caller` (output `mode=listener` is rejected in first pass)
 - `stdout`, `-`, or `fd://stdout` (binary MPEG-TS to process stdout)
 - Repeat `--output` to fan out one input stream to multiple output endpoints
@@ -237,15 +239,25 @@ Metrics server:
 
 - `GET /healthz` returns `ok`
 - `GET /metrics` on `http://<metrics-host>:<metrics-port>`
-- `GET /session/specs` returns JSON with configured `inputs` and `outputs` endpoint specs (plus legacy `output`), live runtime session shape (`runtime.bonded`, `runtime.group_type`), runtime and resolved session transtype (`runtime_transtype`, `session_transtype` with source), connected SRT member details (`connected_members`, including per-member state/peer and `rtt_ms`), and effective live SRT socket options for the active session (when connected), including directional and negotiated latency fields (`rcvlatency_ms`, `peerlatency_ms`, `negotiated_latency_ms`)
+- `GET /session/specs` returns JSON with configured `inputs` and `outputs` endpoint specs (plus legacy `output`), live runtime session shape (`runtime.bonded`, `runtime.group_type`), runtime and resolved session transtype (`runtime_transtype`, `session_transtype` with source), output listener active client count (`connected_clients` for SRT listener outputs), output listener remote client endpoint list (`connected_client_ips` in `IP:port` form for SRT listener outputs), connected SRT member details (`connected_members`, including per-member state/peer and `rtt_ms`), and effective live SRT socket options for the active session (when connected), including directional and negotiated latency fields (`rcvlatency_ms`, `peerlatency_ms`, `negotiated_latency_ms`)
 - `POST /metrics/links/compact?direction=input|output|both` compacts active per-link slot indexes and drops disconnected slots from exported stable-slot series (when `direction` is omitted, default is `both`)
 - Controlled by `--metrics-enabled`, `--metrics-host`, `--metrics-port`
+
+Output listener fanout observability semantics (current behavior):
+
+- Fanout health/capacity is reported by `srt_relay_output_listener_clients_*`.
+- Scalar output transport/session surfaces still follow first-client semantics when fanout is enabled:
+  - internal transport socket selection (`TransportSocket()`)
+  - `/session/specs` output transport/socket details
+  - scalar output transport/session gauges and counters in `/metrics`
+- This is intentional for backward compatibility and may be revisited in a future transport-semantics version.
 
 Metrics are refreshed on each stats tick (`--stats-interval-ms`) and include:
 
 - Relay totals and rates (`*_bytes_*`, `*_messages_*`, reconnect/send-failure counters)
 - Path state (`input_listening`, `input_connected`, `output_connected`, `path_ready`)
 - Per-source state (`srt_relay_input_source_*`, `srt_relay_output_source_*`)
+- Output listener fanout client metrics (`srt_relay_output_listener_clients_*` with `output_index`)
 - Bond mode gauges for both directions (`srt_relay_input_bond_mode{mode=...}`, `srt_relay_output_bond_mode{mode=...}`)
 - Input and output link health (`*_links_total|healthy|running`) plus per-link stable-slot metrics (`*_link_connected`, `*_link_*_bytes_*`, `*_link_rtt_ms` with `link_index`/`socket_id` labels)
 - Transport-level SRT counters for both directions (total/current recv or sent bytes, unique bytes, retrans, loss/drop, tracked member count)
@@ -321,6 +333,7 @@ Dashboards:
 Recognized SRT query keys:
 
 - Endpoint behavior: `mode` (`listener`/`caller`; defaults: input=`listener`, output=`caller`)
+- Output listener fanout (listener mode only): `fanout` (`on`/`off`), `max_clients` (alias: `fanout_max_clients`)
 - Bond mode aliases: `grouptype`, `group_type`, `bond`, `bond_mode` (`broadcast`/`backup`)
 - Bonded source adapter aliases (caller groups): `srcip`, `sourceip`, `localip`, `adapterip`, `adapter_ip`
 - Socket options: `passphrase`, `pbkeylen`, `transtype` (`live`/`file`), `latency`
@@ -334,7 +347,8 @@ Recognized UDP query keys:
 ## Current Limitations
 
 - unsupported URI query options are ignored (debug logged)
-- output listener mode is single-consumer at a time (no multi-client listener fanout on one listener socket)
+- output listener mode defaults to single-consumer; optional fanout mode allows multiple concurrent downstream clients
 - output listener mode blocks forwarding until a downstream client is connected
+- when output listener fanout is enabled, scalar output transport/session observability surfaces currently reflect the first connected downstream client (use `srt_relay_output_listener_clients_*` for fanout state)
 - per-link observability depends on bonded member snapshot availability from libsrt; when unavailable, relay falls back to a single synthetic input-link slot for continuity
 - UDP endpoint lists are single-endpoint only (no bonded/multipath UDP)

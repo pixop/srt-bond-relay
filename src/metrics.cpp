@@ -99,6 +99,12 @@ MetricsState::MetricsState() {
         output_source_connected[i].store(0, std::memory_order_relaxed);
         output_source_listening[i].store(0, std::memory_order_relaxed);
         output_source_bond_mode[i].store(0, std::memory_order_relaxed);
+        output_listener_clients_active[i].store(0, std::memory_order_relaxed);
+        output_listener_clients_accepted_total[i].store(0, std::memory_order_relaxed);
+        output_listener_clients_dropped_timeout_total[i].store(0, std::memory_order_relaxed);
+        output_listener_clients_dropped_disconnected_total[i].store(0, std::memory_order_relaxed);
+        output_listener_clients_dropped_error_total[i].store(0, std::memory_order_relaxed);
+        output_listener_accept_rejected_max_clients_total[i].store(0, std::memory_order_relaxed);
     }
     for (size_t side = 0; side < kFailureSides; ++side) {
         for (size_t i = 0; i < kTimeoutTypes; ++i) {
@@ -115,6 +121,9 @@ MetricsState::MetricsState() {
 namespace {
 
 using json = nlohmann::json;
+
+json BuildConnectedClientIpsJson(const json& connected_members);
+json BuildConnectedClientIpsJson(const std::vector<std::string>& connected_endpoints);
 
 const char* InputProtocolName(InputEndpointKind kind) {
     switch (kind) {
@@ -544,9 +553,11 @@ json BuildOutputSessionSpecJson(const OutputEndpointSpec& spec,
                                 size_t output_index) {
     bool connected = metrics.output_connected.load(std::memory_order_relaxed) == 1;
     bool listening = false;
+    int64_t connected_clients = 0;
     if (output_index < MetricsState::kMaxOutputSources) {
         connected = metrics.output_source_connected[output_index].load(std::memory_order_relaxed) == 1;
         listening = metrics.output_source_listening[output_index].load(std::memory_order_relaxed) == 1;
+        connected_clients = metrics.output_listener_clients_active[output_index].load(std::memory_order_relaxed);
     }
     SRTSOCKET socket_id = static_cast<SRTSOCKET>(metrics.output_transport_socket_id.load(std::memory_order_relaxed));
     if (output_index > 0) {
@@ -559,6 +570,10 @@ json BuildOutputSessionSpecJson(const OutputEndpointSpec& spec,
     };
     if (spec.kind == OutputEndpointKind::kSrtListener || spec.kind == OutputEndpointKind::kSrtCaller) {
         configured["members"] = BuildSrtMembersJson(spec.uris);
+        if (spec.kind == OutputEndpointKind::kSrtListener) {
+            configured["fanout"] = spec.listener_fanout_enabled;
+            configured["max_clients"] = spec.listener_max_clients;
+        }
     } else if (spec.kind == OutputEndpointKind::kUdpListener || spec.kind == OutputEndpointKind::kUdpCaller) {
         configured["endpoint"] = BuildUdpEndpointJson(spec.udp_uri);
     }
@@ -577,6 +592,20 @@ json BuildOutputSessionSpecJson(const OutputEndpointSpec& spec,
     if (spec.kind == OutputEndpointKind::kSrtListener || spec.kind == OutputEndpointKind::kSrtCaller) {
         connected_members = BuildConnectedMembersJson(socket_id);
     }
+    json connected_client_ips = json(nullptr);
+    if (spec.kind == OutputEndpointKind::kSrtListener) {
+        std::vector<std::string> connected_endpoints;
+        {
+            std::lock_guard<std::mutex> session_lock(metrics.session_specs_mutex);
+            if (output_index < MetricsState::kMaxOutputSources) {
+                connected_endpoints = metrics.output_listener_connected_endpoints[output_index];
+            }
+        }
+        connected_client_ips = BuildConnectedClientIpsJson(connected_endpoints);
+        if (connected_client_ips.empty()) {
+            connected_client_ips = BuildConnectedClientIpsJson(connected_members);
+        }
+    }
     const SRT_GROUP_TYPE runtime_group_type = ReadRuntimeGroupType(socket_id);
     const bool runtime_bonded = (runtime_group_type == SRT_GTYPE_BROADCAST ||
                                  runtime_group_type == SRT_GTYPE_BACKUP ||
@@ -591,6 +620,8 @@ json BuildOutputSessionSpecJson(const OutputEndpointSpec& spec,
         {"mode", OutputModeName(spec.kind)},
         {"connected", connected},
         {"listening", listening},
+        {"connected_clients", spec.kind == OutputEndpointKind::kSrtListener ? json(connected_clients) : json(nullptr)},
+        {"connected_client_ips", connected_client_ips},
         {"socket_id", socket_id == SRT_INVALID_SOCK ? json(nullptr) : json(socket_id)},
         {"group_socket_id", group_socket_id == SRT_INVALID_SOCK ? json(nullptr) : json(group_socket_id)},
         {"configured", configured},
@@ -980,6 +1011,46 @@ json BuildConnectedMembersJson(SRTSOCKET session_sock) {
     }
 
     return members_json;
+}
+
+json BuildConnectedClientIpsJson(const json& connected_members) {
+    json client_ips = json::array();
+    std::unordered_set<std::string> seen_endpoints;
+    for (const auto& member : connected_members) {
+        if (!member.is_object() || !member.contains("peer_host")) {
+            continue;
+        }
+        const auto& peer_host = member["peer_host"];
+        if (!peer_host.is_string()) {
+            continue;
+        }
+        const std::string host = peer_host.get<std::string>();
+        if (host.empty()) {
+            continue;
+        }
+        std::string endpoint = host;
+        if (member.contains("peer_port") && member["peer_port"].is_number_integer()) {
+            endpoint += ":" + std::to_string(member["peer_port"].get<int>());
+        }
+        if (seen_endpoints.insert(endpoint).second) {
+            client_ips.push_back(endpoint);
+        }
+    }
+    return client_ips;
+}
+
+json BuildConnectedClientIpsJson(const std::vector<std::string>& connected_endpoints) {
+    json client_ips = json::array();
+    std::unordered_set<std::string> seen_endpoints;
+    for (const auto& endpoint : connected_endpoints) {
+        if (endpoint.empty()) {
+            continue;
+        }
+        if (seen_endpoints.insert(endpoint).second) {
+            client_ips.push_back(endpoint);
+        }
+    }
+    return client_ips;
 }
 
 void UpdateInputLinkHealthFromGroupMembers(const std::vector<SRT_SOCKGROUPDATA>& group_members,
@@ -2039,12 +2110,32 @@ std::string RenderPrometheusMetrics(const MetricsState& metrics) {
     out << "# TYPE srt_relay_output_source_listening gauge\n";
     out << "# HELP srt_relay_output_source_bond_mode Configured bond mode by output index.\n";
     out << "# TYPE srt_relay_output_source_bond_mode gauge\n";
+    out << "# HELP srt_relay_output_listener_clients_active Active downstream client count for output listener fanout by index.\n";
+    out << "# TYPE srt_relay_output_listener_clients_active gauge\n";
+    out << "# HELP srt_relay_output_listener_clients_accepted_total Total accepted downstream clients for output listener fanout by index.\n";
+    out << "# TYPE srt_relay_output_listener_clients_accepted_total counter\n";
+    out << "# HELP srt_relay_output_listener_clients_dropped_total Total dropped downstream clients for output listener fanout by index and reason.\n";
+    out << "# TYPE srt_relay_output_listener_clients_dropped_total counter\n";
+    out << "# HELP srt_relay_output_listener_accept_rejected_total Total output listener fanout accept rejections by index and reason.\n";
+    out << "# TYPE srt_relay_output_listener_accept_rejected_total counter\n";
     const size_t output_source_count_capped = std::min(static_cast<size_t>(std::max<int64_t>(0, output_sources_total)),
                                                        MetricsState::kMaxOutputSources);
     for (size_t i = 0; i < output_source_count_capped; ++i) {
         const int connected_state = metrics.output_source_connected[i].load(std::memory_order_relaxed);
         const int listening_state = metrics.output_source_listening[i].load(std::memory_order_relaxed);
         const int bond_mode = metrics.output_source_bond_mode[i].load(std::memory_order_relaxed);
+        const int64_t listener_clients_active =
+            metrics.output_listener_clients_active[i].load(std::memory_order_relaxed);
+        const uint64_t listener_clients_accepted_total =
+            metrics.output_listener_clients_accepted_total[i].load(std::memory_order_relaxed);
+        const uint64_t listener_clients_dropped_timeout_total =
+            metrics.output_listener_clients_dropped_timeout_total[i].load(std::memory_order_relaxed);
+        const uint64_t listener_clients_dropped_disconnected_total =
+            metrics.output_listener_clients_dropped_disconnected_total[i].load(std::memory_order_relaxed);
+        const uint64_t listener_clients_dropped_error_total =
+            metrics.output_listener_clients_dropped_error_total[i].load(std::memory_order_relaxed);
+        const uint64_t listener_accept_rejected_max_clients_total =
+            metrics.output_listener_accept_rejected_max_clients_total[i].load(std::memory_order_relaxed);
         out << "srt_relay_output_source_connected{output_index=\"" << (i + 1) << "\"} " << connected_state << "\n";
         out << "srt_relay_output_source_listening{output_index=\"" << (i + 1) << "\"} " << listening_state << "\n";
         out << "srt_relay_output_source_bond_mode{output_index=\"" << (i + 1)
@@ -2053,6 +2144,18 @@ std::string RenderPrometheusMetrics(const MetricsState& metrics) {
             << "\",mode=\"broadcast\"} " << (bond_mode == 1 ? 1 : 0) << "\n";
         out << "srt_relay_output_source_bond_mode{output_index=\"" << (i + 1)
             << "\",mode=\"backup\"} " << (bond_mode == 2 ? 1 : 0) << "\n";
+        out << "srt_relay_output_listener_clients_active{output_index=\"" << (i + 1)
+            << "\"} " << listener_clients_active << "\n";
+        out << "srt_relay_output_listener_clients_accepted_total{output_index=\"" << (i + 1)
+            << "\"} " << listener_clients_accepted_total << "\n";
+        out << "srt_relay_output_listener_clients_dropped_total{output_index=\"" << (i + 1)
+            << "\",reason=\"timeout\"} " << listener_clients_dropped_timeout_total << "\n";
+        out << "srt_relay_output_listener_clients_dropped_total{output_index=\"" << (i + 1)
+            << "\",reason=\"disconnected\"} " << listener_clients_dropped_disconnected_total << "\n";
+        out << "srt_relay_output_listener_clients_dropped_total{output_index=\"" << (i + 1)
+            << "\",reason=\"error\"} " << listener_clients_dropped_error_total << "\n";
+        out << "srt_relay_output_listener_accept_rejected_total{output_index=\"" << (i + 1)
+            << "\",reason=\"max_clients\"} " << listener_accept_rejected_max_clients_total << "\n";
     }
     emit_i64("srt_relay_last_rx_unix_seconds", "gauge", "Unix timestamp of last received packet.", last_rx_unix_seconds);
     emit_i64("srt_relay_last_tx_unix_seconds", "gauge", "Unix timestamp of last forwarded packet.", last_tx_unix_seconds);
@@ -2347,6 +2450,9 @@ void MaybeLogStats(const Config& cfg,
     const auto input_transport_packet_belated_interval = CounterDeltaWithReset(
         stats->last_input_transport_packet_belated_total,
         input_transport_packet_belated_total);
+    const auto input_transport_byte_recv_interval = CounterDeltaWithReset(
+        stats->last_input_transport_byte_recv_total,
+        input_transport_byte_recv_total);
     const auto output_transport_byte_retrans_interval = CounterDeltaWithReset(
         stats->last_output_transport_byte_retrans_total,
         output_transport_byte_retrans_total);
@@ -2379,7 +2485,7 @@ void MaybeLogStats(const Config& cfg,
                    " bytes, dropped: " + FormatWithThousands(input_group_byte_drop_total) + " bytes (" +
                    FormatWithThousands(input_group_packet_drop_total) + " packets), belated: " +
                    FormatWithThousands(input_transport_packet_belated_total) + " packets",
-               "| Interval recv: " + FormatWithThousands(stats->interval_rx_bytes) +
+               "| Interval recv: " + FormatWithThousands(input_transport_byte_recv_interval) +
                    " bytes, retransmit: " + FormatWithThousands(input_transport_byte_retrans_interval) +
                    " bytes, lost: " + FormatWithThousands(input_transport_byte_loss_interval) +
                    " bytes, dropped: " + FormatWithThousands(input_group_byte_drop_interval) + " bytes, belated: " +
@@ -2415,6 +2521,7 @@ void MaybeLogStats(const Config& cfg,
     stats->last_input_transport_byte_loss_total = input_transport_byte_loss_total;
     stats->last_input_group_byte_drop_total = input_group_byte_drop_total;
     stats->last_input_transport_packet_belated_total = input_transport_packet_belated_total;
+    stats->last_input_transport_byte_recv_total = input_transport_byte_recv_total;
     stats->last_output_transport_byte_retrans_total = output_transport_byte_retrans_total;
     stats->last_output_transport_byte_drop_total = output_transport_byte_drop_total;
 

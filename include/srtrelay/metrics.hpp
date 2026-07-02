@@ -37,6 +37,7 @@ struct RelayStats {
     uint64_t interval_send_failures = 0;
 
     // Last-seen transport counters used to compute per-stats-tick interval deltas.
+    uint64_t last_input_transport_byte_recv_total = 0;
     uint64_t last_input_transport_byte_retrans_total = 0;
     uint64_t last_input_transport_byte_loss_total = 0;
     uint64_t last_input_group_byte_drop_total = 0;
@@ -170,6 +171,13 @@ struct MetricsState {
     std::array<std::atomic<int>, kMaxOutputSources> output_source_connected {};
     std::array<std::atomic<int>, kMaxOutputSources> output_source_listening {};
     std::array<std::atomic<int>, kMaxOutputSources> output_source_bond_mode {};  // 0=unknown,1=broadcast,2=backup
+    std::array<std::atomic<int64_t>, kMaxOutputSources> output_listener_clients_active {};
+    std::array<std::atomic<uint64_t>, kMaxOutputSources> output_listener_clients_accepted_total {};
+    std::array<std::atomic<uint64_t>, kMaxOutputSources> output_listener_clients_dropped_timeout_total {};
+    std::array<std::atomic<uint64_t>, kMaxOutputSources> output_listener_clients_dropped_disconnected_total {};
+    std::array<std::atomic<uint64_t>, kMaxOutputSources> output_listener_clients_dropped_error_total {};
+    std::array<std::atomic<uint64_t>, kMaxOutputSources> output_listener_accept_rejected_max_clients_total {};
+    std::array<std::vector<std::string>, kMaxOutputSources> output_listener_connected_endpoints {};
 
     std::atomic<int64_t> last_rx_unix_ms{0};
     std::atomic<int64_t> last_tx_unix_ms{0};
@@ -246,6 +254,7 @@ struct MetricsState {
     LastFailureSnapshot output_last_failure;
 
     mutable std::mutex link_metrics_mutex;
+    mutable std::mutex session_specs_mutex;
     mutable std::mutex causality_mutex;
 
     MetricsState();
