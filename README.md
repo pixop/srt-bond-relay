@@ -75,7 +75,7 @@ docker run --rm --network host \
 
 ## Detailed Documentation
 
-Use `OPERATIONS_GUIDE.md` for full operational reference, including:
+Use [`OPERATIONS_GUIDE.md`](OPERATIONS_GUIDE.md) for full operational reference, including:
 
 - all build variants (runtime, static artifact, `srt-test-live`)
 - all relay run examples (SRT, UDP, stdin/stdout, bonded and switched scenarios)
